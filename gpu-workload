@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""gpu-workload: hand the single 16 GB GPU between Strata (local LLM) and ComfyUI.
+
+The two can't hold VRAM at the same time, so the GPU is in one of these modes:
+
+  strata    Strata's model is loaded; ComfyUI holds no models and has no jobs.
+  comfy     Strata's model is unloaded; ComfyUI may load models and run jobs.
+  conflict  Strata is loaded while ComfyUI holds models or has jobs queued.
+
+The mode is always derived from the live servers and nvidia-smi, never from a
+state file, so `status` can't drift from reality and `switch` is idempotent:
+switching to the mode you're already in only re-verifies it.
+
+Commands:
+  gpu-workload status [--json]
+  gpu-workload switch strata|comfy [--wait SECONDS] [--json]
+  gpu-workload check  strata|comfy [--json]
+  gpu-workload hook strata-before-load      (Strata's before_load; not for humans)
+
+Exit codes: 0 ok · 1 failed / refused · 2 usage · 3 `check` found the wrong mode.
+"""
+
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+STRATA_URL = os.environ.get("GPU_WORKLOAD_STRATA_URL", "http://127.0.0.1:2335")
+COMFY_URL = os.environ.get("GPU_WORKLOAD_COMFY_URL", "http://127.0.0.1:8188")
+STRATA_UNIT = os.environ.get("GPU_WORKLOAD_STRATA_UNIT", "strata")
+COMFY_UNIT = os.environ.get("GPU_WORKLOAD_COMFY_UNIT", "comfyui")
+# nvidia-smi process paths that identify each server's GPU allocations.
+STRATA_PROC = os.environ.get("GPU_WORKLOAD_STRATA_PROC", "/Strata/")
+COMFY_PROC = os.environ.get("GPU_WORKLOAD_COMFY_PROC", "/ComfyUI/")
+# ComfyUI's CUDA context alone is ~450 MiB; above this it is holding models.
+COMFY_IDLE_MIB = int(os.environ.get("GPU_WORKLOAD_COMFY_IDLE_MIB", "1500"))
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "gpu-workload"
+LOCK_FILE = STATE_DIR / "switch.lock"      # holds the target mode while a switch runs
+EVENTS_FILE = STATE_DIR / "events.jsonl"   # every switch and every hook decision
+EVENTS_KEEP = 500
+
+EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_WRONG_MODE = 0, 1, 2, 3
+
+
+class SwitchError(Exception):
+    pass
+
+
+# --- probes ------------------------------------------------------------------
+
+
+def _http(method: str, url: str, body: dict | None = None, timeout: float = 5.0):
+    """Return (status, parsed JSON or text), or (None, error string) if unreachable."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status, raw = resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
+    except (urllib.error.URLError, OSError) as e:
+        return None, str(getattr(e, "reason", e))
+    try:
+        return status, json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        return status, raw.decode(errors="replace")
+
+
+def _unit_active(unit: str) -> bool:
+    r = subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit])
+    return r.returncode == 0
+
+
+def _gpu() -> dict:
+    """Card totals plus per-server VRAM use, from nvidia-smi."""
+    out = {"total_mib": None, "free_mib": None, "strata_mib": 0, "comfy_mib": 0, "other_mib": 0}
+    try:
+        card = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.splitlines()[0]
+        out["total_mib"], out["free_mib"] = (int(x) for x in card.split(","))
+        apps = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError, IndexError, ValueError) as e:
+        out["error"] = f"nvidia-smi failed: {e}"
+        return out
+    for line in apps.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 3 or not parts[2].isdigit():
+            continue
+        name, mib = parts[1], int(parts[2])
+        key = "strata_mib" if STRATA_PROC in name else "comfy_mib" if COMFY_PROC in name else "other_mib"
+        out[key] += mib
+    return out
+
+
+def probe() -> dict:
+    strata = {"service": _unit_active(STRATA_UNIT), "reachable": False, "loaded": False}
+    if strata["service"]:
+        code, body = _http("GET", f"{STRATA_URL}/health")
+        if code == 200 and isinstance(body, dict):
+            strata.update(reachable=True, loaded=bool(body.get("loaded")))
+
+    comfy = {"service": _unit_active(COMFY_UNIT), "reachable": False, "running": 0, "pending": 0}
+    if comfy["service"]:
+        code, body = _http("GET", f"{COMFY_URL}/queue")
+        if code == 200 and isinstance(body, dict):
+            comfy.update(
+                reachable=True,
+                running=len(body.get("queue_running") or []),
+                pending=len(body.get("queue_pending") or []),
+            )
+
+    gpu = _gpu()
+    comfy["holds_models"] = gpu["comfy_mib"] > COMFY_IDLE_MIB
+    comfy_active = comfy["holds_models"] or comfy["running"] or comfy["pending"]
+    # nvidia-smi is the tiebreaker if /health is unreachable but the engine is on the GPU.
+    strata_on_gpu = strata["loaded"] or gpu["strata_mib"] > 0
+
+    if strata_on_gpu and comfy_active:
+        mode = "conflict"
+    elif strata_on_gpu:
+        mode = "strata"
+    else:
+        mode = "comfy"
+    return {"mode": mode, "strata": strata, "comfy": comfy, "gpu": gpu, "last_event": last_event()}
+
+
+def _describe(s: dict) -> str:
+    st, cf, g = s["strata"], s["comfy"], s["gpu"]
+    if not st["service"]:
+        strata = "service stopped"
+    elif not st["reachable"]:
+        strata = "service up, API not answering"
+    else:
+        strata = "model loaded" if st["loaded"] else "model unloaded (lazy)"
+    if not cf["service"]:
+        comfy = "service stopped"
+    elif not cf["reachable"]:
+        comfy = "service up, API not answering"
+    else:
+        jobs = f"{cf['running']} running / {cf['pending']} queued"
+        comfy = f"{'models loaded' if cf['holds_models'] else 'no models loaded'}, {jobs}"
+    gpu = (
+        f"{g['free_mib']} of {g['total_mib']} MiB free "
+        f"(strata {g['strata_mib']}, comfy {g['comfy_mib']}, other {g['other_mib']})"
+        if "error" not in g else g["error"]
+    )
+    out = f"mode:   {s['mode']}\nstrata: {strata}\ncomfy:  {comfy}\ngpu:    {gpu}"
+    if ev := s.get("last_event"):
+        detail = ", ".join(f"{k}={v}" for k, v in ev.items() if k not in ("time", "event"))
+        out += f"\nlast:   {ev['time']} {ev['event']}" + (f" ({detail})" if detail else "")
+    return out
+
+
+# --- events ------------------------------------------------------------------
+
+
+def record(kind: str, **fields) -> None:
+    """Append one event; the log is trimmed to the last EVENTS_KEEP lines."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    event = {"time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), "event": kind, **fields}
+    lines = EVENTS_FILE.read_text().splitlines() if EVENTS_FILE.exists() else []
+    lines = [*lines[-(EVENTS_KEEP - 1):], json.dumps(event)]
+    tmp = EVENTS_FILE.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    tmp.replace(EVENTS_FILE)
+
+
+def last_event() -> dict | None:
+    if not EVENTS_FILE.exists():
+        return None
+    lines = EVENTS_FILE.read_text().splitlines()
+    try:
+        return json.loads(lines[-1]) if lines else None
+    except json.JSONDecodeError:
+        return None
+
+
+# --- switching ---------------------------------------------------------------
+
+
+def _wait_until(pred, timeout: float, what: str, poll: float = 1.0):
+    deadline = time.monotonic() + timeout
+    while True:
+        value = pred()
+        if value:
+            return value
+        if time.monotonic() >= deadline:
+            raise SwitchError(f"timed out after {timeout:g}s waiting for {what}")
+        time.sleep(poll)
+
+
+def _ensure_unit(unit: str, health_url: str, timeout: float = 60.0) -> None:
+    if not _unit_active(unit):
+        _log(f"starting {unit}.service")
+        r = subprocess.run(["systemctl", "--user", "start", unit], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise SwitchError(f"systemctl --user start {unit} failed: {r.stderr.strip()}")
+    _wait_until(lambda: _http("GET", health_url)[0] == 200, timeout, f"{unit} to answer {health_url}")
+
+
+def to_strata(wait: float) -> None:
+    s = probe()
+    if s["mode"] == "strata":
+        _log("already in strata mode")
+        return
+
+    if s["comfy"]["service"]:
+        _ensure_unit(COMFY_UNIT, f"{COMFY_URL}/queue")
+        busy = lambda: (lambda c: c["running"] + c["pending"])(probe()["comfy"])  # noqa: E731
+        if busy():
+            if not wait:
+                raise SwitchError("ComfyUI has jobs running or queued (use --wait SECONDS to wait for them)")
+            _log("waiting for ComfyUI's queue to drain")
+            _wait_until(lambda: busy() == 0, wait, "ComfyUI's queue to drain", poll=2.0)
+        # /free only takes effect between jobs, which the drain above guarantees.
+        code, body = _http("POST", f"{COMFY_URL}/free", {"unload_models": True, "free_memory": True})
+        if code != 200:
+            raise SwitchError(f"ComfyUI /free failed: {code} {body}")
+        _wait_until(
+            lambda: not probe()["comfy"]["holds_models"], 60,
+            f"ComfyUI to release VRAM (below {COMFY_IDLE_MIB} MiB); was a new job queued?",
+        )
+
+    _ensure_unit(STRATA_UNIT, f"{STRATA_URL}/health")
+    _log("loading Strata's model")
+    # Synchronous: answers once the engine is up. A cold load reads ~33 GB of experts.
+    code, body = _http("POST", f"{STRATA_URL}/load", {}, timeout=max(300.0, wait))
+    if code != 200:
+        raise SwitchError(f"Strata /load failed: {code} {body}")
+    if probe()["mode"] != "strata":
+        raise SwitchError("Strata reported loaded, but the mode isn't strata; run `gpu-workload status`")
+
+
+def to_comfy(wait: float) -> None:
+    s = probe()
+    if s["mode"] == "comfy" and s["comfy"]["reachable"]:
+        _log("already in comfy mode")
+        return
+
+    if s["strata"]["service"] and (s["strata"]["loaded"] or s["gpu"]["strata_mib"]):
+        _ensure_unit(STRATA_UNIT, f"{STRATA_URL}/health")
+        # wait=N lets a running answer finish; without it Strata answers "busy" at once.
+        url = f"{STRATA_URL}/unload" + (f"?wait={int(wait)}" if wait else "")
+        code, body = _http("POST", url, {}, timeout=wait + 30)
+        status = body.get("status") if isinstance(body, dict) else body
+        if code == 409 or status == "busy":
+            raise SwitchError("Strata is answering a request (use --wait SECONDS to let it finish)")
+        if code != 200 or status not in ("unloaded", "not loaded"):
+            raise SwitchError(f"Strata /unload failed: {code} {body}")
+        _wait_until(lambda: probe()["gpu"]["strata_mib"] == 0, 30, "Strata's engine to leave the GPU")
+    elif s["gpu"]["strata_mib"]:
+        raise SwitchError("a Strata process holds VRAM but strata.service is stopped; kill it by hand")
+
+    _ensure_unit(COMFY_UNIT, f"{COMFY_URL}/queue")
+    if probe()["mode"] != "comfy":
+        raise SwitchError("Strata unloaded, but the mode isn't comfy; run `gpu-workload status`")
+
+
+# --- Strata before_load hook ---------------------------------------------------
+
+
+def strata_before_load() -> int:
+    """Run by Strata before it loads its model (its `before_load`, with
+    `before_load_strict`, so a non-zero exit becomes a 503 and no load).
+
+    - A `switch strata` in progress triggered this load: allow at once. Waiting
+      on the lock here would deadlock, since that switch holds it while it
+      blocks on Strata's /load.
+    - A `switch comfy` in progress: refuse.
+    - Otherwise a request woke the lazy model: allow only if ComfyUI is idle and
+      holds no models, so a stray request never takes the GPU from a comfy
+      workflow. Strata itself is not queried; it is busy loading.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_FILE, "a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.seek(0)
+            target = lock.read().strip()
+            allowed = target == "strata"
+            record("strata-load", source="hook", allowed=allowed, reason=f"switch to {target or '?'} in progress")
+            if not allowed:
+                _log(f"refusing Strata load: a switch to {target or '?'} is in progress")
+            return EXIT_OK if allowed else EXIT_FAIL
+
+        code, body = _http("GET", f"{COMFY_URL}/queue")
+        jobs = (len(body.get("queue_running") or []) + len(body.get("queue_pending") or [])
+                if code == 200 and isinstance(body, dict) else 0)
+        gpu = _gpu()
+        if "error" in gpu:
+            reason = gpu["error"]
+        elif jobs:
+            reason = f"ComfyUI has {jobs} job(s) running or queued"
+        elif gpu["comfy_mib"] > COMFY_IDLE_MIB:
+            reason = f"ComfyUI holds {gpu['comfy_mib']} MiB of models"
+        else:
+            record("strata-load", source="request", allowed=True, reason="ComfyUI idle")
+            return EXIT_OK
+        record("strata-load", source="request", allowed=False, reason=reason)
+        _log(f"refusing Strata load: {reason}; run `gpu-workload switch strata`")
+        return EXIT_FAIL
+
+
+# --- CLI ---------------------------------------------------------------------
+
+_json_out = False
+
+
+def _log(msg: str) -> None:
+    print(f"gpu-workload: {msg}", file=sys.stderr)
+
+
+def _emit(s: dict, extra: dict | None = None) -> None:
+    if _json_out:
+        print(json.dumps({**s, **(extra or {})}))
+    else:
+        print(_describe(s))
+
+
+def main(argv: list[str] | None = None) -> int:
+    global _json_out
+    p = argparse.ArgumentParser(prog="gpu-workload", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name, help_ in (("status", "show the current mode"),
+                        ("switch", "move the GPU to a workload (idempotent)"),
+                        ("check", "exit 0 if in MODE, 3 otherwise")):
+        sp = sub.add_parser(name, help=help_)
+        sp.add_argument("--json", action="store_true", help="machine-readable output on stdout")
+        if name != "status":
+            sp.add_argument("mode", choices=("strata", "comfy"))
+        if name == "switch":
+            sp.add_argument("--wait", type=float, default=0, metavar="SECONDS",
+                            help="wait this long for running work to finish instead of failing")
+    hp = sub.add_parser("hook", help="entry points for server hooks")
+    hp.add_argument("name", choices=("strata-before-load",))
+    args = p.parse_args(argv)
+    _json_out = getattr(args, "json", False)
+
+    if args.cmd == "hook":
+        return strata_before_load()
+
+    if args.cmd == "status":
+        _emit(probe())
+        return EXIT_OK
+
+    if args.cmd == "check":
+        s = probe()
+        # comfy mode with ComfyUI down is no use to a comfy workflow.
+        ok = s["mode"] == args.mode and (args.mode != "comfy" or s["comfy"]["reachable"])
+        _emit(s, {"ok": ok, "want": args.mode})
+        if not ok and not _json_out:
+            _log(f"GPU is in {s['mode']} mode, not {args.mode}; run `gpu-workload switch {args.mode}`")
+        return EXIT_OK if ok else EXIT_WRONG_MODE
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_FILE, "a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _log("waiting for another switch to finish")
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        # The hook reads this to tell the load we trigger from a stray one.
+        lock.seek(0)
+        lock.truncate()
+        lock.write(args.mode)
+        lock.flush()
+        before = probe()["mode"]
+        try:
+            (to_strata if args.mode == "strata" else to_comfy)(args.wait)
+        except SwitchError as e:
+            record("switch", to=args.mode, ok=False, error=str(e))
+            _log(f"switch to {args.mode} failed: {e}")
+            _emit(probe(), {"ok": False, "error": str(e)})
+            return EXIT_FAIL
+        finally:
+            lock.seek(0)
+            lock.truncate()
+        if before != args.mode:
+            record("switch", to=args.mode, ok=True, previous=before)
+    _emit(probe(), {"ok": True})
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
