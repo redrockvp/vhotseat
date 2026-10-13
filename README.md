@@ -48,29 +48,85 @@ Measured 2026-10-12 (RTX 5070 Ti, Strata IQ2_XS):
 | to strata, warm (OS page cache) | 26 s |
 | to comfy | ~1 s |
 
-## For workflows
+`switch comfy` always asks Strata to unload when its service is running, even
+if it looks unloaded. A load in progress hasn't reached the GPU yet, and
+Strata's `/unload` waits behind it, so the switch can't report `comfy` while
+Strata is still coming up.
 
-**ComfyUI workflows must run under `hold`**, because an *idle* ComfyUI no
-longer reserves the GPU (see the hook below):
+## Each side takes the GPU for itself
+
+| Wants the GPU | Who makes room | How |
+| --- | --- | --- |
+| Strata (any caller: pi, the chat bot, curl) | Strata's `before_load` hook | frees an idle ComfyUI; refuses while a job is queued or running |
+| ComfyUI (any caller: a script, its web page) | the ComfyUI guard node | before each job, `switch comfy --wait 300`: lets an answer Strata is writing finish, then unloads it |
+
+Callers need no GPU logic: pi, scripts and the ComfyUI web page just use
+their server. A Strata request between two ComfyUI jobs works, but costs
+about 30 s per handover (Strata reload, then ComfyUI reloads its model).
+
+## ComfyUI guard node
+
+`comfyui/gpu_workload_guard` is installed as a symlink:
+`~/ComfyUI/custom_nodes/gpu_workload_guard`. ComfyUI must be restarted
+after installing or changing it.
+
+- **How it hooks in:** it wraps `execution.PromptExecutor.execute_async`, which
+  ComfyUI's prompt worker thread calls once per job, and runs
+  `gpu-workload switch comfy --wait $GPU_WORKLOAD_GUARD_WAIT_S` (default 300)
+  first. The worker thread may block, so the web server stays responsive.
+- **On failure:** the job is **not run** and fails visibly, with an
+  `execution_error` "GPU busy, job not run: <reason>" in the UI and in
+  `/history`.
+- **It's a private API:** an update can break it. The guard switches itself off
+  with an error in the log if the method disappears. After every ComfyUI update,
+  follow [docs/comfyui-updates.md](docs/comfyui-updates.md).
+- **Env:**
+  - `GPU_WORKLOAD_GUARD=0` disables it;
+  - `GPU_WORKLOAD_GUARD_WAIT_S` sets how long it waits;
+  - `GPU_WORKLOAD_BIN` points it at the CLI.
+
+Measured 2026-10-13:
+
+| Situation when a job was queued | Result |
+| --- | --- |
+| Strata loaded | job done in 10 s |
+| Strata writing a 1,500-token answer | the answer completed; job done in 9 s |
+| A Strata request between two jobs | both jobs succeeded |
+| The guard's wait cut to 2 s | job failed visibly in 2.5 s |
+
+## pi skill: batch ComfyUI work
+
+`pi/skills/comfyui-batching/SKILL.md` is a best-effort hint for pi: queue
+each round's ComfyUI jobs up front and wait once, over-generate rather than
+re-roll, review one contact sheet per round, and keep tool output short.
+Every handover costs a ~30 s Strata reload plus a re-read of the
+conversation. It's installed for pi only, as a symlink:
+`~/.pi/agent/skills/comfyui-batching`. Pi lists it in `<available_skills>`
+in headless runs too (checked 2026-10-13).
+
+## `hold`: optional, for batches
+
+`hold` is no longer needed for safety; the guard covers every job. It's a speed
+optimisation: it keeps the GPU on comfy for a whole batch, so a Strata request
+arriving between jobs is refused instead of costing two ~30 s handovers.
 
 ```sh
 gpu-workload hold comfy --wait 600 -- ./render.sh
 ```
 
 `hold` switches to comfy, then keeps the switch lock marked `hold comfy` until
-COMMAND exits, so every Strata load is refused for that whole time. Without
-it, a script that queues jobs one at a time leaves ComfyUI's queue empty
-between jobs, and a stray Strata request could take the GPU in that gap.
+COMMAND exits, so every Strata load is refused for that whole time.
 
 - Inside a hold, `gpu-workload switch comfy` is a no-op, and `switch strata`
   fails. Both are detected via the `GPU_WORKLOAD_HOLD` env var, since taking
   the lock would deadlock.
 - SIGINT, SIGTERM and SIGHUP are forwarded to COMMAND. The lock is released
   only after COMMAND exits.
-- A script that queues **all** its jobs at once is also safe without `hold`,
-  because the queue stays busy until they're done.
+- A script that queues **all** its jobs at once gets the same effect without
+  `hold`, because the queue stays busy until they're done.
+- A `hold` inside another `hold` just runs its command, since the outer one
+  already owns the lock.
 
-Strata-side callers need no guard: a request simply wakes Strata (see below).
 `gpu-workload check strata|comfy` is still there for scripts that want to
 assert a mode.
 
@@ -113,11 +169,9 @@ it would deadlock: `switch strata` holds the lock while it blocks on Strata's
 is left unset. A Strata that's still loaded simply shows as `strata` mode until
 `switch comfy`.
 
-ComfyUI has **no hook yet**. Something that queues ComfyUI jobs directly, while
-Strata is loaded and not under `hold`, would still collide. That includes
-generating from ComfyUI's own web page. Leaving ComfyUI idle with a model loaded
-also no longer reserves the GPU: the next Strata request evicts it, and
-ComfyUI reloads it on its next render.
+Leaving ComfyUI idle with a model loaded doesn't reserve the GPU: the next
+Strata request evicts it, and ComfyUI reloads it on its next job. ComfyUI's own
+side is covered by the guard node above.
 
 ## Event log
 

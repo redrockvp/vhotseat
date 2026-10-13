@@ -269,21 +269,20 @@ def to_strata(wait: float) -> None:
 
 def to_comfy(wait: float) -> None:
     s = probe()
-    if s["mode"] == "comfy" and s["comfy"]["reachable"]:
-        _log("already in comfy mode")
-        return
-
-    if s["strata"]["service"] and (s["strata"]["loaded"] or s["gpu"]["strata_mib"]):
+    if s["strata"]["service"]:
+        # Always ask Strata, even when it looks unloaded: a load may be under way
+        # (its engine not on the GPU yet), and /unload waits behind it. When it
+        # is already unloaded this costs one request and answers "not loaded".
         _ensure_unit(STRATA_UNIT, f"{STRATA_URL}/health")
         # wait=N lets a running answer finish; without it Strata answers "busy" at once.
         url = f"{STRATA_URL}/unload" + (f"?wait={int(wait)}" if wait else "")
         code, body = _http("POST", url, {}, timeout=wait + 30)
         status = body.get("status") if isinstance(body, dict) else body
         if code == 409 or status == "busy":
-            raise SwitchError("Strata is answering a request (use --wait SECONDS to let it finish)")
+            raise SwitchError("Strata is answering or loading (use --wait SECONDS to let it finish)")
         if code != 200 or status not in ("unloaded", "not loaded"):
             raise SwitchError(f"Strata /unload failed: {code} {body}")
-        _wait_until(lambda: probe()["gpu"]["strata_mib"] == 0, 30, "Strata's engine to leave the GPU")
+        _wait_until(lambda: _gpu()["strata_mib"] == 0, 30, "Strata's engine to leave the GPU")
     elif s["gpu"]["strata_mib"]:
         raise SwitchError("a Strata process holds VRAM but strata.service is stopped; kill it by hand")
 
@@ -446,6 +445,9 @@ def main(argv: list[str] | None = None) -> int:
         command = args.command[1:] if args.command[:1] == ["--"] else args.command
         if not command:
             p.error("hold needs a command after --")
+        if os.environ.get(HOLD_ENV) == "comfy":
+            # Already inside a hold: our parent owns the lock, so taking it would deadlock.
+            return subprocess.call(command)
         return hold_comfy(command, args.wait)
 
     if args.cmd == "status":
