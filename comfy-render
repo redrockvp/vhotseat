@@ -23,12 +23,17 @@ failed · 2 bad input file or ComfyUI unreachable · 3 timed out.
 """
 
 import argparse
+import base64
 import copy
 import json
 import os
+import socket
+import struct
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -36,6 +41,8 @@ from pathlib import Path
 COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188")
 COMFY_DIR = Path(os.environ.get("COMFY_DIR", Path.home() / "ComfyUI"))
 POLL_S = 2.0
+# Live progress: at most one line per job this often, unless the running node changes.
+PROGRESS_EVERY_S = 10.0
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_TIMEOUT = 0, 1, 2, 3
 
@@ -160,12 +167,142 @@ def _runtime_error(status: dict, verbose: bool) -> str:
     return status.get("status_str") or "failed"
 
 
+# --- live progress -------------------------------------------------------------
+#
+# ComfyUI's HTTP API only says queued/running/done; step counts go out over its
+# websocket, to the client_id a job was queued with. Python has no websocket
+# client in the standard library, but this is a local, unencrypted socket that
+# only *receives* small JSON frames, so a minimal reader is enough. Anything
+# going wrong here just means no progress lines: /history stays the source of
+# truth for when a job is finished.
+
+
+class ProgressWatcher(threading.Thread):
+    """Reads ComfyUI's websocket and keeps the latest node / step per prompt."""
+
+    def __init__(self, client_id: str, class_types: dict[str, dict[str, str]]):
+        super().__init__(name="comfy-progress", daemon=True)
+        self.client_id = client_id
+        self.class_types = class_types  # prompt_id -> {node_id: class_type}
+        self.state: dict[str, dict] = {}  # prompt_id -> {"node", "value", "max"}
+        self.lock = threading.Lock()
+        self.connected = threading.Event()
+        self.sock: socket.socket | None = None
+
+    def connect(self, timeout: float = 5.0) -> bool:
+        """Open the websocket. Call before submitting jobs so no event is missed."""
+        try:
+            url = urllib.parse.urlsplit(COMFY_URL)
+            sock = socket.create_connection((url.hostname, url.port or 80), timeout=timeout)
+            key = base64.b64encode(os.urandom(16)).decode()
+            sock.sendall((
+                f"GET /ws?clientId={self.client_id} HTTP/1.1\r\nHost: {url.netloc}\r\n"
+                "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ).encode())
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    return False
+                head += chunk
+            if b" 101 " not in head.split(b"\r\n", 1)[0]:
+                return False
+            sock.settimeout(None)
+            self.sock = sock
+            self._buf = head.split(b"\r\n\r\n", 1)[1]
+            self.connected.set()
+            return True
+        except OSError:
+            return False
+
+    def _read(self, n: int) -> bytes:
+        while len(self._buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("closed")
+            self._buf += chunk
+        out, self._buf = self._buf[:n], self._buf[n:]
+        return out
+
+    def _frames(self):
+        """Yield (opcode, payload) for each complete message; server frames aren't masked."""
+        parts, first_op = [], None
+        while True:
+            b0, b1 = self._read(2)
+            fin, op = b0 & 0x80, b0 & 0x0F
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._read(8))[0]
+            payload = self._read(n)
+            if op == 0x8:  # close
+                return
+            if op in (0x9, 0xA):  # ping / pong: nothing to answer for a reader this short-lived
+                continue
+            if op != 0x0:
+                first_op, parts = op, []
+            parts.append(payload)
+            if fin:
+                yield first_op, b"".join(parts)
+
+    def run(self):
+        try:
+            for op, payload in self._frames():
+                if op != 0x1:  # binary frames are live preview images
+                    continue
+                try:
+                    msg = json.loads(payload)
+                except ValueError:
+                    continue
+                self._handle(msg.get("type"), msg.get("data") or {})
+        except (OSError, ConnectionError, struct.error, ValueError):
+            pass
+
+    def _handle(self, kind: str, data: dict) -> None:
+        pid = data.get("prompt_id")
+        if not pid:
+            return
+        with self.lock:
+            st = self.state.setdefault(pid, {})
+            if kind == "executing" and data.get("node") is not None:
+                st.update(node=str(data["node"]), value=None, max=None)
+            elif kind == "progress":
+                st.update(node=str(data.get("node") or st.get("node")),
+                          value=data.get("value"), max=data.get("max"))
+
+    def describe(self, pid: str) -> tuple[str | None, str | None]:
+        """(node_id, a one-line description) of what the job is doing right now."""
+        with self.lock:
+            st = dict(self.state.get(pid) or {})
+        node = st.get("node")
+        if not node:
+            return None, None
+        cls = self.class_types.get(pid, {}).get(node, "")
+        text = f"node {node} {cls}".rstrip()
+        value, total = st.get("value"), st.get("max")
+        if value is not None and total:
+            text += f" step {value}/{total} ({100 * value // total}%)"
+        return node, text
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+
 # --- run ----------------------------------------------------------------------
 
 
 def run(jobs: list[dict], timeout: float, verbose: bool) -> tuple[list[dict], bool]:
     """Submit every job, then wait for all of them. Returns (results, timed_out)."""
     client_id = f"comfy-render-{uuid.uuid4().hex[:8]}"
+    watcher = ProgressWatcher(client_id, {})
+    if watcher.connect():
+        watcher.start()
     results = []
     for i, wf in enumerate(jobs, 1):
         try:
@@ -174,14 +311,24 @@ def run(jobs: list[dict], timeout: float, verbose: bool) -> tuple[list[dict], bo
             raise UsageError(f"ComfyUI not reachable at {COMFY_URL}: {getattr(e, 'reason', e)}") from None
         if code == 200 and isinstance(body, dict) and body.get("prompt_id"):
             results.append({"job": i, "prompt_id": body["prompt_id"], "status": "queued"})
+            watcher.class_types[body["prompt_id"]] = {
+                nid: node.get("class_type", "") for nid, node in wf.items()
+            }
         else:
             results.append({"job": i, "status": "rejected", "errors": _validation_errors(body)})
     queued = sum(r["status"] == "queued" for r in results)
     print(f"queued {queued}/{len(jobs)} job(s)", flush=True)
+    try:
+        return _wait(results, queued, len(jobs), watcher, timeout, verbose)
+    finally:
+        watcher.close()
 
+
+def _wait(results, queued, total, watcher, timeout, verbose) -> tuple[list[dict], bool]:
     deadline = time.monotonic() + timeout
     pending = {r["prompt_id"]: r for r in results if r["status"] == "queued"}
-    last_note = 0.0
+    last_note = time.monotonic()  # "queued N job(s)" was just printed
+    shown: dict[str, tuple[str | None, str | None, float]] = {}  # pid -> (node, text, when)
     while pending:
         if time.monotonic() > deadline:
             for r in pending.values():
@@ -207,11 +354,30 @@ def run(jobs: list[dict], timeout: float, verbose: bool) -> tuple[list[dict], bo
                 r.update(status="done", files=files)
             del pending[pid]
             finished = queued - len(pending)
-            print(f"job {r['job']}/{len(jobs)} {r['status']} ({finished} of {queued} queued finished)", flush=True)
-        if pending and time.monotonic() - last_note > 60:
+            print(f"job {r['job']}/{total} {r['status']} ({finished} of {queued} queued finished)", flush=True)
+
+        now = time.monotonic()
+        for pid, r in pending.items():
+            node, text = watcher.describe(pid)
+            if not text:
+                # No node has started. Either jobs ahead of it are running, or it's
+                # ComfyUI's turn but the guard is still taking the GPU from Strata
+                # (~1 s) and the model is loading (tens of seconds): say so once.
+                if watcher.connected.is_set() and pid not in shown:
+                    print(f"job {r['job']}/{total} waiting to start (earlier jobs, or the GPU "
+                          "handover and model load)", flush=True)
+                    shown[pid] = (None, None, now)
+                    last_note = now
+                continue
+            last_node, last_text, when = shown.get(pid, (None, None, 0.0))
+            if text != last_text and (node != last_node or now - when >= PROGRESS_EVERY_S):
+                print(f"job {r['job']}/{total} running: {text}", flush=True)
+                shown[pid] = (node, text, now)
+                last_note = now
+        if pending and now - last_note > 60:
             # Keep the caller's idle watchdog fed during long renders.
             print(f"waiting on {len(pending)} job(s)…", flush=True)
-            last_note = time.monotonic()
+            last_note = now
         if pending:
             time.sleep(POLL_S)
     return results, False

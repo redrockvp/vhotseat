@@ -131,8 +131,31 @@ up once the first is fixed.
 
 Exit codes: `0` every job saved files · `1` some job was rejected or failed ·
 `2` bad input file or ComfyUI unreachable · `3` timed out (default 3600 s).
-While waiting it prints a line at least once a minute, so a caller's idle
-watchdog (the chat bot's) doesn't kill a long render.
+
+**Live progress.** While jobs run it prints what each one is doing, read from
+ComfyUI's websocket (the same feed as its own progress bar):
+
+```
+queued 1/1 job(s)
+job 1/1 waiting to start (earlier jobs, or the GPU handover and model load)
+job 1/1 running: node 3 CLIPTextEncode
+job 1/1 running: node 5 KSampler step 57/150 (38%)
+job 1/1 done (1 of 1 queued finished)
+```
+
+- **Throttled:** a line appears at most every 10 s per job, or at once when
+  the running node changes.
+- **Step counts** come from nodes that report them (samplers, and most video
+  models' sampling); other nodes show just their name.
+- **Fallback:** a line at least once a minute regardless, so a caller's idle
+  watchdog (the chat bot's) doesn't kill a long render.
+- **Pi passes these lines through as live steps**, so web and Slack show render
+  progress as it happens.
+- **Implementation:** Python's standard library has no websocket client, so
+  comfy-render has a minimal one (local, receive-only, text frames only;
+  preview-image frames are skipped). If it can't connect, the jobs still run
+  and report normally, just without progress lines. `/history` remains the
+  source of truth for when a job is finished.
 
 **Why it exists:** a pi turn on 2026-10-13 hand-wrote a polling script that
 crashed on `/history`'s shape after the first of four jobs finished. pi's turn
@@ -149,6 +172,9 @@ Measured 2026-10-13 against the live ComfyUI:
 | a batch with one good job, an unknown node, a wrong link type, a missing model file | 1 ok, 3 rejected with ComfyUI's messages; the missing model listed the valid file names |
 | a job whose input file vanished before it ran | `failed: node 1 LoadImage: [Errno 2] …`, while the other job in the batch still succeeded |
 | a UI-format file, invalid JSON, a missing file | exit 2 with a one-line reason |
+| a 150-step SDXL job | `KSampler step 9/150 (6%)`, then `64/150`, then `119/150`, 10 s apart |
+| a job submitted with ComfyUI's models unloaded | `waiting to start …` at 0 s, then `CLIPTextEncode` at 26 s (model load), then the sampler steps |
+| the websocket unreachable | no progress lines; the job still completed and reported normally |
 
 ## pi skill: run ComfyUI work through comfy-render, in batches
 
