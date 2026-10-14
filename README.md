@@ -3,6 +3,11 @@
 Hands the single 16 GB GPU between **Strata** (local LLM, `strata.service`,
 `:2335`) and **ComfyUI** (`comfyui.service`, `:8188`). They can't both hold VRAM.
 
+**New here?** Read [docs/how-it-works.md](docs/how-it-works.md) first. It
+walks through a full the chat bot → pi → ComfyUI → pi flow as a sequence
+diagram, then covers the race conditions and deadlocks, and how often the GPU
+changes hands. This README is the reference.
+
 ```
 gpu-workload status [--json]
 gpu-workload switch strata|comfy [--wait SECONDS] [--json]
