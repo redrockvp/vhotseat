@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""comfy-render: run a batch of ComfyUI workflows and report what came out.
+
+Queues every job up front, waits until all of them have finished, and prints
+one line per job: the files it produced, or ComfyUI's own error. It never
+crashes on a bad workflow; a job that fails is reported and the rest still run.
+
+    comfy-render JOBS.json [--timeout SECONDS] [--json] [--verbose]
+
+JOBS.json is either
+  - one workflow:      {"1": {"class_type": ..., "inputs": {...}}, ...}
+  - a list of them:    [ {workflow}, {workflow}, ... ]
+  - a base + variants: {"base": {workflow},
+                        "jobs": [{"5.inputs.seed": 1}, {"5.inputs.seed": 2}]}
+    where each variant overrides "NODE.inputs.NAME" paths in a copy of base.
+
+Workflows are ComfyUI's API format (what "Export (API)" saves, and what
+POST /prompt takes). The GPU handover to ComfyUI is done by the guard node;
+nothing here needs to know about it.
+
+Exit codes: 0 every job produced output · 1 at least one job was rejected or
+failed · 2 bad input file or ComfyUI unreachable · 3 timed out.
+"""
+
+import argparse
+import copy
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188")
+COMFY_DIR = Path(os.environ.get("COMFY_DIR", Path.home() / "ComfyUI"))
+POLL_S = 2.0
+
+EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_TIMEOUT = 0, 1, 2, 3
+
+
+class UsageError(Exception):
+    pass
+
+
+# --- input --------------------------------------------------------------------
+
+
+def _is_workflow(obj) -> bool:
+    return isinstance(obj, dict) and bool(obj) and all(
+        isinstance(v, dict) and "class_type" in v for v in obj.values()
+    )
+
+
+def _apply(workflow: dict, overrides: dict) -> dict:
+    out = copy.deepcopy(workflow)
+    for path, value in overrides.items():
+        parts = path.split(".")
+        if len(parts) != 3 or parts[1] != "inputs":
+            raise UsageError(f"override {path!r}: expected NODE.inputs.NAME")
+        node, _, name = parts
+        if node not in out:
+            raise UsageError(f"override {path!r}: no node {node!r} in base")
+        out[node].setdefault("inputs", {})[name] = value
+    return out
+
+
+def load_jobs(path: str) -> list[dict]:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise UsageError(f"{path}: no such file") from None
+    except json.JSONDecodeError as e:
+        raise UsageError(f"{path}: not valid JSON ({e})") from None
+
+    if _is_workflow(data):
+        return [data]
+    if isinstance(data, list) and data and all(_is_workflow(w) for w in data):
+        return data
+    if isinstance(data, dict) and "base" in data:
+        base, variants = data["base"], data.get("jobs") or [{}]
+        if not _is_workflow(base):
+            raise UsageError(f"{path}: 'base' is not an API-format workflow")
+        if not isinstance(variants, list) or not all(isinstance(v, dict) for v in variants):
+            raise UsageError(f"{path}: 'jobs' must be a list of override objects")
+        return [_apply(base, v) for v in variants]
+    raise UsageError(
+        f"{path}: expected an API-format workflow, a list of them, or "
+        '{"base": workflow, "jobs": [overrides]}. A UI-format export (with '
+        '"nodes" and "links") won\'t work; use "Export (API)".'
+    )
+
+
+# --- ComfyUI ------------------------------------------------------------------
+
+
+def _request(method: str, path: str, body=None, timeout: float = 30):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        COMFY_URL + path, data=data, method=method, headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return e.code, raw.decode(errors="replace")
+
+
+def _validation_errors(body) -> list[str]:
+    """Flatten a /prompt 400 into one readable line per problem."""
+    if not isinstance(body, dict):
+        return [str(body)[:300]]
+    lines = []
+    for node_id, info in (body.get("node_errors") or {}).items():
+        cls = info.get("class_type", "?")
+        for err in info.get("errors") or []:
+            detail = err.get("details") or ""
+            lines.append(f"node {node_id} {cls}: {err.get('message', 'error')}" + (f": {detail}" if detail else ""))
+    if not lines:
+        err = body.get("error") or {}
+        msg = err.get("message") or str(body)[:300]
+        detail = err.get("details") or ""
+        lines.append(msg + (f" ({detail})" if detail else ""))
+    return lines
+
+
+def _files(outputs: dict) -> list[str]:
+    """Every saved file, whatever the output key (images, audio, gifs, …)."""
+    files = []
+    for node_out in (outputs or {}).values():
+        for value in node_out.values():
+            if not isinstance(value, list):
+                continue
+            for item in value:
+                if isinstance(item, dict) and "filename" in item:
+                    root = "temp" if item.get("type") == "temp" else "output"
+                    files.append(str(COMFY_DIR / root / item.get("subfolder", "") / item["filename"]))
+    return files
+
+
+def _runtime_error(status: dict, verbose: bool) -> str:
+    for kind, data in status.get("messages") or []:
+        if kind == "execution_error":
+            line = (f"node {data.get('node_id')} {data.get('node_type')}: "
+                    f"{data.get('exception_message', '').strip()}")
+            if verbose and data.get("traceback"):
+                # Library internals end the traceback; the frames that say where
+                # in the workflow's nodes it broke are the ones under ComfyUI/.
+                frames = [f for f in data["traceback"] if str(COMFY_DIR) in f and "/.venv/" not in f]
+                tail = "".join((frames or data["traceback"])[-3:]).rstrip()
+                line += "\n    " + "\n    ".join(tail.splitlines())
+            return line
+        if kind == "execution_interrupted":
+            return f"interrupted at node {data.get('node_id')} {data.get('node_type')}"
+    return status.get("status_str") or "failed"
+
+
+# --- run ----------------------------------------------------------------------
+
+
+def run(jobs: list[dict], timeout: float, verbose: bool) -> tuple[list[dict], bool]:
+    """Submit every job, then wait for all of them. Returns (results, timed_out)."""
+    client_id = f"comfy-render-{uuid.uuid4().hex[:8]}"
+    results = []
+    for i, wf in enumerate(jobs, 1):
+        try:
+            code, body = _request("POST", "/prompt", {"prompt": wf, "client_id": client_id})
+        except (urllib.error.URLError, OSError) as e:
+            raise UsageError(f"ComfyUI not reachable at {COMFY_URL}: {getattr(e, 'reason', e)}") from None
+        if code == 200 and isinstance(body, dict) and body.get("prompt_id"):
+            results.append({"job": i, "prompt_id": body["prompt_id"], "status": "queued"})
+        else:
+            results.append({"job": i, "status": "rejected", "errors": _validation_errors(body)})
+    queued = sum(r["status"] == "queued" for r in results)
+    print(f"queued {queued}/{len(jobs)} job(s)", flush=True)
+
+    deadline = time.monotonic() + timeout
+    pending = {r["prompt_id"]: r for r in results if r["status"] == "queued"}
+    last_note = 0.0
+    while pending:
+        if time.monotonic() > deadline:
+            for r in pending.values():
+                r.update(status="timeout", errors=[f"not finished after {timeout:g}s (still queued or running)"])
+            return results, True
+        for pid, r in list(pending.items()):
+            try:
+                _, hist = _request("GET", f"/history/{pid}")
+            except (urllib.error.URLError, OSError):
+                continue  # transient; try again next round
+            entry = hist.get(pid) if isinstance(hist, dict) else None
+            if not entry:
+                continue
+            status = entry.get("status") or {}
+            if not status.get("completed") and status.get("status_str") != "error":
+                continue
+            files = _files(entry.get("outputs"))
+            if status.get("status_str") == "error":
+                r.update(status="failed", errors=[_runtime_error(status, verbose)])
+            elif not files:
+                r.update(status="failed", errors=["finished but saved no files (no Save* output node?)"])
+            else:
+                r.update(status="done", files=files)
+            del pending[pid]
+            finished = queued - len(pending)
+            print(f"job {r['job']}/{len(jobs)} {r['status']} ({finished} of {queued} queued finished)", flush=True)
+        if pending and time.monotonic() - last_note > 60:
+            # Keep the caller's idle watchdog fed during long renders.
+            print(f"waiting on {len(pending)} job(s)…", flush=True)
+            last_note = time.monotonic()
+        if pending:
+            time.sleep(POLL_S)
+    return results, False
+
+
+def summarize(results: list[dict]) -> str:
+    lines = []
+    n = len(results)
+    for r in results:
+        head = f"job {r['job']}/{n}"
+        if r["status"] == "done":
+            lines.append(f"{head} ok: " + ", ".join(r["files"]))
+        else:
+            for err in r.get("errors") or [r["status"]]:
+                lines.append(f"{head} {r['status']}: {err}")
+    ok = sum(r["status"] == "done" for r in results)
+    files = sum(len(r.get("files", [])) for r in results)
+    lines.append(f"{ok}/{n} job(s) succeeded, {files} file(s)")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="comfy-render", description=__doc__.split("\n\n")[0])
+    p.add_argument("jobs", help="JSON file: a workflow, a list of them, or {base, jobs}")
+    p.add_argument("--timeout", type=float, default=3600, metavar="SECONDS",
+                   help="give up waiting after this long (default 3600)")
+    p.add_argument("--json", action="store_true", help="print the results as JSON")
+    p.add_argument("--verbose", action="store_true", help="include traceback tails for runtime errors")
+    args = p.parse_args(argv)
+
+    try:
+        jobs = load_jobs(args.jobs)
+        results, timed_out = run(jobs, args.timeout, args.verbose)
+    except UsageError as e:
+        print(f"comfy-render: {e}", file=sys.stderr)
+        return EXIT_USAGE
+
+    print(json.dumps(results, indent=1) if args.json else summarize(results))
+    if timed_out:
+        return EXIT_TIMEOUT
+    return EXIT_OK if all(r["status"] == "done" for r in results) else EXIT_FAILED
+
+
+if __name__ == "__main__":
+    sys.exit(main())

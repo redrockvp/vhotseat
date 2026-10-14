@@ -94,15 +94,87 @@ Measured 2026-10-13:
 | A Strata request between two jobs | both jobs succeeded |
 | The guard's wait cut to 2 s | job failed visibly in 2.5 s |
 
-## pi skill: batch ComfyUI work
+## comfy-render: run a batch of workflows
 
-`pi/skills/comfyui-batching/SKILL.md` is a best-effort hint for pi: queue
-each round's ComfyUI jobs up front and wait once, over-generate rather than
-re-roll, review one contact sheet per round, and keep tool output short.
-Every handover costs a ~30 s Strata reload plus a re-read of the
-conversation. It's installed for pi only, as a symlink:
-`~/.pi/agent/skills/comfyui-batching`. Pi lists it in `<available_skills>`
-in headless runs too (checked 2026-10-13).
+```
+comfy-render JOBS.json [--timeout SECONDS] [--json] [--verbose]
+```
+
+Queues every job up front, waits until **all** of them have finished, and
+prints one line per job: the files it saved, or ComfyUI's own error. It doesn't
+touch the GPU itself; the guard node does the handover. Installed as a symlink:
+`~/.local/bin/comfy-render`.
+
+JOBS.json is API-format workflow JSON, in one of three shapes:
+
+| Shape | Use |
+| --- | --- |
+| a single workflow | one job |
+| a list of workflows | several different jobs |
+| `{"base": workflow, "jobs": [{"5.inputs.seed": 11}, …]}` | variants: each overrides `NODE.inputs.NAME` in a copy of `base` |
+
+A UI-format export (`nodes` / `links`) is refused with a hint to use
+"Export (API)".
+
+What it reports:
+
+| Outcome | Example line |
+| --- | --- |
+| saved files | `job 2/4 ok: /…/output/a.png` (files from any `Save*`/`Preview*` node, whatever its output key) |
+| rejected at submit (HTTP 400) | `job 3/4 rejected: node 7 PreviewImage: Return type mismatch …` |
+| failed while running | `job 1/4 failed: node 1 LoadImage: [Errno 2] No such file …` (`--verbose` adds the ComfyUI frames of the traceback) |
+| finished, no files | `job 1/1 failed: finished but saved no files (no Save* output node?)` |
+
+A bad job never stops the others. ComfyUI validates each output backwards and
+stops at the first broken link, so a second problem in the same job only shows
+up once the first is fixed.
+
+Exit codes: `0` every job saved files · `1` some job was rejected or failed ·
+`2` bad input file or ComfyUI unreachable · `3` timed out (default 3600 s).
+While waiting it prints a line at least once a minute, so a caller's idle
+watchdog (the chat bot's) doesn't kill a long render.
+
+**Why it exists:** a pi turn on 2026-10-13 hand-wrote a polling script that
+crashed on `/history`'s shape after the first of four jobs finished. pi's turn
+then continued while three jobs were still queued, so Strata was refused
+(correctly) and the turn failed with "GPU busy", although all four images
+rendered. Waiting correctly is the part a local model gets wrong; designing
+the workflow is not.
+
+Measured 2026-10-13 against the live ComfyUI:
+
+| Test | Result |
+| --- | --- |
+| 3 seed variants of a base workflow | all saved, 6 s |
+| a batch with one good job, an unknown node, a wrong link type, a missing model file | 1 ok, 3 rejected with ComfyUI's messages; the missing model listed the valid file names |
+| a job whose input file vanished before it ran | `failed: node 1 LoadImage: [Errno 2] …`, while the other job in the batch still succeeded |
+| a UI-format file, invalid JSON, a missing file | exit 2 with a one-line reason |
+
+## pi skill: run ComfyUI work through comfy-render, in batches
+
+`pi/skills/comfyui-batching/SKILL.md` tells pi two things:
+
+- run workflows with `comfy-render` rather than its own polling script;
+- batch as a best effort: one call per round, over-generate rather than
+  re-roll, one contact sheet per round.
+
+Every handover costs a ~30 s Strata reload plus a re-read of the conversation.
+pi still designs the workflows itself. The skill is installed for pi only, as a
+symlink: `~/.pi/agent/skills/comfyui-batching`. Pi lists it in
+`<available_skills>` in headless runs too (checked 2026-10-13).
+
+**pi's retry window** (machine config, not in this repo): when ComfyUI is
+still rendering, Strata refuses pi with a 503 and pi retries. The default is 3
+retries, ~14 s in total, which a render that's still finishing outlasts.
+`~/.pi/agent/settings.json` sets
+
+```json
+"retry": {"maxRetries": 8, "baseDelayMs": 2000, "maxAgentDelayMs": 30000}
+```
+
+`maxAgentDelayMs` caps each delay, not the total. Measured 2026-10-13 against an
+always-503 server: delays of 2, 4, 8, 16 and then 30 s ×4, giving up after
+151 s.
 
 ## `hold`: optional, for batches
 
