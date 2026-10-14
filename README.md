@@ -85,6 +85,9 @@ after installing or changing it.
 - **It's a private API:** an update can break it. The guard switches itself off
   with an error in the log if the method disappears. After every ComfyUI update,
   follow [docs/comfyui-updates.md](docs/comfyui-updates.md).
+- **TTS Audio Suite:** IndexTTS needs a local patch to fully leave the GPU on
+  unload. Re-apply it after every suite update; see
+  [docs/tts-audio-suite-vram.md](docs/tts-audio-suite-vram.md).
 - **Env:**
   - `GPU_WORKLOAD_GUARD=0` disables it;
   - `GPU_WORKLOAD_GUARD_WAIT_S` sets how long it waits;
