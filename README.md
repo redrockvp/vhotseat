@@ -132,13 +132,31 @@ What it reports:
 | rejected at submit (HTTP 400) | `job 3/4 rejected: node 7 PreviewImage: Return type mismatch …` |
 | failed while running | `job 1/4 failed: node 1 LoadImage: [Errno 2] No such file …` (`--verbose` adds the ComfyUI frames of the traceback) |
 | finished, no files | `job 1/1 failed: finished but saved no files (no Save* output node?)` |
+| cancelled while running | `job 2/4 cancelled: cancelled by the user (dashboard or ComfyUI) while running node 5 KSampler` |
+| cancelled while queued | `job 3/4 cancelled: cancelled by the user (…) before it started` |
 
 A bad job never stops the others. ComfyUI validates each output backwards and
 stops at the first broken link, so a second problem in the same job only shows
 up once the first is fixed.
 
 Exit codes: `0` every job saved files · `1` some job was rejected or failed ·
-`2` bad input file or ComfyUI unreachable · `3` timed out (default 3600 s).
+`2` bad input file or ComfyUI unreachable · `3` timed out (default 3600 s) ·
+`4` the user cancelled some job (wins over `1` and `3`).
+
+**Cancelled jobs.** Nothing on this machine stops a job except a person (the
+dashboard's Cancel button, ComfyUI's own page, or `comfy jobs
+cancel`); the guard node fails a job with an error instead. So a cancel is
+reported as the user's, separately from failures, and the summary ends with
+`N job(s) cancelled by the user: ask them why before re-running`, so an agent
+asks rather than retrying. ComfyUI records the two cases differently, and both
+are handled:
+
+- **Running:** `/interrupt` leaves an `execution_interrupted` entry in
+  `/history`. Files the job saved before it was stopped are still listed.
+- **Queued:** the job is deleted from the queue and never reaches `/history`.
+  A job that is in neither `/queue` nor `/history` (read in that order, since
+  ComfyUI moves a job from one to the other in a single step) was cancelled.
+  Before this, comfy-render waited for it until the timeout.
 
 **Live progress.** While jobs run it prints what each one is doing, read from
 ComfyUI's websocket (the same feed as its own progress bar):

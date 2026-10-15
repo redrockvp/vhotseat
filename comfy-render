@@ -19,7 +19,8 @@ POST /prompt takes). The GPU handover to ComfyUI is done by the guard node;
 nothing here needs to know about it.
 
 Exit codes: 0 every job produced output · 1 at least one job was rejected or
-failed · 2 bad input file or ComfyUI unreachable · 3 timed out.
+failed · 2 bad input file or ComfyUI unreachable · 3 timed out · 4 the user
+cancelled at least one job (it outranks 1 and 3: ask them why before re-running).
 """
 
 import argparse
@@ -44,7 +45,12 @@ POLL_S = 2.0
 # Live progress: at most one line per job this often, unless the running node changes.
 PROGRESS_EVERY_S = 10.0
 
-EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_TIMEOUT = 0, 1, 2, 3
+EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_TIMEOUT, EXIT_CANCELLED = 0, 1, 2, 3, 4
+
+# Nothing on this machine interrupts or dequeues a job except a person: the
+# dashboard's Cancel, ComfyUI's own page, or `comfy jobs cancel`.
+# The guard node fails a job with an error instead.
+CANCELLED_BY = "cancelled by the user (dashboard or ComfyUI)"
 
 
 class UsageError(Exception):
@@ -162,9 +168,29 @@ def _runtime_error(status: dict, verbose: bool) -> str:
                 tail = "".join((frames or data["traceback"])[-3:]).rstrip()
                 line += "\n    " + "\n    ".join(tail.splitlines())
             return line
-        if kind == "execution_interrupted":
-            return f"interrupted at node {data.get('node_id')} {data.get('node_type')}"
     return status.get("status_str") or "failed"
+
+
+def _interrupted_at(status: dict) -> str | None:
+    """The node a running job was stopped at, if it was cancelled rather than failed."""
+    for kind, data in status.get("messages") or []:
+        if kind == "execution_interrupted":
+            return f"node {data.get('node_id')} {data.get('node_type')}"
+    return None
+
+
+def _queued_ids() -> set[str] | None:
+    """Prompt ids ComfyUI still has running or pending, or None if it didn't answer."""
+    try:
+        code, body = _request("GET", "/queue")
+    except (urllib.error.URLError, OSError):
+        return None
+    if code != 200 or not isinstance(body, dict):
+        return None
+    return {
+        item[1] for key in ("queue_running", "queue_pending")
+        for item in body.get(key) or [] if isinstance(item, list) and len(item) > 1
+    }
 
 
 # --- live progress -------------------------------------------------------------
@@ -324,6 +350,20 @@ def run(jobs: list[dict], timeout: float, verbose: bool) -> tuple[list[dict], bo
         watcher.close()
 
 
+def _outcome(entry: dict, status: dict, verbose: bool) -> dict:
+    """What a job that reached /history ended as."""
+    files = _files(entry.get("outputs"))
+    if status.get("status_str") == "error":
+        node = _interrupted_at(status)
+        if node:
+            return {"status": "cancelled", "errors": [f"{CANCELLED_BY} while running {node}"],
+                    "files": files}
+        return {"status": "failed", "errors": [_runtime_error(status, verbose)]}
+    if not files:
+        return {"status": "failed", "errors": ["finished but saved no files (no Save* output node?)"]}
+    return {"status": "done", "files": files}
+
+
 def _wait(results, queued, total, watcher, timeout, verbose) -> tuple[list[dict], bool]:
     deadline = time.monotonic() + timeout
     pending = {r["prompt_id"]: r for r in results if r["status"] == "queued"}
@@ -334,6 +374,9 @@ def _wait(results, queued, total, watcher, timeout, verbose) -> tuple[list[dict]
             for r in pending.values():
                 r.update(status="timeout", errors=[f"not finished after {timeout:g}s (still queued or running)"])
             return results, True
+        # A job leaves the queue and enters /history in one step, so reading
+        # /queue before /history means a job in neither was deleted while queued.
+        in_queue = _queued_ids()
         for pid, r in list(pending.items()):
             try:
                 _, hist = _request("GET", f"/history/{pid}")
@@ -341,20 +384,20 @@ def _wait(results, queued, total, watcher, timeout, verbose) -> tuple[list[dict]
                 continue  # transient; try again next round
             entry = hist.get(pid) if isinstance(hist, dict) else None
             if not entry:
-                continue
-            status = entry.get("status") or {}
-            if not status.get("completed") and status.get("status_str") != "error":
-                continue
-            files = _files(entry.get("outputs"))
-            if status.get("status_str") == "error":
-                r.update(status="failed", errors=[_runtime_error(status, verbose)])
-            elif not files:
-                r.update(status="failed", errors=["finished but saved no files (no Save* output node?)"])
+                if in_queue is None or pid in in_queue:
+                    continue
+                r.update(status="cancelled", errors=[f"{CANCELLED_BY} before it started"])
             else:
-                r.update(status="done", files=files)
+                status = entry.get("status") or {}
+                if not status.get("completed") and status.get("status_str") != "error":
+                    continue
+                r.update(**_outcome(entry, status, verbose))
             del pending[pid]
             finished = queued - len(pending)
-            print(f"job {r['job']}/{total} {r['status']} ({finished} of {queued} queued finished)", flush=True)
+            line = f"job {r['job']}/{total} {r['status']}"
+            if r["status"] == "cancelled":
+                line += f": {r['errors'][0]}"
+            print(f"{line} ({finished} of {queued} queued finished)", flush=True)
 
         now = time.monotonic()
         for pid, r in pending.items():
@@ -393,9 +436,14 @@ def summarize(results: list[dict]) -> str:
         else:
             for err in r.get("errors") or [r["status"]]:
                 lines.append(f"{head} {r['status']}: {err}")
+            if r.get("files"):  # a job cancelled partway may have saved some already
+                lines.append(f"{head} saved before it was cancelled: " + ", ".join(r["files"]))
     ok = sum(r["status"] == "done" for r in results)
     files = sum(len(r.get("files", [])) for r in results)
     lines.append(f"{ok}/{n} job(s) succeeded, {files} file(s)")
+    cancelled = sum(r["status"] == "cancelled" for r in results)
+    if cancelled:
+        lines.append(f"{cancelled} job(s) cancelled by the user: ask them why before re-running")
     return "\n".join(lines)
 
 
@@ -416,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
 
     print(json.dumps(results, indent=1) if args.json else summarize(results))
+    if any(r["status"] == "cancelled" for r in results):
+        return EXIT_CANCELLED
     if timed_out:
         return EXIT_TIMEOUT
     return EXIT_OK if all(r["status"] == "done" for r in results) else EXIT_FAILED
