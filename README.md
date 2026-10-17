@@ -19,6 +19,14 @@ gpu-workload hook strata-before-load     # called by Strata, not by hand
 Exit codes: `0` ok · `1` switch failed or hook refused · `2` usage · `3` `check` found the wrong mode.
 `hold` exits with COMMAND's own exit code.
 
+**Code layout.** `gpu-workload` is a thin wrapper around the `vhotseat`
+package in [src/vhotseat/](src/vhotseat/), the start of the generic version
+planned in [docs/plans/2026-10-14-vhotseat.md](docs/plans/2026-10-14-vhotseat.md)
+(phase 0: same behaviour, split into an arbiter, a lock, and one driver per
+workload). The CLI, its output, exit codes, env vars, lock file and event log
+are unchanged. Tests: `uv run --with pytest pytest` in this directory (fake
+Strata and ComfyUI servers; no GPU needed).
+
 ## Modes
 
 The mode is **derived live** from Strata `/health`, ComfyUI `/queue` and
@@ -261,6 +269,11 @@ COMMAND exits, so every Strata load is refused for that whole time.
 - Inside a hold, `gpu-workload switch comfy` is a no-op, and `switch strata`
   fails. Both are detected via the `GPU_WORKLOAD_HOLD` env var, since taking
   the lock would deadlock.
+- A `switch comfy` from **outside** the hold's command, which is how the
+  ComfyUI guard runs (in ComfyUI's process, without that env var), is also a
+  no-op while a `hold comfy` owns the lock: the GPU is already ComfyUI's. Until
+  2026-10-17 it waited for the lock, so a job queued by a held script waited
+  on the hold, which waited on the job, until the guard's 420 s timeout.
 - SIGINT, SIGTERM and SIGHUP are forwarded to COMMAND. The lock is released
   only after COMMAND exits.
 - A script that queues **all** its jobs at once gets the same effect without
@@ -282,6 +295,7 @@ answers **503** and doesn't load. The hook decides like this:
 | a `switch strata` is in progress (it triggered this load) | allow |
 | a `switch comfy` or `hold comfy` is in progress | refuse |
 | a request woke the lazy model; ComfyUI has jobs running or queued | refuse: a render is never interrupted |
+| a request woke the lazy model; ComfyUI holds models but its `/queue` doesn't answer | refuse: it may be rendering (until 2026-10-17 an unanswered `/queue` counted as no jobs) |
 | a request woke the lazy model; ComfyUI idle, no models loaded | allow |
 | a request woke the lazy model; ComfyUI idle but **holding models** | free ComfyUI's models (`/free`, wait up to 20 s for its VRAM to drop below 1500 MiB), then allow |
 | either of the two above, and ComfyUI's VRAM won't drop or its RAM + swap is still above 4 GiB | also [restart ComfyUI](#comfyui-restart-ram-not-just-vram) first, then allow |
