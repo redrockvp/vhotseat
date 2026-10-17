@@ -1,0 +1,10 @@
+[project]
+name = "vhotseat"
+version = "0.0.0"
+description = "Take turns on one GPU: hand it between workloads without interrupting work."
+requires-python = ">=3.10"
+license = "MIT"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+testpaths = ["tests"]
