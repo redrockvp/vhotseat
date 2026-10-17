@@ -140,7 +140,7 @@ stops at the first broken link, so a second problem in the same job only shows
 up once the first is fixed.
 
 Exit codes: `0` every job saved files · `1` some job was rejected or failed ·
-`2` bad input file or ComfyUI unreachable · `3` timed out (default 3600 s) ·
+`2` bad input file or ComfyUI unreachable · `3` no progress for `--timeout` s (default 1800) ·
 `4` the user cancelled some job (wins over `1` and `3`).
 
 **Cancelled jobs.** Nothing on this machine stops a job except a person (the
@@ -182,6 +182,21 @@ job 1/1 done (1 of 1 queued finished)
   preview-image frames are skipped). If it can't connect, the jobs still run
   and report normally, just without progress lines. `/history` remains the
   source of truth for when a job is finished.
+
+**Timeout: no progress, not total time.** `--timeout` (default 1800 s) is how
+long it may go without any progress: a job finishing, a websocket event for one
+of its jobs (a node or sampler step starting), or ComfyUI's queue changing (the
+batch may be waiting behind someone else's jobs, which send it no events). A
+batch that keeps progressing may run for hours. On a timeout the unfinished
+jobs stay in ComfyUI's queue.
+
+Until 2026-10-16 it was a 3600 s limit on the whole batch. A 9-video batch hit
+it with 6 jobs still running. pi's turn went on, Strata refused it (correctly,
+since ComfyUI had jobs), pi retried for ~151 s and the turn failed with "GPU
+busy". The same happened earlier that day with a 22-job batch. The pi skill
+also now tells pi not to pipe comfy-render's output (it had used `| tail -20`,
+which hid the live progress for the whole hour) or set its own timeout. pi's
+bash tool has no default timeout.
 
 **Why it exists:** a pi turn on 2026-10-13 hand-wrote a polling script that
 crashed on `/history`'s shape after the first of four jobs finished. pi's turn
