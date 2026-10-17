@@ -229,7 +229,7 @@ Measured 2026-10-13 against the live ComfyUI:
 
 Every handover costs a ~30 s Strata reload plus a re-read of the conversation.
 pi still designs the workflows itself. The skill is installed for pi only, as a
-symlink: `~/.pi/agent/skills/comfyui-batching`. Pi lists it in
+symlink in the `.pi/skills/` of the folder pi runs ComfyUI work from. Pi lists it in
 `<available_skills>` in headless runs too (checked 2026-10-13).
 
 **pi's retry window** (machine config, not in this repo): when ComfyUI is

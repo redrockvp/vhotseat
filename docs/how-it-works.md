@@ -35,7 +35,7 @@ Reference material, such as commands, flags and env vars, is in
 | **Strata's `before_load` hook** | `strata-iq2_xs.json` → `gpu-workload hook strata-before-load`, with `before_load_strict: true` | Runs before Strata loads its model. Decides allow / refuse; may free an idle ComfyUI first. |
 | **ComfyUI guard node** | `comfyui/gpu_workload_guard`, symlinked into `custom_nodes/` | Wraps `PromptExecutor.execute_async`; runs `gpu-workload switch comfy --wait 300` before **every** job. |
 | `comfy-render` | `gpu-workload/comfy-render`, on PATH | Submits a batch of workflows, waits for **all** of them, and reports files or errors plus live progress. It never touches the GPU itself. |
-| pi skill `comfyui-batching` | `pi/skills/`, symlinked into `~/.pi/agent/skills/` | Tells pi to use `comfy-render` and to batch. Best effort. |
+| pi skill `comfyui-batching` | `pi/skills/`, symlinked into the pi workspace's `.pi/skills/` | Tells pi to use `comfy-render` and to batch. Best effort. |
 | pi retry window | `~/.pi/agent/settings.json` | When Strata answers 503, pi retries for ~151 s instead of ~14 s. |
 | Strata `lazy_load` | `strata-iq2_xs.json` | The service stays up holding no VRAM until a request arrives. |
 
