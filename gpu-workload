@@ -44,6 +44,13 @@ STRATA_PROC = os.environ.get("GPU_WORKLOAD_STRATA_PROC", "/Strata/")
 COMFY_PROC = os.environ.get("GPU_WORKLOAD_COMFY_PROC", "/ComfyUI/")
 # ComfyUI's CUDA context alone is ~450 MiB; above this it is holding models.
 COMFY_IDLE_MIB = int(os.environ.get("GPU_WORKLOAD_COMFY_IDLE_MIB", "1500"))
+# /free empties ComfyUI's VRAM but not its RAM: after a video render it kept ~11 GiB
+# (RAM + swap), and Strata's ~38 GiB load on top pushed the machine into memory
+# pressure. Above this (RAM + swap, MiB) an idle ComfyUI is restarted before Strata loads.
+COMFY_RESTART_MIB = int(os.environ.get("GPU_WORKLOAD_COMFY_RESTART_MIB", "4096"))
+# A restart wipes ComfyUI's /history. comfy-render polls it every 2 s, so a job that
+# finished less than this long ago may not have been reported yet: wait first.
+COMFY_HISTORY_SETTLE_S = 10
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "gpu-workload"
 LOCK_FILE = STATE_DIR / "switch.lock"      # holds the target mode while a switch or hold runs
 EVENTS_FILE = STATE_DIR / "events.jsonl"   # every switch and every hook decision
@@ -51,8 +58,11 @@ EVENTS_KEEP = 500
 # Set in a `hold` command's environment, so a nested `switch` to the held mode is a no-op
 # instead of deadlocking on the lock the hold owns.
 HOLD_ENV = "GPU_WORKLOAD_HOLD"
-# The hook must finish inside Strata's before_load_timeout_s (30 s); /free measured at ~2 s.
+# The hook must finish inside Strata's before_load_timeout_s (90 s): /free ~2 s (or a
+# 20 s timeout when it can't empty VRAM), then possibly the history settle (<= 10 s)
+# and a ComfyUI restart (~15-20 s, up to COMFY_RESTART_TIMEOUT_S).
 HOOK_RELEASE_TIMEOUT_S = 20
+COMFY_RESTART_TIMEOUT_S = 50
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_WRONG_MODE = 0, 1, 2, 3
 
@@ -115,6 +125,49 @@ def _gpu() -> dict:
     return out
 
 
+def _unit_mib(unit: str) -> dict:
+    """A unit's anonymous memory and swap (MiB), from its cgroup. Page cache is left
+    out of ram_mib: the kernel drops it under pressure. file_mib (page cache charged
+    to the unit) is reported on its own, to see whether that assumption holds."""
+    out = {"ram_mib": None, "swap_mib": None, "file_mib": None}
+    r = subprocess.run(["systemctl", "--user", "show", unit, "-p", "ControlGroup", "--value"],
+                       capture_output=True, text=True)
+    cgroup = r.stdout.strip()
+    if not cgroup:
+        return out
+    base = Path("/sys/fs/cgroup") / cgroup.lstrip("/")
+    try:
+        for line in (base / "memory.stat").read_text().splitlines():
+            key, value = line.split()
+            if key in ("anon", "file"):
+                out["ram_mib" if key == "anon" else "file_mib"] = int(value) // 2**20
+        out["swap_mib"] = int((base / "memory.swap.current").read_text()) // 2**20
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def _ram() -> dict:
+    """Machine RAM and swap (MiB) from /proc/meminfo, plus each server's share."""
+    out = {"total_mib": None, "available_mib": None, "swap_total_mib": None, "swap_used_mib": None}
+    try:
+        info = {k: int(v.split()[0]) // 1024 for k, v in
+                (line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())}
+        out.update(total_mib=info["MemTotal"], available_mib=info["MemAvailable"],
+                   swap_total_mib=info["SwapTotal"], swap_used_mib=info["SwapTotal"] - info["SwapFree"])
+    except (OSError, KeyError, ValueError) as e:
+        out["error"] = f"/proc/meminfo: {e}"
+    out["strata"] = _unit_mib(STRATA_UNIT)
+    out["comfy"] = _unit_mib(COMFY_UNIT)
+    return out
+
+
+def _comfy_held_mib() -> int:
+    """ComfyUI's RAM plus swap (MiB), 0 if unknown."""
+    m = _unit_mib(COMFY_UNIT)
+    return (m["ram_mib"] or 0) + (m["swap_mib"] or 0)
+
+
 def probe() -> dict:
     strata = {"service": _unit_active(STRATA_UNIT), "reachable": False, "loaded": False}
     if strata["service"]:
@@ -144,7 +197,8 @@ def probe() -> dict:
         mode = "strata"
     else:
         mode = "comfy"
-    return {"mode": mode, "strata": strata, "comfy": comfy, "gpu": gpu, "last_event": last_event()}
+    return {"mode": mode, "strata": strata, "comfy": comfy, "gpu": gpu, "ram": _ram(),
+            "last_event": last_event()}
 
 
 def _describe(s: dict) -> str:
@@ -167,11 +221,30 @@ def _describe(s: dict) -> str:
         f"(strata {g['strata_mib']}, comfy {g['comfy_mib']}, other {g['other_mib']})"
         if "error" not in g else g["error"]
     )
-    out = f"mode:   {s['mode']}\nstrata: {strata}\ncomfy:  {comfy}\ngpu:    {gpu}"
+    out = f"mode:   {s['mode']}\nstrata: {strata}\ncomfy:  {comfy}\ngpu:    {gpu}\nram:    {_describe_ram(s['ram'])}"
     if ev := s.get("last_event"):
         detail = ", ".join(f"{k}={v}" for k, v in ev.items() if k not in ("time", "event"))
         out += f"\nlast:   {ev['time']} {ev['event']}" + (f" ({detail})" if detail else "")
     return out
+
+
+def _describe_ram(r: dict) -> str:
+    if "error" in r:
+        return r["error"]
+
+    def gib(mib):
+        return f"{mib / 1024:.1f}"
+
+    def share(name):
+        m = r[name]
+        if m["ram_mib"] is None:
+            return f"{name} -"
+        swap = f" + {gib(m['swap_mib'])} swap" if m["swap_mib"] else ""
+        return f"{name} {gib(m['ram_mib'])} GiB{swap}"
+
+    return (f"{gib(r['available_mib'])} of {gib(r['total_mib'])} GiB available, "
+            f"swap {gib(r['swap_used_mib'])} of {gib(r['swap_total_mib'])} GiB used "
+            f"({share('strata')}, {share('comfy')})")
 
 
 # --- events ------------------------------------------------------------------
@@ -247,6 +320,61 @@ def free_comfy(wait: float, release_timeout: float = 60) -> None:
     )
 
 
+def _comfy_last_finish() -> float | None:
+    """When ComfyUI's newest /history entry finished (epoch seconds), or None."""
+    code, body = _http("GET", f"{COMFY_URL}/history?max_items=1")
+    if code != 200 or not isinstance(body, dict) or not body:
+        return None
+    entry = list(body.values())[-1]
+    stamps = [m[1].get("timestamp") for m in (entry.get("status") or {}).get("messages") or []
+              if isinstance(m, list) and len(m) == 2 and isinstance(m[1], dict)]
+    stamps = [t for t in stamps if isinstance(t, (int, float))]
+    return max(stamps) / 1000 if stamps else None
+
+
+def restart_comfy(timeout: float, why: str) -> None:
+    """Restart an idle ComfyUI. A restart wipes /history, so it first waits until
+    the newest job finished COMFY_HISTORY_SETTLE_S ago (comfy-render has read it
+    by then), and re-checks the queue right before stopping."""
+    if (done := _comfy_last_finish()) is not None:
+        if (left := done + COMFY_HISTORY_SETTLE_S - time.time()) > 0:
+            _log(f"waiting {left:.0f}s so the last job's result is read before the restart")
+            time.sleep(left)
+    if _comfy_jobs():
+        raise SwitchError("a ComfyUI job was queued just now; not restarting it")
+    _log(f"restarting ComfyUI: {why}")
+    r = subprocess.run(["systemctl", "--user", "restart", COMFY_UNIT], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SwitchError(f"systemctl --user restart {COMFY_UNIT} failed: {r.stderr.strip()}")
+    _wait_until(lambda: _http("GET", f"{COMFY_URL}/queue")[0] == 200, timeout,
+                f"{COMFY_UNIT} to answer after its restart")
+
+
+def make_room_in_comfy(wait: float, release_timeout: float) -> list[str]:
+    """Free ComfyUI's models, and restart it when that isn't enough, so Strata
+    can load. Returns what was done, for the event log.
+
+    Restarts when its VRAM won't drop below COMFY_IDLE_MIB with the queue empty
+    (an extension that doesn't unload fully, e.g. IndexTTS without our patch),
+    or when its RAM + swap stays above COMFY_RESTART_MIB."""
+    done = []
+    if (held := _gpu()["comfy_mib"]) > COMFY_IDLE_MIB or _comfy_jobs():
+        try:
+            free_comfy(wait, release_timeout)
+            done.append(f"freed its {held} MiB of models")
+        except SwitchError:
+            # A job queued since the check postpones /free past it: never restart then.
+            if _comfy_jobs():
+                raise
+            stuck = _gpu()["comfy_mib"]
+            restart_comfy(COMFY_RESTART_TIMEOUT_S, f"it kept {stuck} MiB of VRAM after /free")
+            return [*done, f"restarted it: kept {stuck} MiB of VRAM after /free"]
+    if (ram := _comfy_held_mib()) > COMFY_RESTART_MIB:
+        restart_comfy(COMFY_RESTART_TIMEOUT_S, f"it holds {ram} MiB of RAM + swap with no models loaded")
+        done.append(f"restarted it to release {ram} MiB of RAM + swap")
+    return done
+
+
 def to_strata(wait: float) -> None:
     s = probe()
     if s["mode"] == "strata":
@@ -255,7 +383,7 @@ def to_strata(wait: float) -> None:
 
     if s["comfy"]["service"]:
         _ensure_unit(COMFY_UNIT, f"{COMFY_URL}/queue")
-        free_comfy(wait)
+        make_room_in_comfy(wait, release_timeout=60)
 
     _ensure_unit(STRATA_UNIT, f"{STRATA_URL}/health")
     _log("loading Strata's model")
@@ -304,7 +432,8 @@ def strata_before_load() -> int:
     - A `switch comfy` or `hold comfy` in progress: refuse.
     - Otherwise a request woke the lazy model. ComfyUI rendering or with jobs
       queued: refuse, a render is never interrupted. ComfyUI idle: free its
-      models if it holds any, then allow.
+      models if it holds any, restart it if its VRAM won't drop or it still
+      holds a lot of RAM, then allow.
 
     It frees ComfyUI itself rather than calling `switch strata`: that ends in
     Strata's /load, which would wait on the very load running this hook. The
@@ -330,18 +459,16 @@ def strata_before_load() -> int:
             reason = gpu["error"]
         elif jobs:
             reason = f"ComfyUI has {jobs} job(s) running or queued"
-        elif gpu["comfy_mib"] <= COMFY_IDLE_MIB:
-            record("strata-load", source="request", allowed=True, reason="ComfyUI idle")
-            return EXIT_OK
         else:
-            held = gpu["comfy_mib"]
             try:
-                free_comfy(wait=0, release_timeout=HOOK_RELEASE_TIMEOUT_S)
+                done = make_room_in_comfy(wait=0, release_timeout=HOOK_RELEASE_TIMEOUT_S)
             except SwitchError as e:
-                reason = f"could not free ComfyUI's {held} MiB: {e}"
+                reason = f"could not make room in ComfyUI: {e}"
             else:
-                record("strata-load", source="request", allowed=True,
-                       reason=f"ComfyUI idle; freed its {held} MiB of models")
+                # What memory Strata loads into: oomd killed loads that skipped the restart.
+                ram = _ram()
+                record("strata-load", source="request", allowed=True, reason="; ".join(["ComfyUI idle", *done]),
+                       available_mib=ram["available_mib"], comfy=ram["comfy"])
                 return EXIT_OK
         record("strata-load", source="request", allowed=False, reason=reason)
         _log(f"refusing Strata load: {reason}")

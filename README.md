@@ -36,7 +36,7 @@ Both directions are idempotent: switching to the current mode only re-checks it.
 
 | Command | What it does |
 | --- | --- |
-| `switch strata` | Waits for ComfyUI's queue to drain (fails at once unless `--wait N`), `POST /free`, waits until ComfyUI's VRAM drops below 1500 MiB, then `POST /load` on Strata, which blocks until the model is up |
+| `switch strata` | Waits for ComfyUI's queue to drain (fails at once unless `--wait N`), `POST /free`, waits until ComfyUI's VRAM drops below 1500 MiB, [restarts ComfyUI if it still holds a lot of RAM](#comfyui-restart-ram-not-just-vram), then `POST /load` on Strata, which blocks until the model is up |
 | `switch comfy` | `POST /unload` on Strata (`?wait=N` with `--wait`, to let a running answer finish), waits until its engine leaves the GPU |
 
 - If a service is stopped, `switch` starts it (`systemctl --user start`).
@@ -87,7 +87,9 @@ after installing or changing it.
   follow [docs/comfyui-updates.md](docs/comfyui-updates.md).
 - **TTS Audio Suite:** IndexTTS needs a local patch to fully leave the GPU on
   unload. Re-apply it after every suite update; see
-  [docs/tts-audio-suite-vram.md](docs/tts-audio-suite-vram.md).
+  [docs/tts-audio-suite-vram.md](docs/tts-audio-suite-vram.md). Sending it
+  upstream is planned in
+  [docs/plans/2026-10-16-upstream-indextts-unload-fix.md](docs/plans/2026-10-16-upstream-indextts-unload-fix.md).
 - **Env:**
   - `GPU_WORKLOAD_GUARD=0` disables it;
   - `GPU_WORKLOAD_GUARD_WAIT_S` sets how long it waits;
@@ -282,6 +284,7 @@ answers **503** and doesn't load. The hook decides like this:
 | a request woke the lazy model; ComfyUI has jobs running or queued | refuse: a render is never interrupted |
 | a request woke the lazy model; ComfyUI idle, no models loaded | allow |
 | a request woke the lazy model; ComfyUI idle but **holding models** | free ComfyUI's models (`/free`, wait up to 20 s for its VRAM to drop below 1500 MiB), then allow |
+| either of the two above, and ComfyUI's VRAM won't drop or its RAM + swap is still above 4 GiB | also [restart ComfyUI](#comfyui-restart-ram-not-just-vram) first, then allow |
 
 So whoever calls Strata, whether the chat bot, the `pi` CLI, curl or
 Strata's web page, gets the GPU back whenever ComfyUI is merely idle. Nobody
@@ -312,6 +315,76 @@ Leaving ComfyUI idle with a model loaded doesn't reserve the GPU: the next
 Strata request evicts it, and ComfyUI reloads it on its next job. ComfyUI's own
 side is covered by the guard node above.
 
+## ComfyUI restart: RAM, not just VRAM
+
+`/free` empties ComfyUI's VRAM but not its RAM. On 2026-10-16, after a video
+render, ComfyUI went from 34 GiB to 7 GiB of RAM plus 3.8 GiB of swap with no
+models loaded. Strata then loaded its ~38 GiB of experts on top: the user
+session's memory pressure reached 64%, Strata's load took 70 s instead of
+23 s, and systemd-oomd killed `chat-bot.service` (which restarted).
+
+So before Strata loads, whether from `switch strata` or the hook,
+gpu-workload restarts ComfyUI (`systemctl --user restart comfyui`) when its
+queue is empty (the existing rule: a render is never interrupted) **and**
+either:
+
+- its RAM + swap is above `GPU_WORKLOAD_COMFY_RESTART_MIB` (default 4096). RAM
+  here is the unit's anonymous memory from its cgroup; page cache is left out,
+  since the kernel drops it under pressure; or
+- `/free` didn't get its VRAM below 1500 MiB, e.g. an extension that doesn't
+  unload fully, like IndexTTS without
+  [our patch](docs/tts-audio-suite-vram.md). Before, Strata was refused until
+  someone restarted ComfyUI by hand. If a job was queued meanwhile (ComfyUI
+  postpones `/free` past it), it still refuses instead.
+
+**History.** A restart wipes ComfyUI's `/history`, which comfy-render polls every
+2 s to report results. So it waits until the newest history entry finished
+at least 10 s ago, then re-checks the queue and gives up (Strata answers 503)
+if a job arrived meanwhile. A dashboard's list of recent
+jobs also starts empty after a restart.
+
+**Cost.** About 15–20 s more for that handover (ComfyUI starts in ~13 s),
+only when ComfyUI is heavy. Strata's `before_load_timeout_s` is 90 to fit it.
+ComfyUI reloads its models on its next job either way.
+
+**Tested with a fake ComfyUI unit** (2026-10-16):
+
+| Fake ComfyUI | Result |
+| --- | --- |
+| RAM over the threshold, last job finished 4 s ago | waited 4 s, restarted |
+| RAM under the threshold, VRAM clean | left alone |
+| a job queued during the wait | not restarted; failed with that reason |
+| VRAM stuck at 2066 MiB after `/free`, queue empty | restarted |
+
+**Measured on the real ComfyUI** (2026-10-16, Strata IQ2_XS, 128K context):
+
+| Test | Result |
+| --- | --- |
+| Strata woken by requests after video renders, ComfyUI holding 6.1, 7.6 and 6.3 GiB of RAM + swap (19:21, 19:23, 19:56) | each time: waited 6–8 s for history, restarted, ComfyUI answered ~10 s later, Strata loaded in 33–43 s; no oomd kill |
+| `comfy-render` of one SDXL job, then `switch strata` 1.5 s after queueing it (threshold lowered to 1024 MiB for the test) | the job finished, the switch waited 10 s, restarted ComfyUI (back in 11 s), loaded Strata; whole switch 57 s. comfy-render still reported the job `ok` with its file |
+| After the restart | ComfyUI 0.8 GiB RAM, guard `on` in its log; a smoke job then took the GPU back from Strata and succeeded in 10.9 s |
+
+`gpu-workload status` shows the RAM picture:
+
+```
+ram:    26.9 of 60.5 GiB available, swap 4.5 of 8.0 GiB used (strata 0.1 GiB + 0.2 swap, comfy 29.7 GiB + 3.6 swap)
+```
+
+`--json` has the same under `ram` (`total_mib`, `available_mib`,
+`swap_total_mib`, `swap_used_mib`, and `strata` / `comfy` each with `ram_mib`,
+`swap_mib` and `file_mib`, the page cache charged to the unit).
+
+**Open question (2026-10-16).** At 20:00 systemd-oomd killed `strata.service`
+itself during a load that skipped the restart: ComfyUI had just rendered a
+video and was under the threshold (it was at ~3.7 GiB RAM + swap minutes
+later). Every load that day without a restart (16:15, 20:00) ended in an oomd
+kill; every one with a restart (19:21, 19:23, 19:56, 20:14) didn't. So the
+4 GiB threshold, or counting only anonymous memory, may be too lenient. Each
+hook-allowed load now logs `available_mib` and ComfyUI's `ram_mib` /
+`swap_mib` / `file_mib` in the event log; the next kill will show which. If
+that's still unclear, the simple fix is to always restart a ComfyUI that has
+run a job since its last start.
+
 ## Event log
 
 `~/.local/state/gpu-workload/events.jsonl` (last 500 lines) records every mode
@@ -331,14 +404,15 @@ while ComfyUI holds models gets a 503 instead of loading on top of it. The file
 before this change is `strata-iq2_xs.json.pre-lazy`.
 
 It also has `before_load` (the hook above), `before_load_strict: true` and
-`before_load_timeout_s: 30`. The pre-hook config is the same
-`strata-iq2_xs.json.pre-lazy` backup, taken before any of these keys were
+`before_load_timeout_s: 90` (30 until 2026-10-16; raised for the ComfyUI
+restart, backup `strata-iq2_xs.json.pre-restart`). The pre-hook config is the
+same `strata-iq2_xs.json.pre-lazy` backup, taken before any of these keys were
 added.
 
 ## Env overrides
 
 `GPU_WORKLOAD_STRATA_URL`, `_COMFY_URL`, `_STRATA_UNIT`, `_COMFY_UNIT`,
-`_STRATA_PROC`, `_COMFY_PROC` (substrings of the nvidia-smi process path), and
-`_COMFY_IDLE_MIB`.
+`_STRATA_PROC`, `_COMFY_PROC` (substrings of the nvidia-smi process path),
+`_COMFY_IDLE_MIB`, and `_COMFY_RESTART_MIB`.
 
 Installed as a symlink: `~/.local/bin/gpu-workload`.
