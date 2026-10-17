@@ -3,64 +3,74 @@
 Strata's before_load (`gpu-workload hook strata-before-load`), the ComfyUI
 guard (`gpu-workload switch comfy --wait N`), a dashboard
 (`status --json`, `switch comfy --json`) and people all call this. Its commands,
-output, exit codes, env vars, lock file and event log stay as they were; the
-work is done by the arbiter and the Strata and ComfyUI drivers.
+output and exit codes stay as they were.
+
+It reads the vhotseat config when there is one (it must name its workloads
+`strata` and `comfy`); without one it uses the setup gpu-workload always had,
+with its GPU_WORKLOAD_* env vars. Either way it takes the same lock and writes
+the same event log as `vhotseat`.
 """
 
 import argparse
 import json
 import os
 import sys
-from pathlib import Path
 
+from . import config as cfgmod
 from . import util
 from .arbiter import Arbiter
-from .drivers.base import Context
-from .drivers.comfyui import ComfyUI
-from .drivers.strata import Strata
-from .events import EventLog
-from .gpu import NvidiaSmi
-from .host import SystemdUser
-from .lock import GpuLock
+from .setup import build as build_arbiter
 
 DESCRIPTION = "gpu-workload: hand the single 16 GB GPU between Strata (local LLM) and ComfyUI."
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_WRONG_MODE = 0, 1, 2, 3
 
 
-def build(env=os.environ, gpu=None, host=None) -> Arbiter:
-    """The arbiter for this machine's two workloads, configured from GPU_WORKLOAD_* env vars."""
-    state = Path(env.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "gpu-workload"
-    host = host or SystemdUser()
-    arbiter = None
-    ctx = Context(gpu=lambda: arbiter.snapshot(), host=host)
-    strata = Strata(
-        name="strata", label="Strata", ctx=ctx,
-        url=env.get("GPU_WORKLOAD_STRATA_URL", "http://127.0.0.1:2335"),
-        unit=env.get("GPU_WORKLOAD_STRATA_UNIT", "strata"),
-        # nvidia-smi process paths that identify each server's GPU allocations.
-        proc=env.get("GPU_WORKLOAD_STRATA_PROC", "/Strata/"),
-    )
-    comfy = ComfyUI(
-        name="comfy", label="ComfyUI", ctx=ctx,
-        url=env.get("GPU_WORKLOAD_COMFY_URL", "http://127.0.0.1:8188"),
-        unit=env.get("GPU_WORKLOAD_COMFY_UNIT", "comfyui"),
-        proc=env.get("GPU_WORKLOAD_COMFY_PROC", "/ComfyUI/"),
-        idle_vram_mib=int(env.get("GPU_WORKLOAD_COMFY_IDLE_MIB", "1500")),
-        restart_ram_mib=int(env.get("GPU_WORKLOAD_COMFY_RESTART_MIB", "4096")),
-    )
-    arbiter = Arbiter(
-        [strata, comfy], gpu or NvidiaSmi(), host,
-        GpuLock(state / "switch.lock"),       # holds the target mode while a switch or hold runs
-        EventLog(state / "events.jsonl"),     # every switch and every hook decision
-        idle_owner="comfy",
-        # The hook must finish inside Strata's before_load_timeout_s (90 s): /free ~2 s
-        # (or this timeout when it can't empty VRAM), then possibly the history settle
-        # (<= 10 s) and a ComfyUI restart (~15-20 s, up to its restart timeout, 50 s).
-        gate_release_timeout_s=20,
-        hold_env="GPU_WORKLOAD_HOLD",
-    )
-    return arbiter
+def builtin_config(env=os.environ) -> dict:
+    """gpu-workload's setup before there was a config file."""
+    return cfgmod.validate({
+        "gpu": {"backend": "auto"},
+        "workloads": {
+            "strata": {
+                "driver": "http", "label": "Strata",
+                "url": env.get("GPU_WORKLOAD_STRATA_URL", "http://127.0.0.1:2335"),
+                "service": {"systemd-user": env.get("GPU_WORKLOAD_STRATA_UNIT", "strata")},
+                # nvidia-smi process paths that identify each server's GPU allocations.
+                "vram": {"process": env.get("GPU_WORKLOAD_STRATA_PROC", "/Strata/")},
+                "resident": {"get": "/health", "path": "loaded"},
+                "release": {"post": "/unload?wait={wait}", "always": True,
+                            "busy_when": [{"status": 409}, {"path": "status", "in": ["busy"]}],
+                            "ok_when": [{"status": 200, "path": "status", "in": ["unloaded", "not loaded"]}]},
+                "confirm": {"vram_at_most": 0},
+                "load": {"post": "/load", "timeout": 300},
+                "gate": {"kind": "hook", "timeout": 90},
+            },
+            "comfy": {
+                "driver": "comfyui", "label": "ComfyUI",
+                "url": env.get("GPU_WORKLOAD_COMFY_URL", "http://127.0.0.1:8188"),
+                "service": {"systemd-user": env.get("GPU_WORKLOAD_COMFY_UNIT", "comfyui")},
+                "vram": {"process": env.get("GPU_WORKLOAD_COMFY_PROC", "/ComfyUI/")},
+                "idle_vram_mib": int(env.get("GPU_WORKLOAD_COMFY_IDLE_MIB", "1500")),
+                "restart_above_ram_mib": int(env.get("GPU_WORKLOAD_COMFY_RESTART_MIB", "4096")),
+                "allow_restart": True,
+                "gate": {"kind": "plugin", "timeout": 300},
+            },
+        },
+    })
+
+
+def build(env=os.environ, **kw) -> Arbiter:
+    path = cfgmod.default_path(env)
+    cfg = cfgmod.load(path) if path.exists() else builtin_config(env)
+    missing = {"strata", "comfy"} - set(cfg["workloads"])
+    if missing:
+        raise cfgmod.ConfigError(f"{path}: gpu-workload needs workloads named strata and comfy "
+                                 f"(missing: {', '.join(sorted(missing))}); use `vhotseat` instead")
+    # The hook must finish inside Strata's before_load_timeout_s (90 s): /free ~2 s
+    # (or this timeout when it can't empty VRAM), then possibly the history settle
+    # (<= 10 s) and a ComfyUI restart (~15-20 s, up to its restart timeout, 50 s).
+    return build_arbiter(cfg, env=env, idle_owner="comfy", gate_release_timeout_s=20,
+                         hold_env="GPU_WORKLOAD_HOLD", cli="gpu-workload", **kw)
 
 
 def main(argv: list[str] | None = None, arbiter: Arbiter | None = None) -> int:
@@ -86,7 +96,12 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None) -> int:
     hp.add_argument("name", choices=("strata-before-load",))
     args = p.parse_args(argv)
     json_out = getattr(args, "json", False)
-    arb = arbiter or build()
+    try:
+        arb = arbiter or build()
+    except cfgmod.ConfigError as e:
+        util.log(str(e))
+        # A broken config must not let Strata load unchecked: the hook refuses.
+        return EXIT_FAIL if args.cmd in ("hook", "switch", "hold") else EXIT_USAGE
 
     def emit(s: dict, extra: dict | None = None) -> None:
         print(json.dumps({**s, **(extra or {})}) if json_out else arb.describe(s))

@@ -1,9 +1,11 @@
 """The arbiter: who owns the GPU, and handing it from one workload to another.
 
 Every entry point goes through here:
-  acquire  make room for a workload by releasing the others (used by switch and hold)
+  acquire  make room for a workload: release the others, restart one if that
+           isn't enough for its admission, check admission (used by switch, hold)
   gate     a workload's own pre-load hook asks whether it may load
-  switch   acquire under the lock, from the CLI or the ComfyUI guard
+  switch   acquire under the lock, from the CLI or the ComfyUI guard; or, for
+           "none", release every workload
   hold     acquire, then keep the lock until a command exits
 
 Running work is never interrupted: a busy workload is waited for (up to `wait`)
@@ -14,24 +16,27 @@ time, never stored, so it can't drift.
 import os
 import signal
 import subprocess
+import time
 
-from . import util
+from . import host, util
 from .drivers.base import Workload
 from .errors import ReleaseFailed, SwitchError
 from .events import EventLog
 from .lock import GpuLock, Held
 
+NONE = "none"
+
 
 class Arbiter:
-    def __init__(self, workloads: list[Workload], gpu, host, lock: GpuLock, events: EventLog, *,
-                 idle_owner: str | None = None, gate_release_timeout_s: float = 20,
-                 release_timeout_s: float = 60, hold_env: str = "VHOTSEAT_HOLD"):
+    def __init__(self, workloads: list[Workload], gpu, lock: GpuLock, events: EventLog, *,
+                 idle_owner: str = NONE, gate_release_timeout_s: float = 20,
+                 release_timeout_s: float = 60, hold_env: str = "VHOTSEAT_HOLD",
+                 machine_ram=host.machine_ram, cli: str = "vhotseat"):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
-        self.host = host
         self.lock = lock
         self.events = events
-        # The mode to report when no workload holds the GPU. The gpu-workload CLI
+        # The owner to report when no workload holds the GPU. The gpu-workload CLI
         # has always called that "comfy": ComfyUI may take it without a switch.
         self.idle_owner = idle_owner
         # A gate runs inside the workload's own load, which has a time limit
@@ -41,11 +46,13 @@ class Arbiter:
         # Set in a hold's command's environment, so a nested switch to the held
         # workload is a no-op instead of waiting on the lock the hold owns.
         self.hold_env = hold_env
+        self.machine_ram = machine_ram
+        self.cli = cli
 
     def snapshot(self) -> dict:
-        return self.gpu.snapshot({n: w.proc for n, w in self.workloads.items()})
+        return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
 
-    def _others(self, name: str) -> list[Workload]:
+    def _others(self, name: str | None) -> list[Workload]:
         return [w for n, w in self.workloads.items() if n != name]
 
     # --- status --------------------------------------------------------------
@@ -55,21 +62,22 @@ class Arbiter:
         states = {n: w.probe(gpu) for n, w in self.workloads.items()}
         active = [n for n, w in self.workloads.items() if w.active(states[n], gpu)]
         mode = "conflict" if len(active) > 1 else active[0] if active else self.idle_owner
-        ram = self.host.machine_ram()
-        ram.update({n: self.host.memory(w.unit) for n, w in self.workloads.items()})
+        ram = self.machine_ram()
+        ram.update({n: w.memory() for n, w in self.workloads.items()})
         return {"mode": mode, **states, "gpu": gpu, "ram": ram, "last_event": self.events.last()}
 
     def describe(self, s: dict) -> str:
         g = s["gpu"]
-        lines = [f"mode:   {s['mode']}"]
-        lines += [f"{n + ':':<8}{w.describe(s[n])}" for n, w in self.workloads.items()]
+        width = max(len(n) for n in [*self.workloads, "mode"]) + 2
+        lines = [f"{'mode:':<{width}}{s['mode']}"]
+        lines += [f"{n + ':':<{width}}{w.describe(s[n])}" for n, w in self.workloads.items()]
         shares = ", ".join(f"{n} {g[f'{n}_mib']}" for n in self.workloads)
-        lines.append("gpu:    " + (g["error"] if "error" in g else
-                                   f"{g['free_mib']} of {g['total_mib']} MiB free ({shares}, other {g['other_mib']})"))
-        lines.append("ram:    " + self._describe_ram(s["ram"]))
+        lines.append(f"{'gpu:':<{width}}" + (g["error"] if "error" in g else
+                     f"{g['free_mib']} of {g['total_mib']} MiB free ({shares}, other {g['other_mib']})"))
+        lines.append(f"{'ram:':<{width}}" + self._describe_ram(s["ram"]))
         if ev := s.get("last_event"):
             detail = ", ".join(f"{k}={v}" for k, v in ev.items() if k not in ("time", "event"))
-            lines.append(f"last:   {ev['time']} {ev['event']}" + (f" ({detail})" if detail else ""))
+            lines.append(f"{'last:':<{width}}{ev['time']} {ev['event']}" + (f" ({detail})" if detail else ""))
         return "\n".join(lines)
 
     def _describe_ram(self, r: dict) -> str:
@@ -92,9 +100,29 @@ class Arbiter:
 
     # --- handing over ----------------------------------------------------------
 
-    def _make_room(self, others: list[Workload], wait: float, timeout: float, ensure: bool) -> list[str]:
-        """Release every other workload; restart one whose release isn't enough,
-        if it allows that. Returns what was done, for the event log."""
+    def _shortfall(self, x: Workload | None) -> str | None:
+        """What `x`'s admission is missing right now, or None if it's met."""
+        if x is None or not x.admission:
+            return None
+        if (need := x.admission.get("min_available_ram_mib")) is not None:
+            have = self.machine_ram().get("available_mib")
+            if have is None or have < need:
+                return f"{x.label} needs {need} MiB of available RAM, {have} MiB is available"
+        if (need := x.admission.get("min_free_vram_mib")) is not None:
+            have = self.snapshot().get("free_mib")
+            if have is None or have < need:
+                return f"{x.label} needs {need} MiB of free VRAM, {have} MiB is free"
+        return None
+
+    def _make_room(self, x: Workload | None, wait: float, timeout: float, ensure: bool,
+                   deadline: float | None = None, admit: bool = True) -> list[str]:
+        """Release every workload but `x`, restarting one whose release isn't
+        enough when it allows that; then, if `admit`, restart idle ones while
+        `x`'s admission isn't met. Returns what was done, for the event log.
+
+        Admission is for a workload about to load: one already holding the GPU
+        would count its own memory against itself."""
+        others = self._others(x.name if x else None)
         done = []
         for y in others:
             try:
@@ -110,32 +138,55 @@ class Arbiter:
                         y.restart(e.why)
                         done.append(e.then)
                 elif y.vram_mib() > y.idle_vram_mib:
-                    raise SwitchError(f"a {y.label} process holds VRAM but {y.unit}.service is stopped; "
-                                      "kill it by hand")
+                    raise SwitchError(f"a {y.label} process holds VRAM but {y.service.unit or 'its service'} "
+                                      "is stopped; kill it by hand")
             except SwitchError as e:
                 e.workload = y
                 raise
+        # RAM isn't exclusive: a released workload's process may still hold what x needs.
+        tried = set()
+        while admit and (short := self._shortfall(x)):
+            candidates = [y for y in others if y.allow_restart and y.name not in tried
+                          and y.service_active() and not y.busy()]
+            if not candidates:
+                raise SwitchError(short)
+            # A restart takes ~15-20 s (ComfyUI); don't start one the gate can't finish.
+            if deadline is not None and time.monotonic() + 20 * util.SCALE > deadline:
+                raise SwitchError(f"{short}; no time left to restart anything")
+            y = max(candidates, key=lambda c: c.held_mib())
+            tried.add(y.name)
+            held = y.held_mib()
+            try:
+                y.restart(f"{short}; it holds {held} MiB of RAM + swap")
+            except SwitchError as e:
+                e.workload = y
+                raise
+            done.append(f"restarted {y.label} to release {held} MiB of RAM + swap for {x.label}")
         return done
 
     def acquire(self, name: str, wait: float, load: bool) -> list[str]:
-        """Give the GPU to `name`: release the others, start it if it's stopped,
-        and load it if `load` and it can be loaded ahead of a request."""
-        x = self.workloads[name]
+        """Give the GPU to `name` (or to nobody, for "none"): release the others,
+        start it if it's stopped, check its admission, and load it if `load`."""
+        x = self.workloads.get(name)
         others = self._others(name)
+        s = self.probe()
+        resident = x is not None and x.active(s[name], s["gpu"])
         # A workload that may be loading invisibly is asked to release even when the
         # GPU looks like x's already, so this only short-cuts when none of them may be.
-        if self.probe()["mode"] == name and not any(y.release_always for y in others):
+        if s["mode"] == name and not any(y.release_always for y in others):
             util.log(f"already in {name} mode")
             return []
-        done = self._make_room(others, wait, self.release_timeout_s, ensure=True)
+        done = self._make_room(x, wait, self.release_timeout_s, ensure=True, admit=not resident)
+        if x is None:
+            return done
         x.ensure_running()
-        loads = load and type(x).load is not Workload.load
+        loads = load and x.can_load()
         if loads:
             x.load(wait)
         if self.probe()["mode"] != name:
             what = (f"{x.label} reported loaded" if loads
                     else f"{', '.join(y.label for y in others)} unloaded")
-            raise SwitchError(f"{what}, but the mode isn't {name}; run `gpu-workload status`")
+            raise SwitchError(f"{what}, but the mode isn't {name}; run `{self.cli} status`")
         return done
 
     def gate(self, name: str) -> bool:
@@ -147,7 +198,8 @@ class Arbiter:
         - Anything else holds the lock: refuse.
         - Otherwise a request woke the workload. Another workload busy, or its
           state unknown: refuse, a render is never interrupted. All idle:
-          release them (restarting one if releasing isn't enough), then allow.
+          release them (restarting one if releasing isn't enough), check
+          admission, then allow.
 
         It makes room itself rather than calling `switch`: that ends in loading
         `name`, which would wait on the very load running this gate. The lock is
@@ -165,21 +217,23 @@ class Arbiter:
                 util.log(f"refusing {x.label} load: {holder} is in progress")
             return allowed
 
+        # The hook's whole run must fit in the workload's own limit (gate.timeout).
+        deadline = time.monotonic() + x.gate["timeout"] * util.SCALE if x.gate.get("timeout") else None
         with got:
             gpu = self.snapshot()
             reason = gpu.get("error") or next((r for y in others if (r := y.busy())), None)
             if not reason:
                 try:
-                    done = self._make_room(others, 0, self.gate_release_timeout_s, ensure=False)
+                    done = self._make_room(x, 0, self.gate_release_timeout_s, ensure=False, deadline=deadline)
                 except SwitchError as e:
-                    reason = f"could not make room in {e.workload.label}: {e}"
+                    reason = (f"could not make room in {e.workload.label}: {e}" if e.workload is not None
+                              else str(e))
                 else:
                     # What memory it loads into: oomd killed loads that skipped the restart.
-                    ram = self.host.machine_ram()
                     self.events.record(kind, source="request", allowed=True,
                                        reason="; ".join([*(f"{y.label} idle" for y in others), *done]),
-                                       available_mib=ram["available_mib"],
-                                       **{y.name: self.host.memory(y.unit) for y in others})
+                                       available_mib=self.machine_ram()["available_mib"],
+                                       **{y.name: y.memory() for y in others})
                     return True
             self.events.record(kind, source="request", allowed=False, reason=reason)
             util.log(f"refusing {x.label} load: {reason}")
@@ -192,8 +246,8 @@ class Arbiter:
         return self.lock.take(f"switch {name}", unless=unless, on_wait=waiting)
 
     def switch(self, name: str, wait: float) -> dict:
-        """Move the GPU to `name` under the lock. Returns {"ok": …} plus "held"
-        or "error"; the caller prints status.
+        """Move the GPU to `name` (or free it, for "none") under the lock. Returns
+        {"ok": …} plus "held" or "error"; the caller prints status.
 
         While a `hold name` owns the lock, the GPU is already `name`'s and stays
         so: return at once. That's how a ComfyUI job queued by a held script gets
@@ -212,13 +266,13 @@ class Arbiter:
         with lock:
             before = self.probe()["mode"]
             try:
-                self.acquire(name, wait, load=True)
+                done = self.acquire(name, wait, load=True)
             except SwitchError as e:
                 self.events.record("switch", to=name, ok=False, error=str(e))
                 util.log(f"switch to {name} failed: {e}")
                 return {"ok": False, "error": str(e)}
-        if before != name:
-            self.events.record("switch", to=name, ok=True, previous=before)
+        if before != name or done:
+            self.events.record("switch", to=name, ok=True, previous=before, **({"done": done} if done else {}))
         return {"ok": True}
 
     def hold(self, name: str, command: list[str], wait: float) -> int:

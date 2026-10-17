@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""vhotseat: take turns on one GPU. See `vhotseat --help` and src/vhotseat/cli.py."""
+
+import sys
+from pathlib import Path
+
+# Installed as a symlink (~/.local/bin/vhotseat): find src/ next to the real file.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
+from vhotseat.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -21,16 +21,16 @@ def rig(tmp_path, monkeypatch):
     host.on_restart["comfyui"] = comfy.restarted
     gpu = FakeGpu(strata, comfy)
     env = {"GPU_WORKLOAD_STRATA_URL": strata.url, "GPU_WORKLOAD_COMFY_URL": comfy.url,
-           "XDG_STATE_HOME": str(tmp_path)}
+           "XDG_STATE_HOME": str(tmp_path / "state"), "XDG_CONFIG_HOME": str(tmp_path / "config")}
     for k, v in env.items():
         monkeypatch.setenv(k, v)
-    arb = compat.build(env=env, gpu=gpu, host=host)
+    arb = host.install(compat.build(env=env, gpu=gpu))
 
     class Rig:
         pass
 
     r = Rig()
-    r.strata, r.comfy, r.host, r.gpu, r.arb, r.env, r.state = strata, comfy, host, gpu, arb, env, tmp_path / "gpu-workload"
+    r.strata, r.comfy, r.host, r.gpu, r.arb, r.env, r.state = strata, comfy, host, gpu, arb, env, tmp_path / "state" / "vhotseat"
     r.events = lambda: [e for e in _read(r.state / "events.jsonl")]
     r.cli = lambda *argv: compat.main(list(argv), arbiter=arb)
     yield r
