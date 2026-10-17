@@ -7,6 +7,10 @@ crashes on a bad workflow; a job that fails is reported and the rest still run.
 
     comfy-render JOBS.json [--timeout SECONDS] [--json] [--verbose]
 
+There is no limit on how long a batch may take: --timeout (default 1800) is how
+long it may go with no sign of progress (no job finishing, no node or sampler
+step starting, no change in ComfyUI's queue) before it gives up.
+
 JOBS.json is either
   - one workflow:      {"1": {"class_type": ..., "inputs": {...}}, ...}
   - a list of them:    [ {workflow}, {workflow}, ... ]
@@ -21,6 +25,7 @@ nothing here needs to know about it.
 Exit codes: 0 every job produced output · 1 at least one job was rejected or
 failed · 2 bad input file or ComfyUI unreachable · 3 timed out · 4 the user
 cancelled at least one job (it outranks 1 and 3: ask them why before re-running).
+On a timeout the unfinished jobs are left in ComfyUI.
 """
 
 import argparse
@@ -44,6 +49,10 @@ COMFY_DIR = Path(os.environ.get("COMFY_DIR", Path.home() / "ComfyUI"))
 POLL_S = 2.0
 # Live progress: at most one line per job this often, unless the running node changes.
 PROGRESS_EVERY_S = 10.0
+# Give up after this long with no progress at all. Not a limit on the whole batch: a
+# batch of long videos runs for hours, and giving up while jobs are still queued makes
+# the caller's next request to Strata fail, since ComfyUI keeps the GPU until they're done.
+STALL_TIMEOUT_S = 1800
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_TIMEOUT, EXIT_CANCELLED = 0, 1, 2, 3, 4
 
@@ -214,6 +223,7 @@ class ProgressWatcher(threading.Thread):
         self.lock = threading.Lock()
         self.connected = threading.Event()
         self.sock: socket.socket | None = None
+        self.last_activity = time.monotonic()  # last node or step event for one of our jobs
 
     def connect(self, timeout: float = 5.0) -> bool:
         """Open the websocket. Call before submitting jobs so no event is missed."""
@@ -294,9 +304,11 @@ class ProgressWatcher(threading.Thread):
             st = self.state.setdefault(pid, {})
             if kind == "executing" and data.get("node") is not None:
                 st.update(node=str(data["node"]), value=None, max=None)
+                self.last_activity = time.monotonic()
             elif kind == "progress":
                 st.update(node=str(data.get("node") or st.get("node")),
                           value=data.get("value"), max=data.get("max"))
+                self.last_activity = time.monotonic()
 
     def describe(self, pid: str) -> tuple[str | None, str | None]:
         """(node_id, a one-line description) of what the job is doing right now."""
@@ -324,7 +336,8 @@ class ProgressWatcher(threading.Thread):
 
 
 def run(jobs: list[dict], timeout: float, verbose: bool) -> tuple[list[dict], bool]:
-    """Submit every job, then wait for all of them. Returns (results, timed_out)."""
+    """Submit every job, then wait until all of them finish or nothing has progressed
+    for `timeout` seconds. Returns (results, timed_out)."""
     client_id = f"comfy-render-{uuid.uuid4().hex[:8]}"
     watcher = ProgressWatcher(client_id, {})
     if watcher.connect():
@@ -365,18 +378,25 @@ def _outcome(entry: dict, status: dict, verbose: bool) -> dict:
 
 
 def _wait(results, queued, total, watcher, timeout, verbose) -> tuple[list[dict], bool]:
-    deadline = time.monotonic() + timeout
     pending = {r["prompt_id"]: r for r in results if r["status"] == "queued"}
+    # Progress is a job finishing, a websocket event for one of ours, or ComfyUI's queue
+    # changing (our jobs may be waiting behind someone else's, which send us no events).
+    last_progress = time.monotonic()
+    last_queue: set[str] | None = None
     last_note = time.monotonic()  # "queued N job(s)" was just printed
     shown: dict[str, tuple[str | None, str | None, float]] = {}  # pid -> (node, text, when)
     while pending:
-        if time.monotonic() > deadline:
+        if time.monotonic() - max(last_progress, watcher.last_activity) > timeout:
             for r in pending.values():
-                r.update(status="timeout", errors=[f"not finished after {timeout:g}s (still queued or running)"])
+                r.update(status="timeout", errors=[
+                    f"no progress for {timeout:g}s; still queued or running in ComfyUI"])
             return results, True
         # A job leaves the queue and enters /history in one step, so reading
         # /queue before /history means a job in neither was deleted while queued.
         in_queue = _queued_ids()
+        if in_queue is not None and in_queue != last_queue:
+            last_queue = in_queue
+            last_progress = time.monotonic()
         for pid, r in list(pending.items()):
             try:
                 _, hist = _request("GET", f"/history/{pid}")
@@ -393,6 +413,7 @@ def _wait(results, queued, total, watcher, timeout, verbose) -> tuple[list[dict]
                     continue
                 r.update(**_outcome(entry, status, verbose))
             del pending[pid]
+            last_progress = time.monotonic()
             finished = queued - len(pending)
             line = f"job {r['job']}/{total} {r['status']}"
             if r["status"] == "cancelled":
@@ -450,8 +471,9 @@ def summarize(results: list[dict]) -> str:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="comfy-render", description=__doc__.split("\n\n")[0])
     p.add_argument("jobs", help="JSON file: a workflow, a list of them, or {base, jobs}")
-    p.add_argument("--timeout", type=float, default=3600, metavar="SECONDS",
-                   help="give up waiting after this long (default 3600)")
+    p.add_argument("--timeout", type=float, default=STALL_TIMEOUT_S, metavar="SECONDS",
+                   help=f"give up after this long with no progress (default {STALL_TIMEOUT_S}); "
+                        "a batch that keeps progressing may take any time")
     p.add_argument("--json", action="store_true", help="print the results as JSON")
     p.add_argument("--verbose", action="store_true", help="include traceback tails for runtime errors")
     args = p.parse_args(argv)

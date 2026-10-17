@@ -349,7 +349,7 @@ This is a **bounded wait**, not a deadlock.
 | Strata: the hook itself | 30 s (`before_load_timeout_s`) | strict → 503 |
 | guard: `switch comfy --wait` | 300 s (`GPU_WORKLOAD_GUARD_WAIT_S`), +120 s subprocess cap | job fails visibly: "GPU busy, job not run" |
 | `switch strata`: Strata `/load` | `max(300, --wait)` s | switch fails, exit 1 |
-| comfy-render: all jobs | 3600 s (`--timeout`) | exit 3 |
+| comfy-render: no progress | 1800 s without a job finishing, a node or step starting, or the queue changing (`--timeout`); the batch as a whole is unbounded | exit 3, jobs left queued |
 | pi: Strata 503s | ~151 s (8 retries, ≤ 30 s apart) | turn ends `stopReason: error` → "GPU busy" reply |
 | the chat bot: pi silent | 1800 s (`CLAUDE_TIMEOUT`, idle) | run killed; comfy-render prints at least once a minute to prevent this |
 
