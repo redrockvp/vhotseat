@@ -131,6 +131,9 @@ sequenceDiagram
     H->>C: GET /queue → empty, nvidia-smi → ComfyUI holds ~7 GB
     H->>C: POST /free (unload_models)
     H->>H: wait until ComfyUI VRAM ≤ 1500 MiB (≤ 20 s)
+    opt ComfyUI VRAM won't drop, or it holds > 4 GiB of RAM + swap
+    H->>C: systemctl --user restart comfyui (~15–20 s)
+    end
     H->>L: release
     H-->>S: allow
     Note over S: load ~26 s, then re-read the whole conversation<br/>(prefix cache was lost on unload)
@@ -346,7 +349,7 @@ This is a **bounded wait**, not a deadlock.
 | Waiter | Bound | On expiry |
 | --- | --- | --- |
 | hook: ComfyUI VRAM to drop | 20 s (`HOOK_RELEASE_TIMEOUT_S`) | refuse → Strata answers 503 |
-| Strata: the hook itself | 30 s (`before_load_timeout_s`) | strict → 503 |
+| Strata: the hook itself | 90 s (`before_load_timeout_s`) | strict → 503 |
 | guard: `switch comfy --wait` | 300 s (`GPU_WORKLOAD_GUARD_WAIT_S`), +120 s subprocess cap | job fails visibly: "GPU busy, job not run" |
 | `switch strata`: Strata `/load` | `max(300, --wait)` s | switch fails, exit 1 |
 | comfy-render: no progress | 1800 s without a job finishing, a node or step starting, or the queue changing (`--timeout`); the batch as a whole is unbounded | exit 3, jobs left queued |
@@ -368,6 +371,7 @@ Measured on this machine (RTX 5070 Ti, Strata IQ2_XS), 2026-10-12/13:
 | Strata → ComfyUI | guard: Strata `/unload` | ~1 s |
 | | ComfyUI loads its model | SDXL ~10–25 s, video longer |
 | ComfyUI → Strata | hook: ComfyUI `/free` | ~2 s |
+| | hook: ComfyUI restart, only if its VRAM won't drop or it holds > 4 GiB of RAM + swap | ~15–20 s |
 | | Strata loads, warm (files in page cache) | ~26 s |
 | | Strata loads, cold (read from disk) | ~68 s |
 | | **Strata re-reads the conversation** (prefix cache lost on unload) | ~1 min per 30K tokens |
