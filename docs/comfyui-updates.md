@@ -28,7 +28,7 @@ update rather than wait to notice.
    ```sh
    journalctl --user -u comfyui --since "-5min" | grep gpu_workload_guard
    ```
-   Expect `gpu_workload_guard: on (…/gpu-workload, wait 300s)`. If you see
+   Expect `gpu_workload_guard: on (…/vhotseat, wait 300s)`. If you see
    `OFF` or an import error, stop here and go to *Fixing it* below.
 
 3. **Check that the method's signature hasn't changed.** The guard mirrors it:

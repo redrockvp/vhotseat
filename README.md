@@ -116,7 +116,8 @@ after installing or changing it.
 
 - **How it hooks in:** it wraps `execution.PromptExecutor.execute_async`, which
   ComfyUI's prompt worker thread calls once per job, and runs
-  `gpu-workload switch comfy --wait $GPU_WORKLOAD_GUARD_WAIT_S` (default 300)
+  `vhotseat switch comfy --wait $GPU_WORKLOAD_GUARD_WAIT_S` (default 300; falls
+  back to `gpu-workload`, which takes the same arguments)
   first. The worker thread may block, so the web server stays responsive.
 - **On failure:** the job is **not run** and fails visibly, with an
   `execution_error` "GPU busy, job not run: <reason>" in the UI and in
@@ -317,7 +318,8 @@ assert a mode.
 
 ## Strata hook: every model load goes through gpu-workload
 
-Strata's config runs `gpu-workload hook strata-before-load` before it loads its
+Strata's config runs `vhotseat gate strata` (until 2026-10-17:
+`gpu-workload hook strata-before-load`, which does the same) before it loads its
 model. It sets `before_load_strict: true`, so a non-zero exit means Strata
 answers **503** and doesn't load. The hook decides like this:
 

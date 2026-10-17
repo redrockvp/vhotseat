@@ -398,6 +398,7 @@ def _guard(rig, monkeypatch):
     (tests/run_cli.py: the real CLI with GPU and services read from the fakes)."""
     sys.path.insert(0, str(ROOT / "comfyui"))
     monkeypatch.setenv("GPU_WORKLOAD_BIN", str(ROOT / "tests" / "run_cli.py"))
+    monkeypatch.setattr("shutil.which", lambda *a, **k: None)
     monkeypatch.setenv("GPU_WORKLOAD_GUARD_WAIT_S", "2")
     sys.modules.pop("gpu_workload_guard", None)
     import gpu_workload_guard  # its install() logs "ComfyUI internals changed" here: no ComfyUI
