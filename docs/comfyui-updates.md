@@ -45,7 +45,7 @@ update rather than wait to notice.
 
    | # | Do | Expect |
    | --- | --- | --- |
-   | 1 | `gpu-workload switch strata`, then queue a job | Job succeeds; `gpu-workload status` shows `comfy`, Strata unloaded |
+   | 1 | `vhotseat switch strata`, then queue a job | Job succeeds; `vhotseat status` shows `comfy`, Strata unloaded |
    | 2 | Start a long Strata answer, queue a job 2–3 s later | Strata's answer completes; job runs after it and succeeds |
    | 3 | Queue a job, send a Strata request, queue another | Both jobs succeed; each Strata request frees ComfyUI first |
    | 4 | `systemctl --user set-environment GPU_WORKLOAD_GUARD_WAIT_S=2`, restart ComfyUI, start a long Strata answer, queue a job | Job ends `status: error` with `GPU busy, job not run: …` in `/history/<id>`; Strata's answer completes. Then `systemctl --user unset-environment GPU_WORKLOAD_GUARD_WAIT_S` and restart ComfyUI |
@@ -71,7 +71,7 @@ update rather than wait to notice.
   to 300 s would freeze ComfyUI's UI and API.
 - **To run unguarded until it's fixed:** set `GPU_WORKLOAD_GUARD=0` in the
   unit's environment (`systemctl --user edit comfyui`). Then queue ComfyUI
-  work only after running `gpu-workload switch comfy` by hand.
+  work only after running `vhotseat switch comfy` by hand.
 
 ## Rolling back ComfyUI
 

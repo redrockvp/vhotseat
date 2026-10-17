@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""gpu-workload as the guard node runs it, but against the test fakes: the real
-CLI and arbiter, with the GPU and services read from the fake servers named in
-GPU_WORKLOAD_STRATA_URL / GPU_WORKLOAD_COMFY_URL."""
+"""vhotseat as the guard node runs it, but against the test fakes: the real CLI
+and arbiter on config.example.yaml, with the URLs from STRATA_URL / COMFY_URL
+and the GPU and services read from the fake servers."""
 
 import json
+import os
 import sys
 import urllib.request
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "tests"))
 
-import os  # noqa: E402
-
-from vhotseat import compat  # noqa: E402
+from conftest import example_config  # noqa: E402
+from vhotseat import cli, setup  # noqa: E402
 
 
 def _vram(url):
@@ -22,9 +24,9 @@ def _vram(url):
 class RemoteGpu:
     name = "remote"
 
-    def snapshot(self, procs):
-        used = {"strata_mib": _vram(os.environ["GPU_WORKLOAD_STRATA_URL"]),
-                "comfy_mib": _vram(os.environ["GPU_WORKLOAD_COMFY_URL"]), "other_mib": 0}
+    def snapshot(self, selectors):
+        used = {"strata_mib": _vram(os.environ["STRATA_URL"]), "comfy_mib": _vram(os.environ["COMFY_URL"]),
+                "other_mib": 0}
         return {"total_mib": 16303, "free_mib": 16303 - sum(used.values()), **used}
 
 
@@ -43,7 +45,8 @@ def machine_ram():
 
 
 if __name__ == "__main__":
-    arb = compat.build(gpu=RemoteGpu(), machine_ram=machine_ram)
+    cfg = example_config(os.environ["STRATA_URL"], os.environ["COMFY_URL"])
+    arb = setup.build(cfg, gpu=RemoteGpu(), machine_ram=machine_ram)
     for w in arb.workloads.values():
         w.service = AllUp()
-    sys.exit(compat.main(arbiter=arb))
+    sys.exit(cli.main(arbiter=arb, cfg=cfg))

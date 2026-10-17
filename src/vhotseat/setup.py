@@ -1,6 +1,5 @@
 """Build the arbiter from a config: the GPU backend, the workloads, the lock and
-the event log. Shared by the `vhotseat` and `gpu-workload` CLIs, so both take
-the same lock and write the same log."""
+the event log."""
 
 import os
 import shutil
@@ -36,9 +35,8 @@ def build(cfg: dict, *, env=os.environ, gpu=None, machine_ram=None, **arbiter_ar
     workloads = cfgmod.workloads(cfg, ctx)
     arbiter = Arbiter(
         workloads, gpu or open_backend(g.get("backend", "auto"), index),
-        # GPU 0 keeps gpu-workload's lock name, so a gpu-workload from before the
-        # config (a rollback, or a hook still pointing at an old copy) takes the
-        # same lock: two lock files would let both hand the GPU over at once.
+        # GPU 0 keeps gpu-workload's lock name, so rolling back to gpu-workload
+        # (docs/revert-gpu-workload.md) shares the lock with anything still on vhotseat.
         GpuLock(state / ("switch.lock" if index == 0 else f"gpu{index}.lock")),
         EventLog(state / "events.jsonl", keep=(cfg.get("events") or {}).get("keep", 500)),
         machine_ram=machine_ram or host.machine_ram, **arbiter_args,

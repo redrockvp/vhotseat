@@ -12,5 +12,5 @@ Layout:
   gpu       card totals and per-workload VRAM (nvidia-smi)
   host      services (systemd --user) and memory (cgroups, /proc/meminfo)
   drivers/  how to talk to each workload
-  compat    the `gpu-workload` CLI, unchanged for its callers
+  cli       the `vhotseat` CLI
 """

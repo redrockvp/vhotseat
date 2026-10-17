@@ -18,8 +18,7 @@ method is missing, the guard logs an error and stays off rather than
 breaking ComfyUI.
 
 Env:
-  GPU_WORKLOAD_BIN            default: vhotseat on PATH, else ~/.local/bin/vhotseat, else
-                              gpu-workload (same arguments, same answer)
+  GPU_WORKLOAD_BIN            default: vhotseat on PATH, else ~/.local/bin/vhotseat
   GPU_WORKLOAD_GUARD_WAIT_S   how long to wait for Strata to finish an answer (default 300)
   GPU_WORKLOAD_GUARD          set to 0 to disable
 """
@@ -36,16 +35,9 @@ NODE_CLASS_MAPPINGS: dict = {}  # no nodes; ComfyUI requires the attribute to lo
 NODE_DISPLAY_NAME_MAPPINGS: dict = {}
 
 WAIT_S = int(os.environ.get("GPU_WORKLOAD_GUARD_WAIT_S", "300"))
-def _find_bin() -> str:
-    for name in ("vhotseat", "gpu-workload"):
-        for path in (shutil.which(name), os.path.expanduser(f"~/.local/bin/{name}")):
-            if path and os.access(path, os.X_OK):
-                return path
-    return "vhotseat"
-
-
-BIN = os.environ.get("GPU_WORKLOAD_BIN") or _find_bin()
-NAME = os.path.basename(BIN)
+BIN = os.environ.get("GPU_WORKLOAD_BIN") or shutil.which("vhotseat") or os.path.expanduser(
+    "~/.local/bin/vhotseat"
+)
 MARKER = "_gpu_workload_guard"
 
 
@@ -61,10 +53,10 @@ def take_gpu() -> None:
             capture_output=True, text=True, timeout=WAIT_S + 120,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
-        raise GpuBusy(f"{NAME} switch comfy could not run: {e}") from e
+        raise GpuBusy(f"vhotseat switch comfy could not run: {e}") from e
     if r.returncode != 0:
-        lines = [ln.removeprefix(f"{NAME}: ") for ln in r.stderr.splitlines() if ln.strip()]
-        raise GpuBusy(lines[-1] if lines else f"{NAME} switch comfy exited {r.returncode}")
+        lines = [ln.removeprefix("vhotseat: ") for ln in r.stderr.splitlines() if ln.strip()]
+        raise GpuBusy(lines[-1] if lines else f"vhotseat switch comfy exited {r.returncode}")
 
 
 def _fail_job(executor, prompt_id: str, prompt: dict, reason: str) -> None:
