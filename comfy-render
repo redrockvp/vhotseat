@@ -5,7 +5,7 @@ Queues every job up front, waits until all of them have finished, and prints
 one line per job: the files it produced, or ComfyUI's own error. It never
 crashes on a bad workflow; a job that fails is reported and the rest still run.
 
-    comfy-render JOBS.json [--timeout SECONDS] [--json] [--verbose]
+    comfy-render JOBS.json [--url URL] [--comfy-dir DIR] [--timeout SECONDS] [--json] [--verbose]
 
 There is no limit on how long a batch may take: --timeout (default 1800) is how
 long it may go with no sign of progress (no job finishing, no node or sampler
@@ -19,8 +19,13 @@ JOBS.json is either
     where each variant overrides "NODE.inputs.NAME" paths in a copy of base.
 
 Workflows are ComfyUI's API format (what "Export (API)" saves, and what
-POST /prompt takes). The GPU handover to ComfyUI is done by the guard node;
-nothing here needs to know about it.
+POST /prompt takes). If the GPU is shared with an LLM through vhotseat, its
+guard node hands the GPU over before each job; nothing here needs to know.
+
+ComfyUI is at --url, else $COMFY_URL, else http://127.0.0.1:8188. Saved files
+are printed as absolute paths under --comfy-dir (else $COMFY_DIR, else the
+folder ComfyUI reports for its models); if neither is known, as paths relative
+to ComfyUI's folder (output/...).
 
 Exit codes: 0 every job produced output · 1 at least one job was rejected or
 failed · 2 bad input file or ComfyUI unreachable · 3 timed out · 4 the user
@@ -45,21 +50,21 @@ import uuid
 from pathlib import Path
 
 COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188")
-COMFY_DIR = Path(os.environ.get("COMFY_DIR", Path.home() / "ComfyUI"))
+COMFY_DIR: Path | None = Path(os.environ["COMFY_DIR"]) if os.environ.get("COMFY_DIR") else None
 POLL_S = 2.0
 # Live progress: at most one line per job this often, unless the running node changes.
 PROGRESS_EVERY_S = 10.0
 # Give up after this long with no progress at all. Not a limit on the whole batch: a
 # batch of long videos runs for hours, and giving up while jobs are still queued makes
-# the caller's next request to Strata fail, since ComfyUI keeps the GPU until they're done.
+# the caller's next request to an LLM sharing the GPU fail, since ComfyUI keeps the GPU
+# until they're done.
 STALL_TIMEOUT_S = 1800
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_TIMEOUT, EXIT_CANCELLED = 0, 1, 2, 3, 4
 
-# Nothing on this machine interrupts or dequeues a job except a person: the
-# dashboard's Cancel, ComfyUI's own page, or `comfy jobs cancel`.
-# The guard node fails a job with an error instead.
-CANCELLED_BY = "cancelled by the user (dashboard or ComfyUI)"
+# Nothing interrupts or dequeues a job except a person: ComfyUI's own page, a
+# dashboard, `comfy jobs cancel`. The vhotseat guard fails a job with an error instead.
+CANCELLED_BY = "cancelled by the user (ComfyUI or another client)"
 
 
 class UsageError(Exception):
@@ -151,9 +156,25 @@ def _validation_errors(body) -> list[str]:
     return lines
 
 
+def comfy_dir() -> Path | None:
+    """ComfyUI's folder: --comfy-dir / $COMFY_DIR, else where ComfyUI keeps its
+    models (/internal/folder_paths: <dir>/models/checkpoints), else None."""
+    global COMFY_DIR
+    if COMFY_DIR is None:
+        try:
+            code, body = _request("GET", "/internal/folder_paths", timeout=5)
+            first = Path(body["checkpoints"][0]) if code == 200 else None
+        except (urllib.error.URLError, OSError, KeyError, IndexError, TypeError):
+            first = None
+        if first is not None and first.parts[-2:] == ("models", "checkpoints"):
+            COMFY_DIR = first.parent.parent
+    return COMFY_DIR
+
+
 def _files(outputs: dict) -> list[str]:
     """Every saved file, whatever the output key (images, audio, gifs, …)."""
     files = []
+    base = COMFY_DIR or Path()
     for node_out in (outputs or {}).values():
         for value in node_out.values():
             if not isinstance(value, list):
@@ -161,7 +182,7 @@ def _files(outputs: dict) -> list[str]:
             for item in value:
                 if isinstance(item, dict) and "filename" in item:
                     root = "temp" if item.get("type") == "temp" else "output"
-                    files.append(str(COMFY_DIR / root / item.get("subfolder", "") / item["filename"]))
+                    files.append(str(base / root / item.get("subfolder", "") / item["filename"]))
     return files
 
 
@@ -173,7 +194,8 @@ def _runtime_error(status: dict, verbose: bool) -> str:
             if verbose and data.get("traceback"):
                 # Library internals end the traceback; the frames that say where
                 # in the workflow's nodes it broke are the ones under ComfyUI/.
-                frames = [f for f in data["traceback"] if str(COMFY_DIR) in f and "/.venv/" not in f]
+                frames = [f for f in data["traceback"]
+                          if (COMFY_DIR is None or str(COMFY_DIR) in f) and "/.venv/" not in f]
                 tail = "".join((frames or data["traceback"])[-3:]).rstrip()
                 line += "\n    " + "\n    ".join(tail.splitlines())
             return line
@@ -209,7 +231,8 @@ def _queued_ids() -> set[str] | None:
 # client in the standard library, but this is a local, unencrypted socket that
 # only *receives* small JSON frames, so a minimal reader is enough. Anything
 # going wrong here just means no progress lines: /history stays the source of
-# truth for when a job is finished.
+# truth for when a job is finished. The websocket's record of each job's outcome
+# and saved files is the fallback when /history has lost it (ComfyUI restarted).
 
 
 class ProgressWatcher(threading.Thread):
@@ -220,6 +243,7 @@ class ProgressWatcher(threading.Thread):
         self.client_id = client_id
         self.class_types = class_types  # prompt_id -> {node_id: class_type}
         self.state: dict[str, dict] = {}  # prompt_id -> {"node", "value", "max"}
+        self.results: dict[str, dict] = {}  # prompt_id -> {"outputs", "status": /history-shaped}
         self.lock = threading.Lock()
         self.connected = threading.Event()
         self.sock: socket.socket | None = None
@@ -301,6 +325,12 @@ class ProgressWatcher(threading.Thread):
         if not pid:
             return
         with self.lock:
+            res = self.results.setdefault(pid, {"outputs": {}, "messages": []})
+            if kind == "executed" and isinstance(data.get("output"), dict):
+                res["outputs"][str(data.get("node"))] = data["output"]
+            elif kind in ("execution_success", "execution_error", "execution_interrupted"):
+                res["messages"].append([kind, data])
+                res["status_str"] = "success" if kind == "execution_success" else "error"
             st = self.state.setdefault(pid, {})
             if kind == "executing" and data.get("node") is not None:
                 st.update(node=str(data["node"]), value=None, max=None)
@@ -309,6 +339,16 @@ class ProgressWatcher(threading.Thread):
                 st.update(node=str(data.get("node") or st.get("node")),
                           value=data.get("value"), max=data.get("max"))
                 self.last_activity = time.monotonic()
+
+    def result(self, pid: str) -> dict | None:
+        """The job's outcome as /history would show it, if the websocket saw it end."""
+        with self.lock:
+            res = self.results.get(pid)
+            if not res or "status_str" not in res:
+                return None
+            return {"outputs": dict(res["outputs"]),
+                    "status": {"status_str": res["status_str"], "completed": res["status_str"] == "success",
+                               "messages": list(res["messages"])}}
 
     def describe(self, pid: str) -> tuple[str | None, str | None]:
         """(node_id, a one-line description) of what the job is doing right now."""
@@ -406,6 +446,10 @@ def _wait(results, queued, total, watcher, timeout, verbose) -> tuple[list[dict]
             if not entry:
                 if in_queue is None or pid in in_queue:
                     continue
+                # Gone from both: ComfyUI was restarted after it finished (a restart
+                # wipes /history), or someone deleted it while it was queued.
+                entry = watcher.result(pid)
+            if not entry:
                 r.update(status="cancelled", errors=[f"{CANCELLED_BY} before it started"])
             else:
                 status = entry.get("status") or {}
@@ -425,8 +469,8 @@ def _wait(results, queued, total, watcher, timeout, verbose) -> tuple[list[dict]
             node, text = watcher.describe(pid)
             if not text:
                 # No node has started. Either jobs ahead of it are running, or it's
-                # ComfyUI's turn but the guard is still taking the GPU from Strata
-                # (~1 s) and the model is loading (tens of seconds): say so once.
+                # ComfyUI's turn but the guard is still taking the GPU from another
+                # workload (~1 s) and the model is loading (tens of seconds): say so once.
                 if watcher.connected.is_set() and pid not in shown:
                     print(f"job {r['job']}/{total} waiting to start (earlier jobs, or the GPU "
                           "handover and model load)", flush=True)
@@ -471,15 +515,24 @@ def summarize(results: list[dict]) -> str:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="comfy-render", description=__doc__.split("\n\n")[0])
     p.add_argument("jobs", help="JSON file: a workflow, a list of them, or {base, jobs}")
+    p.add_argument("--url", help="ComfyUI's address (default: $COMFY_URL, else http://127.0.0.1:8188)")
+    p.add_argument("--comfy-dir", type=Path, metavar="DIR",
+                   help="ComfyUI's folder, for absolute output paths (default: $COMFY_DIR, else asked of ComfyUI)")
     p.add_argument("--timeout", type=float, default=STALL_TIMEOUT_S, metavar="SECONDS",
                    help=f"give up after this long with no progress (default {STALL_TIMEOUT_S}); "
                         "a batch that keeps progressing may take any time")
     p.add_argument("--json", action="store_true", help="print the results as JSON")
     p.add_argument("--verbose", action="store_true", help="include traceback tails for runtime errors")
     args = p.parse_args(argv)
+    global COMFY_URL, COMFY_DIR
+    if args.url:
+        COMFY_URL = args.url.rstrip("/")
+    if args.comfy_dir:
+        COMFY_DIR = args.comfy_dir.expanduser()
 
     try:
         jobs = load_jobs(args.jobs)
+        comfy_dir()
         results, timed_out = run(jobs, args.timeout, args.verbose)
     except UsageError as e:
         print(f"comfy-render: {e}", file=sys.stderr)

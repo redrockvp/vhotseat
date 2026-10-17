@@ -161,6 +161,8 @@ class FakeComfy(_Server):
         self.job_s = 0.05
         self.slow_s = 1.0
         self.guard = None
+        self.lose_history = False
+        self.models_dir = "/comfy/models/checkpoints"
         self.sockets: dict[str, list] = {}      # client_id -> [socket]
         self._work = threading.Event()
         super().__init__()
@@ -238,7 +240,11 @@ class FakeComfy(_Server):
                 return
             if cls == "SaveImage":
                 outputs[nid] = {"images": [{"filename": f"{pid[:8]}_{nid}.png", "subfolder": "", "type": "output"}]}
+                self._send(pid, "executed", {"node": nid, "display_node": nid, "output": outputs[nid]})
         time.sleep(self.job_s)
+        self._send(pid, "execution_success", {"timestamp": int(time.time() * 1000)})
+        if self.lose_history:     # restarted between the job ending and anyone reading /history
+            return
         self.finish_history(pid, outputs=outputs)
 
     # --- HTTP ---
@@ -250,6 +256,8 @@ class FakeComfy(_Server):
             return self._websocket(h, q.get("clientId", ""))
         if path == "/_vram":
             return h.send_json(200, {"vram": self.vram})
+        if path == "/internal/folder_paths":
+            return h.send_json(200, {"checkpoints": [self.models_dir, "/comfy/output/checkpoints"]})
         if path == "/queue":
             if self.down:
                 return h.send_json(500, {"error": "down"})
@@ -301,45 +309,66 @@ class FakeComfy(_Server):
 
 
 class FakeGpu:
+    """A GPU backend whose processes are the fake servers' allocations."""
+
+    name = "fake"
+
     def __init__(self, strata: FakeStrata, comfy: FakeComfy):
         self.strata, self.comfy = strata, comfy
         self.other = 0
         self.error = None
 
-    def snapshot(self, procs: dict[str, str]) -> dict:
+    def snapshot(self, selectors: dict) -> dict:
         if self.error:
-            return {"total_mib": None, "free_mib": None, "strata_mib": 0, "comfy_mib": 0, "other_mib": 0,
+            return {"total_mib": None, "free_mib": None, **{f"{n}_mib": 0 for n in selectors}, "other_mib": 0,
                     "error": self.error}
         used = {"strata_mib": self.strata.vram, "comfy_mib": self.comfy.vram, "other_mib": self.other}
         return {"total_mib": 16303, "free_mib": 16303 - sum(used.values()), **used}
 
 
+class _FakeService:
+    def __init__(self, host, name):
+        self.host, self.name, self.unit = host, name, f"{name}.service"
+
+    def is_active(self):
+        return self.host.active.get(self.name, False)
+
+    def start(self):
+        self.host.starts.append(self.name)
+        self.host.active[self.name] = True
+
+    def restart(self):
+        self.host.restarts.append(self.name)
+        self.host.active[self.name] = True
+        if cb := self.host.on_restart.get(self.name):
+            cb()
+
+    def memory(self):
+        return dict(self.host.mem.get(self.name, {"ram_mib": None, "swap_mib": None, "file_mib": None}))
+
+
 class FakeHost:
-    """systemd --user stand-in. Units start active; `restart` calls `on_restart[unit]`."""
+    """systemd --user stand-in: units start active; restarting `comfyui` calls
+    `on_restart["comfyui"]`. `service(unit)` gives the object a workload holds."""
 
     def __init__(self):
         self.active = {"strata": True, "comfyui": True}
         self.mem = {"strata": {"ram_mib": 100, "swap_mib": 0, "file_mib": 0},
                     "comfyui": {"ram_mib": 800, "swap_mib": 0, "file_mib": 0}}
+        self.available_mib = 50000
         self.on_restart: dict = {}
         self.restarts: list[str] = []
         self.starts: list[str] = []
 
-    def is_active(self, unit):
-        return self.active.get(unit, False)
-
-    def start(self, unit):
-        self.starts.append(unit)
-        self.active[unit] = True
-
-    def restart(self, unit):
-        self.restarts.append(unit)
-        self.active[unit] = True
-        if cb := self.on_restart.get(unit):
-            cb()
-
-    def memory(self, unit):
-        return dict(self.mem.get(unit, {"ram_mib": None, "swap_mib": None, "file_mib": None}))
+    def service(self, unit: str):
+        return _FakeService(self, unit)
 
     def machine_ram(self):
-        return {"total_mib": 61952, "available_mib": 50000, "swap_total_mib": 8192, "swap_used_mib": 0}
+        return {"total_mib": 61952, "available_mib": self.available_mib, "swap_total_mib": 8192, "swap_used_mib": 0}
+
+    def install(self, arbiter):
+        """Give every workload in `arbiter` its fake service."""
+        for w in arbiter.workloads.values():
+            w.service = self.service(w.service.name)
+        arbiter.machine_ram = self.machine_ram
+        return arbiter

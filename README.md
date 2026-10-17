@@ -20,12 +20,43 @@ Exit codes: `0` ok · `1` switch failed or hook refused · `2` usage · `3` `che
 `hold` exits with COMMAND's own exit code.
 
 **Code layout.** `gpu-workload` is a thin wrapper around the `vhotseat`
-package in [src/vhotseat/](src/vhotseat/), the start of the generic version
-planned in [docs/plans/2026-10-14-vhotseat.md](docs/plans/2026-10-14-vhotseat.md)
-(phase 0: same behaviour, split into an arbiter, a lock, and one driver per
-workload). The CLI, its output, exit codes, env vars, lock file and event log
-are unchanged. Tests: `uv run --with pytest pytest` in this directory (fake
-Strata and ComfyUI servers; no GPU needed).
+package in [src/vhotseat/](src/vhotseat/), the generic version planned in
+[docs/plans/2026-10-14-vhotseat.md](docs/plans/2026-10-14-vhotseat.md). Its
+commands, output and exit codes are unchanged. Tests: `uv run --with pytest
+pytest` in this directory (fake Strata and ComfyUI servers; no GPU needed).
+
+## Config and the `vhotseat` CLI
+
+Both commands read **`~/.config/vhotseat/config.yaml`** (or
+`$VHOTSEAT_CONFIG`). The one in use here is a copy of
+[config.example.yaml](config.example.yaml), commented key by key: the two
+workloads, how to talk to each, their gates, Strata's admission. `gpu-workload`
+needs its workloads named `strata` and `comfy`; without a config file it falls
+back to its old built-in setup and the env vars at the end of this README.
+
+`vhotseat` is the generic CLI over the same config, lock and event log:
+
+```
+vhotseat status [--json]                   # mode: strata | comfy | none | conflict
+vhotseat switch strata|comfy|none [--wait SECONDS] [--json]
+vhotseat hold NAME [--wait SECONDS] -- COMMAND...
+vhotseat gate NAME                         # a hook gate: exit 0 to let NAME load
+vhotseat doctor [--json]                   # config, GPU, services, APIs, gates installed
+```
+
+`switch none` frees the GPU without picking an owner. `doctor` is read-only;
+run it after changing a server's config, updating ComfyUI, or moving things.
+A broken config makes every gate refuse (Strata answers 503) rather than
+letting a load through unchecked. Installed as a symlink:
+`~/.local/bin/vhotseat`.
+
+**GPU memory** is read through NVML (no nvidia-smi process per check), and
+each process is attributed to a workload by the systemd unit it runs in.
+ComfyUI's own `/system_stats` can't be used: it reports 64 MiB with SDXL's
+7 GB loaded.
+
+**State** is in `~/.local/state/vhotseat/` (`events.jsonl`, `switch.lock`);
+`~/.local/state/gpu-workload` is a symlink to it.
 
 ## Modes
 
@@ -49,7 +80,7 @@ Both directions are idempotent: switching to the current mode only re-checks it.
 
 - If a service is stopped, `switch` starts it (`systemctl --user start`).
 - Concurrent switches are serialized with a lock in
-  `~/.local/state/gpu-workload/`.
+  `~/.local/state/vhotseat/`.
 - `--wait` matters because ComfyUI's `/free` only acts *between* jobs, and
   Strata's `/unload` refuses while it's answering.
 
@@ -316,7 +347,7 @@ Measured 2026-10-13: a stray request with ComfyUI idle and holding 7 GB of
 SDXL was answered in 31 s (~2 s free plus ~26 s warm load).
 
 **How the hook tells a switch-triggered load from a stray one:** while a switch
-runs, it holds an flock on `~/.local/state/gpu-workload/switch.lock` and writes
+runs, it holds an flock on `~/.local/state/vhotseat/switch.lock` and writes
 its target mode into that file. The hook never *waits* on that lock. If it did,
 it would deadlock: `switch strata` holds the lock while it blocks on Strata's
 `/load`, and `/load` is what runs the hook.
@@ -342,9 +373,15 @@ gpu-workload restarts ComfyUI (`systemctl --user restart comfyui`) when its
 queue is empty (the existing rule: a render is never interrupted) **and**
 either:
 
-- its RAM + swap is above `GPU_WORKLOAD_COMFY_RESTART_MIB` (default 4096). RAM
-  here is the unit's anonymous memory from its cgroup; page cache is left out,
-  since the kernel drops it under pressure; or
+- **since 2026-10-17:** Strata's admission isn't met: less than
+  `min_available_ram_mib` (46000 for IQ3_XXS) of RAM is available after
+  ComfyUI released its models. That's measured on the machine, not on
+  ComfyUI: on 2026-10-16 at 20:00 ComfyUI was under the old 4 GiB threshold,
+  Strata loaded anyway, and oomd killed it. If a restart still doesn't make
+  room, Strata is refused (503) with the shortfall in the event log, e.g.
+  `Strata needs 46000 MiB of available RAM, 31200 MiB is available`. (Without
+  a config, the old rule applies: ComfyUI's RAM + swap above
+  `GPU_WORKLOAD_COMFY_RESTART_MIB`, default 4096); or
 - `/free` didn't get its VRAM below 1500 MiB, e.g. an extension that doesn't
   unload fully, like IndexTTS without
   [our patch](docs/tts-audio-suite-vram.md). Before, Strata was refused until
@@ -401,7 +438,7 @@ run a job since its last start.
 
 ## Event log
 
-`~/.local/state/gpu-workload/events.jsonl` (last 500 lines) records every mode
+`~/.local/state/vhotseat/events.jsonl` (last 500 lines) records every mode
 change made by `switch`, every `hold` / `hold-end` (with COMMAND's exit code),
 and every load decision the hook makes. Hook decisions carry a `source`
 (`hook` = during a switch or hold, `request` = a request that woke Strata) and
@@ -458,10 +495,11 @@ disk 38 s including a short answer; 82–97 tokens/s on a 700-token story (IQ2_X
 ~100); memory pressure peaked at 49% during the load (oomd acts above 50% for
 20 s), with 14 GiB available once loaded. Installed as a symlink: `~/.local/bin/strata-model`.
 
-## Env overrides
+## Env overrides (only without a config file)
 
 `GPU_WORKLOAD_STRATA_URL`, `_COMFY_URL`, `_STRATA_UNIT`, `_COMFY_UNIT`,
 `_STRATA_PROC`, `_COMFY_PROC` (substrings of the nvidia-smi process path),
-`_COMFY_IDLE_MIB`, and `_COMFY_RESTART_MIB`.
+`_COMFY_IDLE_MIB`, and `_COMFY_RESTART_MIB`. With a config file, edit it
+instead.
 
 Installed as a symlink: `~/.local/bin/gpu-workload`.

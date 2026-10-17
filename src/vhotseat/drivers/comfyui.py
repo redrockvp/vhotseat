@@ -3,7 +3,11 @@
 Its gate is the guard custom node (comfyui/gpu_workload_guard), which takes the
 GPU before every job. /free only takes effect between jobs, and empties VRAM
 but not RAM: after a video render an idle ComfyUI kept 6-15 GiB of RAM + swap
-(2026-10-16), so it's restarted when it holds more than `restart_ram_mib`.
+(2026-10-16). The arbiter restarts it when another workload's admission needs
+that RAM; `restart_above_ram_mib` also restarts it whenever it holds more.
+
+Its VRAM comes from the GPU backend: /system_stats' torch_vram_total doesn't
+include loaded models (64 MiB reported with SDXL's 7 GB loaded, 2026-10-17).
 """
 
 import time
@@ -20,10 +24,12 @@ class ComfyUI(Workload):
     # Its CUDA context alone is ~450 MiB; above this it is holding models.
     idle_vram_mib: int = 1500
     allow_restart: bool = True
-    # RAM + swap (MiB) above which an idle ComfyUI is restarted after /free.
-    restart_ram_mib: int = 4096
-    # A restart wipes /history. comfy-render polls it every 2 s, so a job that
-    # finished less than this long ago may not have been reported yet: wait first.
+    # RAM + swap (MiB) above which an idle ComfyUI is restarted after /free;
+    # None leaves it to the other workloads' admission.
+    restart_above_ram_mib: int | None = None
+    # A restart wipes /history. Clients that read results from it (comfy-cli,
+    # comfy-render after a websocket drop, a dashboard) may not
+    # have read the latest job yet if it finished less than this long ago.
     history_settle_s: float = 10
 
     def _queue(self) -> tuple[int, int] | None:
@@ -65,11 +71,6 @@ class ComfyUI(Workload):
                     "so whether it has jobs is unknown")
         return f"ComfyUI has {jobs} job(s) running or queued" if jobs else None
 
-    def held_mib(self) -> int:
-        """RAM plus swap (MiB), 0 if unknown."""
-        m = self.ctx.host.memory(self.unit)
-        return (m["ram_mib"] or 0) + (m["swap_mib"] or 0)
-
     def _free(self, wait: float, timeout: float) -> None:
         """Make ComfyUI drop its models. Fails at once if it has jobs, unless `wait`
         gives them that long to finish: a render is never interrupted."""
@@ -108,7 +109,7 @@ class ComfyUI(Workload):
                 raise ReleaseFailed(f"ComfyUI kept {stuck} MiB of VRAM after /free",
                                     why=f"it kept {stuck} MiB of VRAM after /free",
                                     then=f"restarted it: kept {stuck} MiB of VRAM after /free") from None
-        if (ram := self.held_mib()) > self.restart_ram_mib:
+        if self.restart_above_ram_mib is not None and (ram := self.held_mib()) > self.restart_above_ram_mib:
             raise ReleaseFailed(f"ComfyUI holds {ram} MiB of RAM + swap",
                                 why=f"it holds {ram} MiB of RAM + swap with no models loaded",
                                 then=f"restarted it to release {ram} MiB of RAM + swap", done=done)

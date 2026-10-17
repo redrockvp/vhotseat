@@ -279,7 +279,7 @@ Three locks are in play:
 
 | Lock | Held by | Acquired how |
 | --- | --- | --- |
-| `~/.local/state/gpu-workload/switch.lock` (flock) | `switch`, `hold`, and the hook | **blocking** in `switch` / `hold`, **non-blocking** in the hook |
+| `~/.local/state/vhotseat/switch.lock` (flock) | `switch`, `hold`, and the hook | **blocking** in `switch` / `hold`, **non-blocking** in the hook |
 | Strata's request queue (`fifo`) | a running request or load | blocking for requests; **non-blocking** in `/unload` |
 | ComfyUI's job worker | the running job, including its guard | one job at a time |
 
@@ -440,7 +440,7 @@ number and size of handovers.
 
 - `gpu-workload status` shows the current mode, what each side holds, and the
   last event.
-- `~/.local/state/gpu-workload/events.jsonl` keeps the last 500 decisions:
+- `~/.local/state/vhotseat/events.jsonl` keeps the last 500 decisions:
   every `switch`, every `hold` / `hold-end`, and every hook decision with its
   `source` (`hook` = during a switch or hold, `request` = a request that woke
   Strata) and `reason`. For example:

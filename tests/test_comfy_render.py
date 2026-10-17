@@ -22,7 +22,7 @@ def cr(monkeypatch):
     loader.exec_module(mod)
     comfy = FakeComfy()
     monkeypatch.setattr(mod, "COMFY_URL", comfy.url)
-    monkeypatch.setattr(mod, "COMFY_DIR", Path("/comfy"))
+    monkeypatch.setattr(mod, "COMFY_DIR", None)
     monkeypatch.setattr(mod, "POLL_S", 0.05)
     mod.fake = comfy
     yield mod
@@ -145,3 +145,34 @@ def test_json_output(cr, tmp_path, capsys):
     out = capsys.readouterr().out
     results = json.loads(out[out.index("["):])
     assert results[0]["status"] == "done" and results[0]["files"][0].startswith("/comfy/output/")
+
+
+def test_comfy_dir_from_comfyui(cr, tmp_path, capsys):
+    """No --comfy-dir: ComfyUI's own model folder says where it lives."""
+    cr.fake.models_dir = "/srv/ComfyUI/models/checkpoints"
+    assert cr.main([write(tmp_path, save())]) == 0
+    assert "job 1/1 ok: /srv/ComfyUI/output/" in capsys.readouterr().out
+
+
+def test_comfy_dir_unknown_gives_relative_paths(cr, tmp_path, capsys):
+    cr.fake.models_dir = "/somewhere/else"
+    assert cr.main([write(tmp_path, save())]) == 0
+    assert "job 1/1 ok: output/" in capsys.readouterr().out
+
+
+def test_comfy_dir_and_url_flags(cr, tmp_path, capsys, monkeypatch):
+    url = cr.fake.url
+    monkeypatch.setattr(cr, "COMFY_URL", "http://127.0.0.1:9")
+    assert cr.main([write(tmp_path, save()), "--url", url, "--comfy-dir", "/opt/comfy"]) == 0
+    assert "job 1/1 ok: /opt/comfy/output/" in capsys.readouterr().out
+
+
+def test_result_survives_lost_history(cr, tmp_path, capsys):
+    """ComfyUI restarted (vhotseat making room) after the job finished but before
+    /history was read: the result comes from the websocket instead of being
+    reported as cancelled."""
+    cr.fake.lose_history = True
+    assert cr.main([write(tmp_path, [save(1), save(2)])]) == 0
+    out = capsys.readouterr().out
+    assert "job 1/2 ok: /comfy/output/" in out and "job 2/2 ok: /comfy/output/" in out
+    assert "cancelled" not in out
