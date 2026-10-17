@@ -397,7 +397,8 @@ shows the latest event on its `last:` line, and `--json` includes it as
 
 ## Strata config this relies on
 
-`~/Strata/strata-iq2_xs.json` has `"lazy_load": true`, so
+Each `~/Strata/strata-<size>.json` ([see strata-model](#strata-model-which-model-size-strata-serves);
+`strata-iq2_xs.json` and `strata-iq3_xxs.json` as of 2026-10-16) has `"lazy_load": true`, so
 `strata.service` can stay enabled without holding VRAM until something asks it
 to load. It also has `"min_free_vram_mib": 14000`: a stray request that arrives
 while ComfyUI holds models gets a 503 instead of loading on top of it. The file
@@ -408,6 +409,40 @@ It also has `before_load` (the hook above), `before_load_strict: true` and
 restart, backup `strata-iq2_xs.json.pre-restart`). The pre-hook config is the
 same `strata-iq2_xs.json.pre-lazy` backup, taken before any of these keys were
 added.
+
+## strata-model: which model size Strata serves
+
+```
+strata-model                   # list installed sizes, * = active
+strata-model iq3|iq2|SIZE      # switch (SIZE as in strata-SIZE.json)
+strata-model iq3 --wait 120    # let an answer Strata is writing finish first
+```
+
+Strata serves one model per server, and it answers whatever model name a
+request uses. So picking a model in pi doesn't change which size runs; the
+server's config does. `strata.service` runs `--config strata-active.json`, a
+symlink to one `strata-<size>.json` that Strata's setup wrote.
+
+Switching unloads Strata if it's loaded (refused while it answers, unless
+`--wait`), repoints the symlink and restarts the unloaded server (~3 s). The
+model then loads on the next request, through the `before_load` hook as
+always. It also sets pi's `defaultModel` to the new size, so pi's labels match
+the server. the chat bot names its pi model in `the chat bot's config`
+(`PI_DEFAULT_MODEL`); that one needs editing and a restart of the chat bot.
+
+Each `strata-<size>.json` needs its own copy of the hook, `lazy_load` and the
+other keys below. Strata's setup keeps them when it rewrites an installed
+size's config, but **not** when it installs a new size: on 2026-10-16 the new
+`strata-iq3_xxs.json` had none of them, and without the hook Strata would load
+on top of ComfyUI. After installing a size, copy `allowed_hosts`,
+`trusted_origins`, `open_browser`, `lazy_load`, `min_free_vram_mib`,
+`before_load`, `before_load_strict` and `before_load_timeout_s` from another
+size's config before switching to it.
+
+Measured 2026-10-16, IQ3_XXS (128K context, images on the CPU): first load from
+disk 38 s including a short answer; 82–97 tokens/s on a 700-token story (IQ2_XS:
+~100); memory pressure peaked at 49% during the load (oomd acts above 50% for
+20 s), with 14 GiB available once loaded. Installed as a symlink: `~/.local/bin/strata-model`.
 
 ## Env overrides
 
