@@ -17,8 +17,8 @@ OK, WARN, FAIL = "ok", "warn", "fail"
 
 
 def _gate_hook(w, gate: dict) -> list:
-    """A hook gate: the server's config runs `vhotseat gate NAME` (or gpu-workload's
-    hook) before it loads, strictly, with a limit that fits our release time."""
+    """A hook gate: the server's config runs `vhotseat gate NAME` before it loads,
+    strictly, with a limit that fits our release time."""
     out = []
     path = gate.get("config")
     if not path:
@@ -30,8 +30,7 @@ def _gate_hook(w, gate: dict) -> list:
         return [(FAIL, f"{w.name}: gate", f"can't read {p}: {e}")]
     cmd = cfg.get("before_load")
     cmd = cmd.split() if isinstance(cmd, str) else cmd or []
-    calls_us = (len(cmd) >= 3 and Path(cmd[0]).name in ("vhotseat", "gpu-workload")
-                and (cmd[1:3] == ["gate", w.name] or cmd[1:3] == ["hook", f"{w.name}-before-load"]))
+    calls_us = len(cmd) >= 3 and Path(cmd[0]).name == "vhotseat" and cmd[1:3] == ["gate", w.name]
     if not calls_us:
         out.append((FAIL, f"{w.name}: gate", f"{p} before_load is {cmd or 'unset'}: "
                     f"loads aren't guarded; set it to [\"vhotseat\", \"gate\", \"{w.name}\"]"))
@@ -90,8 +89,6 @@ def checks(arbiter, cfg: dict | None) -> list:
             out.append((FAIL, f"{w.name}: admission", f"min_free_vram_mib {need} is more than the card has"))
         if (need := w.admission.get("min_available_ram_mib")) and ram.get("total_mib") and need > ram["total_mib"]:
             out.append((FAIL, f"{w.name}: admission", f"min_available_ram_mib {need} is more than the machine has"))
-    if not cfg:
-        out.append((WARN, "config", "no config file: using gpu-workload's built-in setup"))
     return out
 
 

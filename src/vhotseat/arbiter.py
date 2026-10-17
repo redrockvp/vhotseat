@@ -25,29 +25,24 @@ from .events import EventLog
 from .lock import GpuLock, Held
 
 NONE = "none"
+# Set in a hold's command's environment, so a nested switch to the held workload
+# is a no-op instead of waiting on the lock the hold owns.
+HOLD_ENV = "VHOTSEAT_HOLD"
 
 
 class Arbiter:
     def __init__(self, workloads: list[Workload], gpu, lock: GpuLock, events: EventLog, *,
-                 idle_owner: str = NONE, gate_release_timeout_s: float = 20,
-                 release_timeout_s: float = 60, hold_env: str = "VHOTSEAT_HOLD",
-                 machine_ram=host.machine_ram, cli: str = "vhotseat"):
+                 gate_release_timeout_s: float = 20, release_timeout_s: float = 60,
+                 machine_ram=host.machine_ram):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
         self.lock = lock
         self.events = events
-        # The owner to report when no workload holds the GPU. The gpu-workload CLI
-        # has always called that "comfy": ComfyUI may take it without a switch.
-        self.idle_owner = idle_owner
         # A gate runs inside the workload's own load, which has a time limit
         # (Strata's before_load_timeout_s), so its releases get less time.
         self.gate_release_timeout_s = gate_release_timeout_s
         self.release_timeout_s = release_timeout_s
-        # Set in a hold's command's environment, so a nested switch to the held
-        # workload is a no-op instead of waiting on the lock the hold owns.
-        self.hold_env = hold_env
         self.machine_ram = machine_ram
-        self.cli = cli
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
@@ -61,7 +56,7 @@ class Arbiter:
         gpu = self.snapshot()
         states = {n: w.probe(gpu) for n, w in self.workloads.items()}
         active = [n for n, w in self.workloads.items() if w.active(states[n], gpu)]
-        mode = "conflict" if len(active) > 1 else active[0] if active else self.idle_owner
+        mode = "conflict" if len(active) > 1 else active[0] if active else NONE
         ram = self.machine_ram()
         ram.update({n: w.memory() for n, w in self.workloads.items()})
         return {"mode": mode, **states, "gpu": gpu, "ram": ram, "last_event": self.events.last()}
@@ -173,7 +168,8 @@ class Arbiter:
         resident = x is not None and x.active(s[name], s["gpu"])
         # A workload that may be loading invisibly is asked to release even when the
         # GPU looks like x's already, so this only short-cuts when none of them may be.
-        if s["mode"] == name and not any(y.release_always for y in others):
+        if (s["mode"] == name or (s["mode"] == NONE and x is not None and not x.can_load())) \
+                and not any(y.release_always for y in others):
             util.log(f"already in {name} mode")
             return []
         done = self._make_room(x, wait, self.release_timeout_s, ensure=True, admit=not resident)
@@ -183,10 +179,13 @@ class Arbiter:
         loads = load and x.can_load()
         if loads:
             x.load(wait)
-        if self.probe()["mode"] != name:
+        # A lazy workload loads on its first job, so after a switch the GPU may be
+        # free ("none") rather than its: the switch is done once the others are gone.
+        mode = self.probe()["mode"]
+        if mode != name and (loads or mode != NONE):
             what = (f"{x.label} reported loaded" if loads
                     else f"{', '.join(y.label for y in others)} unloaded")
-            raise SwitchError(f"{what}, but the mode isn't {name}; run `{self.cli} status`")
+            raise SwitchError(f"{what}, but the mode is {mode}, not {name}; run `vhotseat status`")
         return done
 
     def gate(self, name: str) -> bool:
@@ -253,7 +252,7 @@ class Arbiter:
         so: return at once. That's how a ComfyUI job queued by a held script gets
         past its guard; before, the guard waited on the hold, which was waiting
         on the job."""
-        held = os.environ.get(self.hold_env)
+        held = os.environ.get(HOLD_ENV)
         if held:
             # Inside `hold`: our parent owns the lock, so taking it would deadlock.
             if held != name:
@@ -280,7 +279,7 @@ class Arbiter:
         its exit code. The lock is marked "hold name" once the switch is done, so
         every other workload's gate refuses, and a script may leave the queue
         empty between its jobs."""
-        if os.environ.get(self.hold_env) == name:
+        if os.environ.get(HOLD_ENV) == name:
             # Already inside a hold: our parent owns the lock, so taking it would deadlock.
             return subprocess.call(command)
         with self._take(name, skip_if_held=False) as lock:
@@ -296,7 +295,7 @@ class Arbiter:
             lock.mark(f"hold {name}")
             self.events.record("hold", mode=name, ok=True, previous=before, command=" ".join(command)[:200])
             try:
-                proc = subprocess.Popen(command, env={**os.environ, self.hold_env: name})
+                proc = subprocess.Popen(command, env={**os.environ, HOLD_ENV: name})
             except OSError as e:
                 self.events.record("hold-end", mode=name, ok=False, error=str(e))
                 util.log(f"could not run {command[0]}: {e}")

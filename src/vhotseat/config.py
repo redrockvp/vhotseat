@@ -141,7 +141,7 @@ def validate(raw) -> dict:
 
 
 def parse(text: str) -> dict:
-    import yaml  # only needed with a config file; `gpu-workload` without one doesn't load it
+    import yaml
     try:
         raw = yaml.safe_load(text)
     except yaml.YAMLError as e:

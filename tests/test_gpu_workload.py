@@ -1,4 +1,5 @@
-"""gpu-workload's behaviour, end to end against fake Strata and ComfyUI servers.
+"""vhotseat's behaviour on the Strata + ComfyUI setup (config.example.yaml),
+end to end against fake Strata and ComfyUI servers.
 
 Each race and deadlock in docs/how-it-works.md §3-4 is a scenario here, as are
 the ComfyUI restart cases from the README (tested by hand on 2026-10-16).
@@ -22,16 +23,11 @@ def last(r, kind=None):
     return evs[-1] if evs else None
 
 
-def hook_into(r):
-    """Wire the fake Strata's before_load to the arbiter's gate, as strata-iq*.json does."""
-    r.strata.on_load = lambda: r.arb.gate("strata")
-
-
 # --- status ------------------------------------------------------------------
 
 
 def test_status_modes(rig, capsys):
-    assert rig.arb.probe()["mode"] == "comfy"          # nothing loaded: ComfyUI may take it
+    assert rig.arb.probe()["mode"] == "none"
     rig.strata.loaded = True
     assert rig.arb.probe()["mode"] == "strata"
     rig.comfy.vram = 7000
@@ -59,22 +55,15 @@ def test_status_text(rig, capsys):
     assert out[3].startswith("gpu:    1903 of 16303 MiB free (strata 14000, comfy 400, other 0)")
 
 
-def test_check(rig, capsys):
-    assert rig.cli("check", "comfy") == 0
-    assert rig.cli("check", "strata") == 3
-    assert "run `gpu-workload switch strata`" in capsys.readouterr().err
-
-
 # --- switch --------------------------------------------------------------------
 
 
 def test_switch_strata_frees_comfy_then_loads(rig):
-    hook_into(rig)
     rig.comfy.vram = 7000
     assert rig.cli("switch", "strata") == 0
     assert rig.strata.loaded and rig.comfy.vram == 400
     assert "POST /free" in rig.comfy.calls
-    assert last(rig, "switch") == {**last(rig, "switch"), "to": "strata", "ok": True, "previous": "conflict"} or True
+    assert last(rig, "switch")["to"] == "strata"
     # Strata's own hook ran during /load and allowed it: the switch asked for this load.
     assert last(rig, "strata-load")["allowed"] is True
     assert last(rig, "strata-load")["reason"] == "switch strata in progress"
@@ -89,7 +78,6 @@ def test_switch_comfy_unloads_strata(rig):
 
 def test_switch_is_idempotent(rig):
     rig.strata.loaded = True
-    hook_into(rig)
     assert rig.cli("switch", "strata") == 0
     assert "POST /load" not in rig.strata.calls
     assert last(rig, "switch") is None                   # nothing changed, nothing logged
@@ -129,7 +117,6 @@ def test_switch_strata_refused_while_comfy_has_jobs(rig):
 
 
 def test_switch_starts_stopped_services(rig):
-    hook_into(rig)
     rig.host.active["strata"] = False
     assert rig.cli("switch", "strata") == 0
     assert rig.host.starts == ["strata"]
@@ -146,7 +133,6 @@ def test_stopped_strata_holding_vram_is_reported(rig):
 
 
 def test_hook_allows_when_comfy_idle(rig):
-    hook_into(rig)
     assert rig.strata.request() == 200
     e = last(rig, "strata-load")
     assert e["allowed"] and e["source"] == "request" and e["reason"] == "ComfyUI idle"
@@ -154,7 +140,6 @@ def test_hook_allows_when_comfy_idle(rig):
 
 
 def test_hook_frees_idle_comfy_models(rig):
-    hook_into(rig)
     rig.comfy.vram = 7000
     assert rig.strata.request() == 200
     assert rig.comfy.vram == 400
@@ -163,7 +148,6 @@ def test_hook_frees_idle_comfy_models(rig):
 
 def test_hook_refuses_while_comfy_renders(rig):
     """A render is never interrupted: Strata answers 503 instead."""
-    hook_into(rig)
     rig.comfy.queue_job({"1": {"class_type": "Slow", "inputs": {}}})
     time.sleep(0.05)
     assert rig.strata.request() == 503
@@ -174,7 +158,6 @@ def test_hook_refuses_while_comfy_renders(rig):
 def test_hook_refuses_when_comfy_state_unknown(rig):
     """Fail closed: ComfyUI holding models with its API down could be mid-job.
     (gpu-workload used to read an unreachable /queue as 0 jobs.)"""
-    hook_into(rig)
     rig.comfy.vram = 7000
     rig.comfy.down = True
     assert rig.strata.request() == 503
@@ -184,20 +167,17 @@ def test_hook_refuses_when_comfy_state_unknown(rig):
 def test_hook_allows_when_comfy_down_but_holding_nothing(rig):
     """…but a ComfyUI that's starting up (API not answering yet, nothing on the
     GPU) doesn't keep Strata out."""
-    hook_into(rig)
     rig.comfy.down = True
     assert rig.strata.request() == 200
 
 
 def test_hook_refuses_when_nvidia_smi_fails(rig):
-    hook_into(rig)
     rig.gpu.error = "nvidia-smi failed: boom"
     assert rig.strata.request() == 503
     assert last(rig, "strata-load")["reason"] == "nvidia-smi failed: boom"
 
 
 def test_hook_refuses_during_switch_comfy(rig):
-    hook_into(rig)
     with rig.arb.lock.try_take("switch comfy"):
         assert rig.strata.request() == 503
     e = last(rig, "strata-load")
@@ -211,7 +191,6 @@ def test_race_job_queued_as_hook_frees(rig):
     """§3.1: a job lands between the hook's /queue check and its /free. /free is
     postponed past the job, ComfyUI's VRAM doesn't drop, and the hook refuses
     rather than letting the two share the GPU. ComfyUI is not restarted."""
-    hook_into(rig)
     rig.comfy.vram = 7000
     rig.comfy.slow_s = 6.0
     rig.comfy.job_arrives_on_free = True
@@ -224,7 +203,6 @@ def test_race_job_queued_as_hook_frees(rig):
 def test_race_job_after_hook_allowed(rig):
     """§3.1, second half: a job queued after Strata loaded waits (--wait) for
     Strata's answer, then unloads it, then runs."""
-    hook_into(rig)
     t = rig.strata.request_async(0.3)
     time.sleep(0.1)
     assert rig.strata.loaded
@@ -235,7 +213,6 @@ def test_race_job_after_hook_allowed(rig):
 
 def test_race_interleaved_jobs_and_request(rig):
     """§3.4: job A done, Strata request, job B: two extra handovers, both safe."""
-    hook_into(rig)
     rig.comfy.vram = 7000                              # job A finished, models still loaded
     assert rig.strata.request() == 200                 # hook frees ComfyUI, Strata loads
     assert rig.cli("switch", "comfy", "--wait", "5") == 0  # job B's guard
@@ -248,7 +225,6 @@ def test_race_interleaved_jobs_and_request(rig):
 def test_switch_strata_does_not_deadlock_on_its_own_hook(rig):
     """§4.1: switch strata holds the lock and blocks on /load, whose hook wants
     the lock. The hook reads the holder note instead of waiting."""
-    hook_into(rig)
     done = threading.Event()
     threading.Thread(target=lambda: (rig.cli("switch", "strata"), done.set()), daemon=True).start()
     assert done.wait(5)
@@ -257,14 +233,13 @@ def test_switch_strata_does_not_deadlock_on_its_own_hook(rig):
 
 def test_switch_inside_hold_is_a_noop(rig, monkeypatch, capsys):
     """§4.2: a hold's command switching to the held mode."""
-    monkeypatch.setenv("GPU_WORKLOAD_HOLD", "comfy")
+    monkeypatch.setenv("VHOTSEAT_HOLD", "comfy")
     assert rig.cli("switch", "comfy", "--json") == 0
     assert json.loads(capsys.readouterr().out)["held"] == "comfy"
     assert rig.cli("switch", "strata") == 1
 
 
 def test_hold_refuses_strata_until_command_exits(rig, tmp_path):
-    hook_into(rig)
     rig.strata.loaded = True
     gate = tmp_path / "go"
     seen = {}
@@ -291,7 +266,7 @@ def test_hold_exit_code_is_the_commands(rig):
 def test_guard_inside_hold_does_not_wait_for_it(rig, tmp_path):
     """The bug in Appendix A.6 #1: a script under `hold comfy` queues a ComfyUI
     job; the job's guard runs `switch comfy` from ComfyUI's process (no
-    GPU_WORKLOAD_HOLD in its env). It used to wait for the hold's lock, while
+    VHOTSEAT_HOLD in its env). It used to wait for the hold's lock, while
     the script waited for the job: stuck until the guard's 420 s timeout."""
     ready = tmp_path / "ready"
     result = {}
@@ -324,7 +299,6 @@ def test_switch_waits_for_another_switch(rig):
 def test_hook_and_guard_wait_is_bounded(rig):
     """§4.3: the hook holds the lock while it frees ComfyUI; a guard starting
     then waits for it, and is never stuck."""
-    hook_into(rig)
     rig.comfy.vram = 7000
     t = rig.strata.request_async(0.2)
     while "POST /free" not in rig.comfy.calls:        # the hook has the lock
@@ -337,35 +311,35 @@ def test_hook_and_guard_wait_is_bounded(rig):
 # --- ComfyUI restart (README "ComfyUI restart: RAM, not just VRAM") ----------------------
 
 
-def test_restart_when_comfy_holds_ram(rig):
-    """RAM over the threshold, last job finished 4 s ago: waits ~6 s more, restarts."""
-    hook_into(rig)
+def test_restart_when_strata_needs_comfys_ram(rig):
+    """Strata's admission isn't met, last job finished 4 s ago: waits ~6 s more
+    (so its result can be read from /history), restarts ComfyUI."""
     pid = rig.comfy.queue_job()
     time.sleep(0.3)
     rig.comfy.finish_history(pid, ago=4)
     rig.comfy.vram = 7000
     rig.host.mem["comfyui"] = {"ram_mib": 6000, "swap_mib": 1000, "file_mib": 0}
+    rig.host.available_mib = 42000
+    rig.host.on_restart["comfyui"] = lambda: (rig.comfy.restarted(), setattr(rig.host, "available_mib", 49000))
     assert rig.strata.request() == 200
     assert rig.host.restarts == ["comfyui"]
     e = last(rig, "strata-load")
     assert e["reason"] == ("ComfyUI idle; freed its 7000 MiB of models; "
-                           "restarted it to release 7000 MiB of RAM + swap")
+                           "restarted ComfyUI to release 7000 MiB of RAM + swap for Strata")
 
 
-def test_no_restart_under_threshold(rig):
-    hook_into(rig)
+def test_no_restart_when_ram_is_enough(rig):
     rig.comfy.vram = 7000
-    rig.host.mem["comfyui"] = {"ram_mib": 2000, "swap_mib": 500, "file_mib": 0}
+    rig.host.mem["comfyui"] = {"ram_mib": 9000, "swap_mib": 500, "file_mib": 0}
     assert rig.strata.request() == 200
     assert rig.host.restarts == []
 
 
 def test_no_restart_if_job_queued_during_settle(rig):
-    hook_into(rig)
     pid = rig.comfy.queue_job()
     time.sleep(0.3)
     rig.comfy.finish_history(pid, ago=0)
-    rig.host.mem["comfyui"] = {"ram_mib": 6000, "swap_mib": 0, "file_mib": 0}
+    rig.host.available_mib = 42000
     threading.Timer(0.3, lambda: rig.comfy.queue_job({"1": {"class_type": "Slow", "inputs": {}}})).start()
     assert rig.strata.request() == 503
     assert rig.host.restarts == []
@@ -374,7 +348,6 @@ def test_no_restart_if_job_queued_during_settle(rig):
 
 def test_restart_when_vram_stuck_after_free(rig):
     """An extension that doesn't unload fully (IndexTTS without our patch)."""
-    hook_into(rig)
     rig.comfy.vram = 7000
     rig.comfy.stuck_vram = 2066
     assert rig.strata.request() == 200
@@ -383,9 +356,9 @@ def test_restart_when_vram_stuck_after_free(rig):
 
 
 def test_switch_strata_restarts_too(rig):
-    hook_into(rig)
     rig.comfy.vram = 7000
-    rig.host.mem["comfyui"] = {"ram_mib": 9000, "swap_mib": 0, "file_mib": 0}
+    rig.host.available_mib = 42000
+    rig.host.on_restart["comfyui"] = lambda: (rig.comfy.restarted(), setattr(rig.host, "available_mib", 49000))
     assert rig.cli("switch", "strata") == 0
     assert rig.host.restarts == ["comfyui"] and rig.strata.loaded
 
@@ -394,10 +367,13 @@ def test_switch_strata_restarts_too(rig):
 
 
 def _guard(rig, monkeypatch):
-    """The real guard node's take_gpu(), running gpu-workload as a subprocess
+    """The real guard node's take_gpu(), running vhotseat as a subprocess
     (tests/run_cli.py: the real CLI with GPU and services read from the fakes)."""
     sys.path.insert(0, str(ROOT / "comfyui"))
     monkeypatch.setenv("GPU_WORKLOAD_BIN", str(ROOT / "tests" / "run_cli.py"))
+    monkeypatch.setenv("STRATA_URL", rig.strata.url)
+    monkeypatch.setenv("COMFY_URL", rig.comfy.url)
+    monkeypatch.setenv("XDG_STATE_HOME", str(rig.state.parent))
     monkeypatch.setattr("shutil.which", lambda *a, **k: None)
     monkeypatch.setenv("GPU_WORKLOAD_GUARD_WAIT_S", "2")
     sys.modules.pop("gpu_workload_guard", None)

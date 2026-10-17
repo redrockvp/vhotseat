@@ -11,7 +11,7 @@ from .errors import SwitchError
 # Multiplies every wait and poll interval. Tests shrink it; the real servers
 # change state on a scale of seconds.
 SCALE = 1.0
-LOG_PREFIX = "gpu-workload"
+LOG_PREFIX = "vhotseat"
 
 
 def log(msg: str) -> None:

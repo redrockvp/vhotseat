@@ -77,26 +77,6 @@ def test_bad_yaml():
         config.parse("workloads: [")
 
 
-def test_gpu_workload_reads_the_config_file(tmp_path, monkeypatch):
-    from vhotseat import compat
-    (tmp_path / "vhotseat").mkdir()
-    (tmp_path / "vhotseat/config.yaml").write_text((ROOT / "config.example.yaml").read_text())
-    arb = compat.build(env={"XDG_CONFIG_HOME": str(tmp_path), "XDG_STATE_HOME": str(tmp_path / "s")},
-                       gpu=FakeGpu(FakeStrata(), FakeComfy()))
-    assert arb.workloads["strata"].admission["min_available_ram_mib"] == 46000
-
-
-def test_gpu_workload_needs_strata_and_comfy(tmp_path):
-    from vhotseat import compat
-    raw = config.parse((ROOT / "config.example.yaml").read_text())
-    raw["workloads"]["llm"] = raw["workloads"].pop("strata")
-    (tmp_path / "vhotseat").mkdir()
-    import yaml
-    (tmp_path / "vhotseat/config.yaml").write_text(yaml.safe_dump(raw))
-    with pytest.raises(config.ConfigError, match="missing: strata"):
-        compat.build(env={"XDG_CONFIG_HOME": str(tmp_path), "XDG_STATE_HOME": str(tmp_path / "s")})
-
-
 def test_state_moves_from_gpu_workload(tmp_path):
     old = tmp_path / "gpu-workload"
     old.mkdir()
@@ -108,9 +88,9 @@ def test_state_moves_from_gpu_workload(tmp_path):
     assert (tmp_path / "vhotseat/switch.lock").exists()
 
 
-def test_old_and_new_cli_share_one_lock(vh):
-    """gpu-workload from before the config used ~/.local/state/gpu-workload/switch.lock;
-    vhotseat uses the same file (through the symlink) for GPU 0."""
+def test_lock_keeps_gpu_workloads_name(vh):
+    """~/.local/state/gpu-workload/switch.lock, through the symlink: a rollback to
+    gpu-workload (docs/revert-gpu-workload.md) shares the lock."""
     assert vh.arb.lock.path.name == "switch.lock"
 
 

@@ -1,4 +1,4 @@
-# How gpu-workload works
+# How gpu-workload (vhotseat) works
 
 This machine has one 16 GB GPU (RTX 5070 Ti). Two services need almost all of
 it:
@@ -8,7 +8,8 @@ it:
 | **Strata** (`strata.service`, `:2335`) | local LLM, Qwen3.8-Flash-Next IQ2_XS; **pi** runs on it | ~14.7 GB |
 | **ComfyUI** (`comfyui.service`, `:8188`) | image and video generation | 7 GB (SDXL) to 13+ GB (video) |
 
-They can't both hold the GPU. `gpu-workload` makes them take turns, with no
+They can't both hold the GPU. `vhotseat` (until 2026-10-17 a script called
+`gpu-workload`) makes them take turns, with no
 caller ever having to manage the GPU:
 
 - not the chat bot;
@@ -31,9 +32,9 @@ Reference material, such as commands, flags and env vars, is in
 
 | Piece | Where | Role |
 | --- | --- | --- |
-| `gpu-workload` CLI | `gpu-workload/gpu-workload`, on PATH | `status` / `switch` / `check` / `hold`, and Strata's hook. Reads state live; keeps no state file. |
-| **Strata's `before_load` hook** | `strata-iq2_xs.json` → `gpu-workload hook strata-before-load`, with `before_load_strict: true` | Runs before Strata loads its model. Decides allow / refuse; may free an idle ComfyUI first. |
-| **ComfyUI guard node** | `comfyui/gpu_workload_guard`, symlinked into `custom_nodes/` | Wraps `PromptExecutor.execute_async`; runs `gpu-workload switch comfy --wait 300` before **every** job. |
+| `vhotseat` CLI | `gpu-workload/vhotseat`, on PATH; config `~/.config/vhotseat/config.yaml` | `status` / `switch` / `hold` / `doctor`, and `gate` for Strata's hook. Reads state live; keeps no state file. |
+| **Strata's `before_load` hook** | `strata-*.json` → `vhotseat gate strata`, with `before_load_strict: true` | Runs before Strata loads its model. Decides allow / refuse; may free an idle ComfyUI first. |
+| **ComfyUI guard node** | `comfyui/gpu_workload_guard`, symlinked into `custom_nodes/` | Wraps `PromptExecutor.execute_async`; runs `vhotseat switch comfy --wait 300` before **every** job. |
 | `comfy-render` | `gpu-workload/comfy-render`, on PATH | Submits a batch of workflows, waits for **all** of them, and reports files or errors plus live progress. It never touches the GPU itself. |
 | pi skill `comfyui-batching` | `pi/skills/`, symlinked into the pi workspace's `.pi/skills/` | Tells pi to use `comfy-render` and to batch. Best effort. |
 | pi retry window | `~/.pi/agent/settings.json` | When Strata answers 503, pi retries for ~151 s instead of ~14 s. |
@@ -56,7 +57,7 @@ Two consequences follow:
   request before unloading it.
 
 Everything else, such as which mode the GPU is "in", follows from those two
-rules. `gpu-workload status` derives the mode from Strata `/health`, ComfyUI
+rules. `vhotseat status` derives the mode from Strata `/health`, ComfyUI
 `/queue` and `nvidia-smi` each time; nothing records it.
 
 ## 2. A full flow
@@ -170,7 +171,7 @@ sequenceDiagram
 
 - **the chat bot** knows nothing about the GPU. It runs pi, streams pi's
   events, and turns a "GPU busy" 503 into a readable reply.
-- **pi** never calls `gpu-workload`. It runs `comfy-render` and asks Strata for
+- **pi** never calls `vhotseat`. It runs `comfy-render` and asks Strata for
   its next step; the hook and the guard do the handovers.
 - **comfy-render** queues and waits; the guard switches the GPU for each job it
   submits.
@@ -259,7 +260,7 @@ The cost is two extra handovers (~30 s each).
 This happens when jobs are submitted one at a time with gaps between them,
 which is exactly what `comfy-render` avoids by queuing a whole batch up front.
 For a batch that must not be split even by unrelated traffic, such as another
-conversation or a cron run, `gpu-workload hold comfy -- CMD` keeps the lock
+conversation or a cron run, `vhotseat hold comfy -- CMD` keeps the lock
 marked `hold comfy`, and the hook refuses every Strata load until CMD exits.
 
 ### 3.5 Something outside the system uses the GPU
@@ -268,7 +269,7 @@ The guard covers every ComfyUI job, including ones queued from ComfyUI's own
 web page. Strata's hook covers every Strata load.
 
 Anything else that grabs VRAM isn't covered: another CUDA program, or a
-ComfyUI custom node that loads models outside a job. `gpu-workload status`
+ComfyUI custom node that loads models outside a job. `vhotseat status`
 shows that VRAM as `other`. Strata's `min_free_vram_mib: 14000` is the last
 line of defence: Strata won't load into a GPU that lacks room. A job whose
 model doesn't fit fails with ComfyUI's own out-of-memory error.
@@ -305,11 +306,11 @@ Two choices avoid it:
 
 ### 4.2 `hold` inside `hold`, `switch` inside `hold`
 
-A render script run under `hold comfy` might call `gpu-workload switch comfy`
+A render script run under `hold comfy` might call `vhotseat switch comfy`
 or another `hold`. Taking `switch.lock` again from inside would wait forever
 on the outer hold.
 
-`hold` sets `GPU_WORKLOAD_HOLD=comfy` in COMMAND's environment:
+`hold` sets `VHOTSEAT_HOLD=comfy` in COMMAND's environment:
 
 | Called inside a hold | Behaviour |
 | --- | --- |
@@ -416,7 +417,7 @@ number and size of handovers.
 | **One contact sheet per round** | pi skill | one image for Strata's (CPU-side) vision to read, not N |
 | **Non-GPU work outside the batch:** layout, captions, file moves | pi skill | doesn't put a Strata turn between two ComfyUI jobs |
 | **Short tool output:** one summary line, throttled progress | `comfy-render`, pi skill | less text to re-read after each reload |
-| **`hold comfy` for batches that must not be split** | `gpu-workload hold` | stops unrelated traffic (another chat, a cron run) from forcing two extra handovers mid-batch |
+| **`hold comfy` for batches that must not be split** | `vhotseat hold` | stops unrelated traffic (another chat, a cron run) from forcing two extra handovers mid-batch |
 | **Lazy Strata, no idle unload** | Strata config | Strata unloads only when ComfyUI actually needs the GPU, never on a timer |
 | **Free ComfyUI only when Strata needs it** | hook | ComfyUI keeps its model between jobs, so back-to-back renders skip the reload |
 
@@ -438,7 +439,7 @@ number and size of handovers.
 
 ## 6. Observing it
 
-- `gpu-workload status` shows the current mode, what each side holds, and the
+- `vhotseat status` shows the current mode, what each side holds, and the
   last event.
 - `~/.local/state/vhotseat/events.jsonl` keeps the last 500 decisions:
   every `switch`, every `hold` / `hold-end`, and every hook decision with its
