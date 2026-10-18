@@ -30,11 +30,11 @@ def state_dir(env=os.environ) -> Path:
 
 # --- validation ----------------------------------------------------------------
 
-GATE_KINDS = ("hook", "plugin", "hold")
+GATE_KINDS = ("hook", "plugin", "proxy", "hold")
 SERVICE_KINDS = ("systemd-user", "systemd")
 COMMON = {"driver", "label", "url", "service", "vram", "idle_vram_mib", "gate", "admission",
           "allow_restart", "restart_timeout_s"}
-GATE_KEYS = {"kind", "timeout", "config", "custom_nodes"}
+GATE_KEYS = {"kind", "timeout", "config", "custom_nodes", "status"}
 DRIVER_KEYS = {
     "http": {"resident", "busy", "release", "confirm", "load", "model"},
     "comfyui": {"restart_above_ram_mib", "history_settle_s"},
@@ -149,6 +149,9 @@ def validate(raw) -> dict:
         _int(gate, "timeout", f"{where}.gate", 1)
         unknown = set(gate) - GATE_KEYS
         _check(not unknown, f"{where}.gate", f"unknown key(s): {', '.join(sorted(unknown))}")
+        if "status" in gate:
+            _check(isinstance(gate["status"], str) and gate["status"].startswith(("http://", "https://")),
+                   f"{where}.gate.status", "expected the proxy's http://…/_vhotseat/status URL")
         if driver == "http":
             _request(w.get("resident"), f"{where}.resident", needs_path=True)
             if "busy" in w:

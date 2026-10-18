@@ -70,30 +70,47 @@ Per request:
 2. **Draining** (see 4 below) is on: wait until it's off, up to your hold time
    (120 s is a good default), then answer **503** with `Retry-After: 30` and an
    error body in the server's own format (`{"error": "GPU busy: …"}` for Ollama).
-3. **Fast path:** `if seat.owns(NAME)`: forward. This is a small file read: no
-   lock, no `nvidia-smi`, no HTTP. It stays true until anything else takes the
-   GPU.
-4. **Slow path:** `seat.acquire(NAME, wait=HOLD)`. It releases the other
-   workloads (never interrupting their work; it waits up to `wait` for them) and
-   returns. On `api.Busy` or `api.SwitchError`: answer 503 + `Retry-After` with
-   the exception's message. Otherwise forward.
+3. **Fast path:** `if seat.owns(NAME)`: forward. While nothing has changed hands
+   since it last checked, this is a small file read: no lock, no `nvidia-smi`,
+   no HTTP. **On a cache miss it probes every workload, including this one, so it
+   calls your own `/_vhotseat/status`**: never call `owns()` (or `acquire()`)
+   while holding a lock your status handler needs, and run the HTTP server
+   threaded, or a cold request waits on itself.
+4. **Slow path:** `seat.acquire(NAME, wait=HOLD)`. It waits (without holding
+   vhotseat's lock) for the other workloads' running work to finish, up to
+   `wait`, then releases them; their work is never interrupted. On `api.Busy` or
+   `api.SwitchError`: answer 503 + `Retry-After` with the exception's message.
+   Otherwise forward. It doesn't load your server's model: the request you're
+   about to forward does that (or, if your server needs an explicit load, do it
+   here, after `acquire` returns).
 5. **Count it in flight** from just before you forward until the **last byte** of
    the response has gone to the client (for a stream, until the upstream body
    closes). Use a lock-protected counter.
 6. **Stream** the response through as it arrives: don't buffer it, or streaming
    clients see nothing until the end. Request bodies are small: read them whole
    (you need the path anyway, sometimes the `model` field).
+7. **With Python's `http.server`:** use `ThreadingHTTPServer`, and set
+   `disable_nagle_algorithm = True` on the handler. Without it, keep-alive
+   clients wait ~40 ms per request (Nagle against delayed ACK), and step 6.4's
+   < 1 ms fails.
 
 Two endpoints of its own, which vhotseat calls (step 4):
 
-- `GET /_vhotseat/status` → `{"in_flight": N, "draining": bool}`.
+- `GET /_vhotseat/status` → `{"in_flight": N, "draining": bool}`, plus
+  `"loaded": bool` if your server's own status endpoint can't say it simply (the
+  config's `resident:` can then read it from here). Count requests clients send
+  straight to the server's internal port too, if the server can tell you (e.g.
+  busy slots): they bypass the gate, but must still not be cut off.
 - `POST /_vhotseat/drain?wait=S` → set draining (new "loads" requests wait),
-  wait until `in_flight == 0` (up to S seconds), and answer 200 `{"in_flight": 0}`.
-  If requests are still running after S: clear draining and answer **409**
-  `{"status": "busy"}`: vhotseat then reports the workload busy instead of
-  unloading under a running answer. Clear draining again when the model has been
-  unloaded and the next request comes (or after a short timeout): a drained proxy
-  that never reopens is a stuck proxy.
+  wait until `in_flight == 0` (up to S seconds), unload (if you do it here; see
+  step 4), and answer 200. If requests are still running after S: answer **409**
+  `{"status": "busy"}`, so vhotseat reports the workload busy instead of
+  unloading under a running answer. **Either way, clear draining before you
+  answer**: requests that waited then go back through `acquire()`, which waits
+  for whoever now holds the GPU. A drain that never clears is a stuck proxy.
+- If `vhotseat switch NAME` should leave the model loaded (warm), a
+  `POST /_vhotseat/load` that loads it, for the config's `load:` (the `http`
+  driver can only send an empty body).
 
 **Check:** with the proxy running in a terminal, a chat request through the old
 port works, streams token by token (watch with `curl -N`), and
@@ -113,11 +130,20 @@ workloads:
     release:
       pre: {post: "http://127.0.0.1:11434/_vhotseat/drain?wait={wait}"}
       post: /api/generate                # see the note below
+      always: true                       # see below
+      timeout: 90                        # seconds the release request may take, on top of {wait}
       ok_when: [{status: 200}]
     confirm: {vram_at_most: 0, timeout: 30}
-    gate: {kind: hold}                   # the proxy is outside vhotseat; doctor can't check it
+    gate:
+      kind: proxy                        # doctor checks the proxy answers here
+      status: http://127.0.0.1:11434/_vhotseat/status
     allow_restart: true                  # if an unload doesn't free the VRAM
 ```
+
+**`release.always: true`** is needed for a proxied workload. Without it, when
+nothing looks loaded vhotseat skips releasing it, and a request the proxy has
+just let through (its model still loading, nothing on the GPU yet) isn't
+drained.
 
 Release needs a body with the model name (`{"model": M, "keep_alive": 0}`),
 which the `http` driver can't send yet. Two ways:
@@ -176,6 +202,26 @@ Every item must pass; each one is a real failure seen in this kind of setup.
    driving ComfyUI: LLM → render → LLM → render → LLM) completes.
 
 ## 7. Known traps
+
+- **The server's own unload may cut a running answer off.** llama-server's
+  `/models/unload` does (tested 2026-10-17). Always drain first.
+- **llama-server in router mode** (`--models-dir`), the way to run it under
+  vhotseat since it can unload without exiting:
+  - start it with `--no-models-autoload`, or any request naming a model loads
+    it, and so does any GET with `?autoload=true`: then force `autoload=false` on
+    everything the proxy doesn't gate, and add `?autoload=true` to the requests
+    it does, after `acquire()`;
+  - `/models/load` and `/models/unload` answer 400 when there's nothing to do
+    ("already running", "not running"): treat those as success;
+  - `/models` says `loading` before any VRAM shows: `release.always` covers it;
+  - clients written for a single-model server send no `model` field, which the
+    router rejects (400 "model name is missing"): fill in the default model;
+  - `/slots` and `/metrics` need `?model=`.
+- **A trial config only half applies.** The ComfyUI guard and Strata's hook
+  read the live config (`~/.config/vhotseat/config.yaml`); a new workload in
+  another file is invisible to them, so a ComfyUI job can load on top of it.
+  Test from your copy, but the new workload is only guarded once it's in the
+  live config.
 
 - **A client still on the internal port** bypasses the gate entirely. After
   step 2, look for anything configured with the old port number (`grep` the

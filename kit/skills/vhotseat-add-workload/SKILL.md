@@ -62,12 +62,17 @@ Take the first row that applies. **Check:** you can say why the rows above it do
 
 ## 3. Write the config
 
-Add the workload to `~/.config/vhotseat/config.yaml`, copying the shape of the
+Add the workload to `~/.config/vhotseat/config.yaml` (to try it first, a copy
+with `VHOTSEAT_CONFIG=…`; but the ComfyUI guard and other hooks only see the
+live file, so the workload is only guarded once it's there), copying the shape of the
 closest example in `config.example.yaml`:
 
 - An HTTP API that answers questions 1–4: `driver: http`, with `resident:`,
-  `release:` (and `busy:`, `load:`, `model:` if it has them). Strata is the
-  model to copy.
+  `release:` (and `busy:`, `load:`, `model:` if it has them). Strata (in
+  `config.example.yaml`) is the shape to copy for a server with a hook; for a
+  proxied one, the guide's Ollama block. If it can tell you it's working
+  (a queue, busy slots, an in-flight count), give it `busy:`: that's what lets
+  vhotseat wait for the work instead of refusing.
 - Too much logic for config (several requests, a body with data from another
   response): a Python driver, a subclass of `vhotseat.drivers.base.Workload`
   like `vhotseat.drivers.comfyui.ComfyUI`, and ask the user before adding code.

@@ -22,6 +22,8 @@ workloads:
       always: true                # ask even when it looks unloaded: a load may be under way
       busy_when: [{status: 409}, {path: status, in: [busy]}]
       ok_when: [{status: 200, path: status, in: [unloaded, not loaded]}]
+      # timeout: 30      # seconds the request may take on top of {wait} (default 30)
+      # pre: {post: …}   # a request first, e.g. a proxy's drain (docs/guides/proxy-gate.md)
     confirm: {vram_at_most: 0}    # released once its VRAM is down to this
     load: {post: /load, timeout: 300}   # `switch strata` leaves it loaded
     model: {get: /health, path: model}  # which model it serves (set by strata-model);

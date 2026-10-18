@@ -6,13 +6,16 @@ costs one small file read on the fast path.
     from vhotseat import api
 
     seat = api.open()                    # the config at ~/.config/vhotseat/config.yaml
-    if not seat.owns("llama"):           # cheap: no lock, no HTTP, no nvidia-smi
-        seat.acquire("llama", wait=120)  # the slow path: make room, under the lock
+    if not seat.owns("llama"):           # cheap while nothing changed hands (see below)
+        seat.acquire("llama", wait=120)  # the slow path: make room
     ... forward the request ...
 
 `owns()` trusts its last answer while the handover count (the generation) is
-unchanged. Every switch, hold and gate that makes room bumps it, so a cached
-"llama owns the GPU" is dropped the moment anything else takes it.
+unchanged: a small file read, no lock, no HTTP. Every switch, hold and gate that
+makes room bumps it, so a cached "llama owns the GPU" is dropped the moment
+anything else takes it. On a cache miss it probes every workload, including the
+one the caller is a proxy for, so it calls that proxy's own status endpoint:
+don't call it while holding a lock that endpoint needs.
 
 All waits and refusals follow the same rules as the CLI: running work is never
 interrupted, and acquire() raises Busy (or SwitchError) instead.

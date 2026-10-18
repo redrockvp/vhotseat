@@ -61,6 +61,20 @@ def _gate_plugin(w, gate: dict) -> list:
     return [(OK, f"{w.name}: gate", f"guard node installed ({guard.resolve()})")]
 
 
+def _gate_proxy(w, gate: dict) -> list:
+    """A proxy gate (docs/guides/proxy-gate.md): it runs, and answers /_vhotseat/status.
+    A proxy that's down doesn't guard anything; clients just can't reach the server."""
+    url = gate.get("status")
+    if not url:
+        return [(WARN, f"{w.name}: gate", "no gate.status set, so the proxy can't be checked")]
+    code, body = util.http("GET", url)
+    if code is None:
+        return [(FAIL, f"{w.name}: gate", f"proxy not answering at {url}: {body}")]
+    if code != 200 or not isinstance(body, dict) or "in_flight" not in body:
+        return [(FAIL, f"{w.name}: gate", f"{url} answered {code} {body!r:.120}, not a proxy's status")]
+    return [(OK, f"{w.name}: gate", f"proxy answers at {url} (in flight: {body['in_flight']})")]
+
+
 def _version_tuple(v: str) -> tuple:
     return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
 
@@ -137,6 +151,8 @@ def checks(arbiter, cfg: dict | None) -> list:
             out += _gate_hook(w, w.gate)
         elif kind == "plugin":
             out += _gate_plugin(w, w.gate)
+        elif kind == "proxy":
+            out += _gate_proxy(w, w.gate)
         else:
             out.append((OK, f"{w.name}: gate", "hold: guarded only while run under `vhotseat hold`"))
         per = w.admission.get("by_model") or {}

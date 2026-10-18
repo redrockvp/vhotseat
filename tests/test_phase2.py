@@ -133,3 +133,16 @@ def test_doctor_warns_about_unattributed_vram(rig):
     assert found and found[0][0] == "warn" and "2956 MiB" in found[0][1]
     rig.gpu.other = 300
     assert not [c for _, c, _ in doctor.checks(rig.arb, rig.cfg) if c == "gpu: other"]
+
+
+def test_proxy_gate_kind(rig):
+    """gate: {kind: proxy, status: URL}: validated, and doctor checks the proxy answers."""
+    import pytest
+    raw = config.parse((ROOT / "config.example.yaml").read_text())
+    raw["workloads"]["strata"]["gate"] = {"kind": "proxy", "status": "localhost:8080"}
+    with pytest.raises(config.ConfigError, match="gate.status"):
+        config.validate(raw)
+    w = rig.arb.workloads["strata"]
+    w.gate = {"kind": "proxy", "status": "http://127.0.0.1:9/_vhotseat/status"}
+    found = [(s, d) for s, c, d in doctor.checks(rig.arb, rig.cfg) if c == "strata: gate"]
+    assert found and found[0][0] == "fail" and "not answering" in found[0][1]

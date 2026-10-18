@@ -112,7 +112,7 @@ def test_switch_comfy_waits_for_strata_answer(rig):
 def test_switch_strata_refused_while_comfy_has_jobs(rig):
     rig.comfy.queue_job({"1": {"class_type": "Slow", "inputs": {}}})
     assert rig.cli("switch", "strata") == 1
-    assert "jobs running or queued" in last(rig, "switch")["error"]
+    assert "job(s) running or queued" in last(rig, "switch")["error"]
     assert not rig.strata.loaded
 
 
@@ -398,3 +398,19 @@ def test_guard_reports_why_gpu_is_busy(rig, monkeypatch):
     with pytest.raises(guard.GpuBusy, match="Strata is answering or loading"):
         guard.take_gpu()
     t.join()
+
+
+def test_switch_with_wait_lets_a_comfy_batch_finish(rig):
+    """`switch strata --wait` while ComfyUI has a batch queued, each job running
+    the guard (`switch comfy`). It used to hold the lock while waiting for the
+    queue, so every guard blocked on it: the batch stalled for the whole wait and
+    the switch then failed. Found by the llama-server trial, 2026-10-17."""
+    rig.comfy.slow_s = 0.3
+    rig.comfy.guard = lambda pid: (lambda r: None if r["ok"] else r["error"])(rig.arb.switch("comfy", 30))
+    pids = [rig.comfy.queue_job({"1": {"class_type": "Slow", "inputs": {}}}) for _ in range(4)]
+    time.sleep(0.05)
+    t0 = time.monotonic()
+    res = rig.arb.switch("strata", 20)
+    assert res["ok"] and time.monotonic() - t0 < 5
+    assert all(rig.comfy.history[p]["status"]["status_str"] == "success" for p in pids)
+    assert rig.strata.loaded
