@@ -33,7 +33,7 @@ def test_status_modes(rig, capsys):
 
 
 def test_status_json_shape_is_unchanged(rig, capsys):
-    """A dashboard reads these keys (monitor.ts)."""
+    """A dashboard reads these keys: they are the --json contract."""
     assert rig.cli("status", "--json") == 0
     s = json.loads(capsys.readouterr().out)
     assert set(s) == {"mode", "strata", "comfy", "gpu", "ram", "last_event"}

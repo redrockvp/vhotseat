@@ -89,7 +89,7 @@ def test_state_moves_from_gpu_workload(tmp_path):
 
 def test_lock_keeps_gpu_workloads_name(vh):
     """~/.local/state/gpu-workload/switch.lock, through the symlink: a rollback to
-    gpu-workload (docs/revert-gpu-workload.md) shares the lock."""
+    gpu-workload shares the lock."""
     assert vh.arb.lock.path.name == "switch.lock"
 
 

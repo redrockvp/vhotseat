@@ -1,0 +1,28 @@
+# Ollama (https://ollama.com) has no pre-load hook and no plugin system, so its
+# gate is a small proxy in front of it: clients keep using :11434, the proxy
+# asks vhotseat for the GPU before forwarding, and Ollama itself moves to
+# :11435. Build the proxy with docs/guides/proxy-gate.md; this is its config.
+#
+# The proxy's /_vhotseat/drain unloads Ollama's models itself (keep_alive: 0
+# for each model in /api/ps), because that request needs the model name in its
+# body; release.post is then a cheap request that always answers 200.
+
+workloads:
+  ollama:
+    driver: http
+    label: Ollama
+    url: http://127.0.0.1:11435
+    service: {systemd: ollama}
+    resident: {get: /api/ps, path: models.0.name}
+    busy: {get: http://127.0.0.1:11434/_vhotseat/status, path: in_flight}
+    release:
+      pre: {post: "http://127.0.0.1:11434/_vhotseat/drain?wait={wait}"}
+      post: /api/version
+      always: true
+      timeout: 90
+      ok_when: [{status: 200}]
+    confirm: {vram_at_most: 0, timeout: 30}
+    gate:
+      kind: proxy
+      status: http://127.0.0.1:11434/_vhotseat/status
+    allow_restart: true

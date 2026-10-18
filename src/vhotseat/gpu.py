@@ -31,7 +31,7 @@ def attribute(total: int, free: int, procs: list[tuple[int, int | None, str]],
               selectors: dict[str, tuple[str, str] | None], procinfo=read_proc) -> dict:
     """Snapshot keyed "<workload>_mib", plus total_mib, free_mib, other_mib.
 
-    selectors: workload -> ("unit", "comfyui.service") or ("process", "/ComfyUI/").
+    selectors: workload -> ("unit", "comfyui.service") or ("process", "ComfyUI/main.py").
     procs: (pid, MiB or None if the driver can't say, name nvidia-smi reports)."""
     out = {"total_mib": total, "free_mib": free, **{f"{n}_mib": 0 for n in selectors}, "other_mib": 0}
     for pid, mib, name in procs:

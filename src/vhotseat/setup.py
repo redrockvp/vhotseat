@@ -15,8 +15,9 @@ from .lock import GpuLock
 
 
 def migrate_state(new: Path, env=os.environ) -> None:
-    """gpu-workload kept its lock and log in ~/.local/state/gpu-workload. Move the
-    log here and leave a symlink, so old paths in docs and notes still work."""
+    """gpu-workload, vhotseat's predecessor, kept its lock and log in
+    ~/.local/state/gpu-workload. Move them here and leave a symlink, so old paths
+    still work."""
     old = new.parent / "gpu-workload"
     if new.exists() or not old.is_dir() or old.is_symlink():
         return
@@ -35,8 +36,8 @@ def build(cfg: dict, *, env=os.environ, gpu=None, machine_ram=None, **arbiter_ar
     workloads = cfgmod.workloads(cfg, ctx)
     arbiter = Arbiter(
         workloads, gpu or open_backend(g.get("backend", "auto"), index),
-        # GPU 0 keeps gpu-workload's lock name, so rolling back to gpu-workload
-        # (docs/revert-gpu-workload.md) shares the lock with anything still on vhotseat.
+        # GPU 0 keeps gpu-workload's lock name, so a rollback to gpu-workload
+        # shares the lock with anything still on vhotseat.
         GpuLock(state / ("switch.lock" if index == 0 else f"gpu{index}.lock")),
         EventLog(state / "events.jsonl", keep=(cfg.get("events") or {}).get("keep", 500)),
         machine_ram=machine_ram or host.machine_ram, **arbiter_args,

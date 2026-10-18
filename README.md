@@ -1,147 +1,217 @@
-# gpu-workload (vhotseat)
+# vhotseat
 
-Hands the single 16 GB GPU between **Strata** (local LLM, `strata.service`,
-`:2335`) and **ComfyUI** (`comfyui.service`, `:8188`). They can't both hold VRAM.
-The tool that does it is **`vhotseat`**, the generic version planned in
-[docs/plans/2026-10-14-vhotseat.md](docs/plans/2026-10-14-vhotseat.md). Until
-2026-10-17 it was a script called `gpu-workload`; to go back to it, see
-[docs/revert-gpu-workload.md](docs/revert-gpu-workload.md).
+**Take turns on one GPU.** Your local LLM agent drives ComfyUI on the same
+card: when it queues a render, the LLM is unloaded; when it asks the LLM its
+next question, ComfyUI is freed. Neither ever loads on top of the other, and
+**running work is never interrupted**: not an answer the LLM is writing, not a
+render in progress.
 
-**New here?** Read [docs/how-it-works.md](docs/how-it-works.md) first. It
-walks through a full the chat bot → pi → ComfyUI → pi flow as a sequence
-diagram, then covers the race conditions and deadlocks, and how often the GPU
-changes hands. This README is the reference.
+> v-hotseat: VRAM hotseat. Hot-seat multiplayer: one device, players take
+> turns, nobody is kicked out mid-turn.
+
+The servers stay as they are, and every client is covered: the agent, its
+scripts, a web UI, curl. Nobody calls vhotseat; each workload asks for the GPU
+through a **gate** right before it loads (a pre-load hook, a ComfyUI custom
+node, a proxy), and vhotseat makes room by releasing the others.
+
+**How it differs.** [llama-swap](https://github.com/mostlygeek/llama-swap) and
+Ollama's scheduler swap models between LLM servers they control; they don't
+take turns with a non-LLM app like ComfyUI, and don't wait for a running job.
+vhotseat arbitrates between *different* servers, of any kind, and can sit on
+top of either (they can be one of its workloads).
+
+Status: Linux, NVIDIA. Windows is designed for and planned. MIT licence.
+
+- [How it works](docs/how-it-works.md): a full agent → ComfyUI → agent flow,
+  the races and deadlocks, and how often the GPU changes hands.
+- [Agent kit](kit/README.md): `comfy-render` and skills for the agent that
+  renders, and for the coding agent that sets this up.
+- [Adding another server](docs/guides/driver-authoring.md), and
+  [building a proxy gate](docs/guides/proxy-gate.md) for one with no hook.
+
+## Install
+
+```sh
+uv tool install vhotseat      # or: pipx install vhotseat
+```
+
+That installs two commands, `vhotseat` and `comfy-render`, with one dependency
+(PyYAML). From a checkout, `./vhotseat` and `./comfy-render` run as they are;
+symlink them into `~/.local/bin`.
+
+## Quickstart: an LLM server and ComfyUI
+
+This uses [Strata](https://github.com/Niko1221/Strata) as the LLM, since it has
+a pre-load hook; [examples/](examples/) has configs for others.
+
+**1. Config.** Copy [config.example.yaml](config.example.yaml) to
+`~/.config/vhotseat/config.yaml` (or point `$VHOTSEAT_CONFIG` at it). It's
+commented key by key. Set each workload's `url`, its systemd unit under
+`service:`, and the paths under `gate:`.
+
+**2. The LLM's gate.** In Strata's config:
+
+```json
+"lazy_load": true,
+"before_load": ["vhotseat", "gate", "strata"],
+"before_load_strict": true,
+"before_load_timeout_s": 90
+```
+
+`lazy_load` keeps it from holding VRAM until a request arrives. Strict means a
+refused gate becomes a 503 rather than a load. Restart Strata.
+
+**3. ComfyUI's gate**, the guard custom node:
+
+```sh
+comfy node install vhotseat-guard
+# or from a checkout:
+ln -s "$PWD/integrations/comfyui/vhotseat_guard" ~/ComfyUI/custom_nodes/
+```
+
+Restart ComfyUI. Its log should say the guard is on.
+
+**4. Check.**
+
+```sh
+vhotseat doctor                     # config, GPU, services, APIs, every gate installed
+vhotseat doctor --exercise strata   # a real take / load / release cycle, timed
+vhotseat doctor --exercise comfy
+vhotseat status
+```
+
+`--exercise` unloads things; run it with the GPU idle.
+
+**5. Point the agent at comfy-render.** Install the
+[comfyui-batching skill](kit/skills/comfyui-batching/SKILL.md) for the agent
+that runs on the LLM, so it renders in batches through `comfy-render` instead
+of hand-written polling scripts. Give the agent's harness a retry window of a
+few minutes for 503s with `Retry-After`: a request that arrives while the last
+jobs of a batch finish is refused until they're done.
+
+Or let a coding agent do all of the above: the
+[vhotseat-setup skill](kit/skills/vhotseat-setup/SKILL.md) walks it through
+finding your GPU workloads, writing the config and installing the gates.
+
+## Commands
 
 ```
-vhotseat status [--json]                   # mode: strata | comfy | none | conflict
-vhotseat switch strata|comfy|none [--wait SECONDS] [--json]
-vhotseat hold NAME [--wait SECONDS] -- COMMAND...
-vhotseat gate NAME                         # Strata's before_load runs `vhotseat gate strata`
-vhotseat doctor [--json]                   # config, GPU, services, APIs, gates installed
+vhotseat status [--json]                        who owns the GPU, what each workload holds, last event
+vhotseat switch NAME|none [--wait S] [--json]   give the GPU to NAME, or free it; idempotent
+vhotseat hold NAME [--wait S] -- COMMAND...     give it to NAME and keep it until COMMAND exits
+vhotseat gate NAME                              for hook gates: may NAME load? (run by the server)
+vhotseat doctor [--json]                        check the config, the GPU, every workload and gate
+vhotseat doctor --exercise NAME [--wait S]      run a real cycle on NAME, timed
 ```
 
-Exit codes: `0` ok · `1` switch failed or gate refused · `2` usage or bad config.
-`hold` exits with COMMAND's own exit code.
+Exit codes: `0` ok · `1` switch failed or gate refused · `2` usage or bad
+config. `hold` exits with COMMAND's own exit code once COMMAND has started.
 
-**Code:** the `vhotseat` package in [src/vhotseat/](src/vhotseat/), run by the
-[vhotseat](vhotseat) script (installed as a symlink: `~/.local/bin/vhotseat`).
-Tests: `uv run --with pytest pytest` in this directory (fake Strata and ComfyUI
-servers; no GPU needed).
+**Modes.** `status` reports the owner, derived live from each workload's API
+and the GPU's per-process memory; there is no state file to drift. The mode is
+a workload's name, `none` (the GPU is free) or `conflict` (two hold memory at
+once; a `switch` either way resolves it).
 
-## Config
+**`switch NAME`** releases every other workload, then loads NAME if it can be
+loaded ahead of a request. A workload that's working makes it fail at once,
+unless `--wait S` lets that work finish first. A stopped service is started.
+`switch none` frees the GPU without picking an owner.
 
-**`~/.config/vhotseat/config.yaml`** (or `$VHOTSEAT_CONFIG`). The one in use
-here is a copy of [config.example.yaml](config.example.yaml), commented key by
-key: the two workloads, how to talk to each, their gates, Strata's admission.
+**`hold NAME -- COMMAND`** switches, then keeps the GPU for NAME until COMMAND
+exits: every other workload's gate refuses meanwhile. Inside it, `switch NAME`
+and a nested `hold` are no-ops (`VHOTSEAT_HOLD` is set in COMMAND's
+environment), and SIGINT, SIGTERM and SIGHUP are passed on to COMMAND. Use it
+for a batch that must not be split, or as the gate for a program with no
+server.
 
-`switch none` frees the GPU without picking an owner. `doctor` is read-only;
-run it after changing a server's config, updating ComfyUI, or moving things.
-A broken config makes every gate refuse (Strata answers 503) rather than
-letting a load through unchecked.
+**Config** is `~/.config/vhotseat/config.yaml`, or `$VHOTSEAT_CONFIG`. It's
+validated on load and every error names the key. A broken config makes every
+gate refuse rather than letting a load through unchecked.
 
-**GPU memory** is read through NVML (no nvidia-smi process per check), and
-each process is attributed to a workload by the systemd unit it runs in.
-ComfyUI's own `/system_stats` can't be used: it reports 64 MiB with SDXL's
-7 GB loaded.
+**State** is in `~/.local/state/vhotseat/` (`$XDG_STATE_HOME`): the lock
+(`switch.lock`, one per GPU) and the event log (`events.jsonl`, the last 500
+decisions: every switch, hold and gate, with its reason).
 
-**State** is in `~/.local/state/vhotseat/` (`events.jsonl`, `switch.lock`);
-`~/.local/state/gpu-workload` is a symlink to it.
+## Gates: how a workload asks for the GPU
 
-## Modes
-
-The mode is **derived live** from Strata `/health`, ComfyUI `/queue` and
-`nvidia-smi`. There is no state file, so it can't drift.
-
-| Mode | Meaning |
-| --- | --- |
-| `strata` | Strata's model is loaded; ComfyUI holds no models and has no jobs |
-| `comfy` | Strata's model is unloaded (ComfyUI may or may not hold models) |
-| `conflict` | both at once; `switch` either way resolves it |
-
-## Switching
-
-Both directions are idempotent: switching to the current mode only re-checks it.
-
-| Command | What it does |
-| --- | --- |
-| `switch strata` | Waits for ComfyUI's queue to drain (fails at once unless `--wait N`), `POST /free`, waits until ComfyUI's VRAM drops below 1500 MiB, [restarts ComfyUI if it still holds a lot of RAM](#comfyui-restart-ram-not-just-vram), then `POST /load` on Strata, which blocks until the model is up |
-| `switch comfy` | `POST /unload` on Strata (`?wait=N` with `--wait`, to let a running answer finish), waits until its engine leaves the GPU |
-
-- If a service is stopped, `switch` starts it (`systemctl --user start`).
-- Concurrent switches are serialized with a lock in
-  `~/.local/state/vhotseat/`.
-- `--wait` matters because ComfyUI's `/free` only acts *between* jobs, and
-  Strata's `/unload` refuses while it's answering.
-
-Measured 2026-10-12 (RTX 5070 Ti, Strata IQ2_XS):
-
-| Switch | Time |
-| --- | --- |
-| to strata, cold (experts read from disk) | 68 s |
-| to strata, warm (OS page cache) | 26 s |
-| to comfy | ~1 s |
-
-`switch comfy` always asks Strata to unload when its service is running, even
-if it looks unloaded. A load in progress hasn't reached the GPU yet, and
-Strata's `/unload` waits behind it, so the switch can't report `comfy` while
-Strata is still coming up.
-
-## Each side takes the GPU for itself
-
-| Wants the GPU | Who makes room | How |
+| Gate | For | How |
 | --- | --- | --- |
-| Strata (any caller: pi, the chat bot, curl) | Strata's `before_load` hook | frees an idle ComfyUI; refuses while a job is queued or running |
-| ComfyUI (any caller: a script, its web page) | the ComfyUI guard node | before each job, `switch comfy --wait 300`: lets an answer Strata is writing finish, then unloads it |
+| `hook` | a server that runs a command before it loads (Strata's `before_load`) | runs `vhotseat gate NAME`; exit 0 = load, 1 = refuse |
+| `plugin` | a server with a plugin system that runs before each job (ComfyUI) | the plugin runs `vhotseat switch NAME --wait N`; the job fails visibly if that fails |
+| `proxy` | a server reached only over HTTP, with no hook (Ollama, llama-server) | a small proxy in front of it asks before forwarding; [build one with the guide](docs/guides/proxy-gate.md) |
+| `hold` | a program that isn't a server (a training run, a script) | always run it as `vhotseat hold NAME -- CMD` |
 
-Callers need no GPU logic: pi, scripts and the ComfyUI web page just use
-their server. A Strata request between two ComfyUI jobs works, but costs
-about 30 s per handover (Strata reload, then ComfyUI reloads its model).
+A gate runs **inside** its workload's own load, so it never waits on the lock:
+a `switch` holding it may be waiting on this very load. It allows a load that a
+`switch` or `hold` for this workload asked for; refuses while any other one is
+in progress; and otherwise releases the other workloads itself and allows. If
+another workload is working (ComfyUI has a job queued, say), or its state can't
+be read, the gate refuses: a render is never interrupted.
 
-## ComfyUI guard node
+## Admission
 
-`comfyui/vhotseat_guard` is installed as a symlink:
-`~/ComfyUI/custom_nodes/vhotseat_guard`. ComfyUI must be restarted
-after installing or changing it.
+Releasing the others always happens. Admission decides whether that's enough
+for the incoming workload to load safely:
 
-- **How it hooks in:** it wraps `execution.PromptExecutor.execute_async`, which
-  ComfyUI's prompt worker thread calls once per job, and runs
-  `vhotseat switch comfy --wait $VHOTSEAT_GUARD_WAIT_S` (default 300)
-  first. The worker thread may block, so the web server stays responsive.
-- **On failure:** the job is **not run** and fails visibly, with an
-  `execution_error` "GPU busy, job not run: <reason>" in the UI and in
-  `/history`.
-- **It's a private API:** an update can break it. The guard switches itself off
-  with an error in the log if the method disappears. After every ComfyUI update,
-  follow [docs/comfyui-updates.md](docs/comfyui-updates.md).
-- **TTS Audio Suite:** IndexTTS used to keep ~2 GB after unload; our fix is
-  upstream since 5.10.4, so no local patch is needed any more. See
-  [docs/tts-audio-suite-vram.md](docs/tts-audio-suite-vram.md).
-- **Env:**
-  - `VHOTSEAT_GUARD=0` disables it;
-  - `VHOTSEAT_GUARD_WAIT_S` sets how long it waits;
-  - `VHOTSEAT_BIN` points it at the CLI.
+```yaml
+admission:
+  min_available_ram_mib: 46000   # MemAvailable: free RAM plus cache the kernel can drop
+  min_free_vram_mib: 14000       # covers VRAM vhotseat doesn't manage (the desktop, a game)
+  by_model:                      # per model, when the server says which it will load
+    big-model-iq3: {min_available_ram_mib: 46000}
+```
 
-Measured 2026-10-13:
+It matters for MoE LLMs that keep their experts in RAM. ComfyUI's `/free`
+empties its VRAM but not its RAM: after a video render an idle ComfyUI can hold
+6–15 GiB of RAM and swap, and an LLM loading on top of that can be killed by
+the OOM killer. If admission isn't met after the release, vhotseat restarts
+idle workloads that allow it (`allow_restart: true`); if it still isn't met,
+the load is refused and the event log says what was short.
 
-| Situation when a job was queued | Result |
-| --- | --- |
-| Strata loaded | job done in 10 s |
-| Strata writing a 1,500-token answer | the answer completed; job done in 9 s |
-| A Strata request between two jobs | both jobs succeeded |
-| The guard's wait cut to 2 s | job failed visibly in 2.5 s |
+A ComfyUI restart wipes its `/history`, so it only happens with an empty queue,
+and once the latest result is at least 10 s old (`history_settle_s`), so
+clients reading results have had time to.
+
+## The ComfyUI guard
+
+[integrations/comfyui/vhotseat_guard](integrations/comfyui/vhotseat_guard)
+wraps `execution.PromptExecutor.execute_async`, which ComfyUI's prompt worker
+thread calls once per job, and runs `vhotseat switch comfy --wait 300` first.
+The worker thread may block, so the web server stays responsive.
+
+- **On failure** the job is **not run** and fails visibly: an `execution_error`
+  "GPU busy, job not run: <reason>" in the UI and in `/history`.
+- **It wraps a private API,** so a ComfyUI update can break it. If the method is
+  missing, the guard logs an error and stays off rather than breaking ComfyUI.
+  After every update, follow [docs/comfyui-updates.md](docs/comfyui-updates.md).
+- **Env:** `VHOTSEAT_GUARD=0` disables it; `VHOTSEAT_GUARD_WAIT_S` sets how
+  long a job waits for the LLM to finish an answer (default 300);
+  `VHOTSEAT_BIN` points it at the CLI.
+
+A custom node that doesn't release its VRAM on `/free` makes every handover
+fail. [docs/examples/vram-leak-tts-audio-suite.md](docs/examples/vram-leak-tts-audio-suite.md)
+is a worked example of finding and fixing one; `patches:` in the config lets
+`doctor` notice when an update drops a local fix.
 
 ## comfy-render: run a batch of workflows
 
 ```
-comfy-render JOBS.json [--timeout SECONDS] [--json] [--verbose]
+comfy-render JOBS.json [--url URL] [--comfy-dir DIR] [--timeout SECONDS]
+                       [--json] [--verbose] [--hold [NAME]] [--hold-wait SECONDS]
 ```
 
 Queues every job up front, waits until **all** of them have finished, and
 prints one line per job: the files it saved, or ComfyUI's own error. It doesn't
-touch the GPU itself; the guard node does the handover. Installed as a symlink:
-`~/.local/bin/comfy-render`.
+touch the GPU; the guard does the handover. It works with ComfyUI alone.
 
-JOBS.json is API-format workflow JSON, in one of three shapes:
+**Why:** while ComfyUI's queue is non-empty, every LLM load is refused, so a
+batch costs 2 handovers instead of 2 per job. And the agent stays blocked in
+the command, so it can't ask the LLM anything mid-batch. Waiting correctly is
+the part a local model tends to get wrong when it writes its own polling
+script.
+
+JOBS.json is ComfyUI API-format workflow JSON ("Export (API)"), in one of
+three shapes:
 
 | Shape | Use |
 | --- | --- |
@@ -149,332 +219,48 @@ JOBS.json is API-format workflow JSON, in one of three shapes:
 | a list of workflows | several different jobs |
 | `{"base": workflow, "jobs": [{"5.inputs.seed": 11}, …]}` | variants: each overrides `NODE.inputs.NAME` in a copy of `base` |
 
-A UI-format export (`nodes` / `links`) is refused with a hint to use
-"Export (API)".
-
-What it reports:
+A UI-format export (`nodes` / `links`) is refused with a hint.
 
 | Outcome | Example line |
 | --- | --- |
-| saved files | `job 2/4 ok: /…/output/a.png` (files from any `Save*`/`Preview*` node, whatever its output key) |
-| rejected at submit (HTTP 400) | `job 3/4 rejected: node 7 PreviewImage: Return type mismatch …` |
-| failed while running | `job 1/4 failed: node 1 LoadImage: [Errno 2] No such file …` (`--verbose` adds the ComfyUI frames of the traceback) |
+| saved files | `job 2/4 ok: /…/output/a.png` |
+| rejected at submit | `job 3/4 rejected: node 7 PreviewImage: Return type mismatch …` |
+| failed while running | `job 1/4 failed: node 1 LoadImage: [Errno 2] No such file …` (`--verbose` adds the traceback's ComfyUI frames) |
 | finished, no files | `job 1/1 failed: finished but saved no files (no Save* output node?)` |
-| cancelled while running | `job 2/4 cancelled: cancelled by the user (dashboard or ComfyUI) while running node 5 KSampler` |
-| cancelled while queued | `job 3/4 cancelled: cancelled by the user (…) before it started` |
+| cancelled | `job 2/4 cancelled: cancelled by the user (ComfyUI or another client) while running node 5 KSampler` |
 
-A bad job never stops the others. ComfyUI validates each output backwards and
-stops at the first broken link, so a second problem in the same job only shows
-up once the first is fixed.
+A bad job never stops the others. While jobs run, it prints live progress from
+ComfyUI's websocket (`job 1/1 running: node 5 KSampler step 57/150 (38%)`), at
+most every 10 s per job and at least once a minute, so a caller's idle
+watchdog doesn't kill a long render.
 
 Exit codes: `0` every job saved files · `1` some job was rejected or failed ·
-`2` bad input file or ComfyUI unreachable · `3` no progress for `--timeout` s (default 1800) ·
-`4` the user cancelled some job (wins over `1` and `3`).
+`2` bad input file or ComfyUI unreachable · `3` no progress for `--timeout`
+seconds (default 1800; the batch as a whole may take hours) · `4` the user
+cancelled some job (wins over `1` and `3`: ask them why before re-running). On
+a timeout the unfinished jobs are left in ComfyUI's queue.
 
-**Cancelled jobs.** Nothing on this machine stops a job except a person (the
-dashboard's Cancel button, ComfyUI's own page, or `comfy jobs
-cancel`); the guard node fails a job with an error instead. So a cancel is
-reported as the user's, separately from failures, and the summary ends with
-`N job(s) cancelled by the user: ask them why before re-running`, so an agent
-asks rather than retrying. ComfyUI records the two cases differently, and both
-are handled:
+- `--url`, else `$COMFY_URL`, else `http://127.0.0.1:8188`.
+- `--comfy-dir`, else `$COMFY_DIR`, else the folder ComfyUI reports for its
+  models: used to print saved files as absolute paths. Without it, paths are
+  relative to ComfyUI's folder (`output/…`).
+- `--hold [NAME]` runs the batch under `vhotseat hold NAME` (default `comfy`),
+  so even unrelated traffic, another conversation say, can't take the GPU back
+  between two jobs. `--hold-wait` is how long to wait for the current owner's
+  work first (default 600 s).
 
-- **Running:** `/interrupt` leaves an `execution_interrupted` entry in
-  `/history`. Files the job saved before it was stopped are still listed.
-- **Queued:** the job is deleted from the queue and never reaches `/history`.
-  A job that is in neither `/queue` nor `/history` (read in that order, since
-  ComfyUI moves a job from one to the other in a single step) was cancelled.
-  Before this, comfy-render waited for it until the timeout.
-
-**Live progress.** While jobs run it prints what each one is doing, read from
-ComfyUI's websocket (the same feed as its own progress bar):
-
-```
-queued 1/1 job(s)
-job 1/1 waiting to start (earlier jobs, or the GPU handover and model load)
-job 1/1 running: node 3 CLIPTextEncode
-job 1/1 running: node 5 KSampler step 57/150 (38%)
-job 1/1 done (1 of 1 queued finished)
-```
-
-- **Throttled:** a line appears at most every 10 s per job, or at once when
-  the running node changes.
-- **Step counts** come from nodes that report them (samplers, and most video
-  models' sampling); other nodes show just their name.
-- **Fallback:** a line at least once a minute regardless, so a caller's idle
-  watchdog (the chat bot's) doesn't kill a long render.
-- **Pi passes these lines through as live steps**, so web and Slack show render
-  progress as it happens.
-- **Implementation:** Python's standard library has no websocket client, so
-  comfy-render has a minimal one (local, receive-only, text frames only;
-  preview-image frames are skipped). If it can't connect, the jobs still run
-  and report normally, just without progress lines. `/history` remains the
-  source of truth for when a job is finished.
-
-**Timeout: no progress, not total time.** `--timeout` (default 1800 s) is how
-long it may go without any progress: a job finishing, a websocket event for one
-of its jobs (a node or sampler step starting), or ComfyUI's queue changing (the
-batch may be waiting behind someone else's jobs, which send it no events). A
-batch that keeps progressing may run for hours. On a timeout the unfinished
-jobs stay in ComfyUI's queue.
-
-Until 2026-10-16 it was a 3600 s limit on the whole batch. A 9-video batch hit
-it with 6 jobs still running. pi's turn went on, Strata refused it (correctly,
-since ComfyUI had jobs), pi retried for ~151 s and the turn failed with "GPU
-busy". The same happened earlier that day with a 22-job batch. The pi skill
-also now tells pi not to pipe comfy-render's output (it had used `| tail -20`,
-which hid the live progress for the whole hour) or set its own timeout. pi's
-bash tool has no default timeout.
-
-**Why it exists:** a pi turn on 2026-10-13 hand-wrote a polling script that
-crashed on `/history`'s shape after the first of four jobs finished. pi's turn
-then continued while three jobs were still queued, so Strata was refused
-(correctly) and the turn failed with "GPU busy", although all four images
-rendered. Waiting correctly is the part a local model gets wrong; designing
-the workflow is not.
-
-Measured 2026-10-13 against the live ComfyUI:
-
-| Test | Result |
-| --- | --- |
-| 3 seed variants of a base workflow | all saved, 6 s |
-| a batch with one good job, an unknown node, a wrong link type, a missing model file | 1 ok, 3 rejected with ComfyUI's messages; the missing model listed the valid file names |
-| a job whose input file vanished before it ran | `failed: node 1 LoadImage: [Errno 2] …`, while the other job in the batch still succeeded |
-| a UI-format file, invalid JSON, a missing file | exit 2 with a one-line reason |
-| a 150-step SDXL job | `KSampler step 9/150 (6%)`, then `64/150`, then `119/150`, 10 s apart |
-| a job submitted with ComfyUI's models unloaded | `waiting to start …` at 0 s, then `CLIPTextEncode` at 26 s (model load), then the sampler steps |
-| the websocket unreachable | no progress lines; the job still completed and reported normally |
-
-## pi skill: run ComfyUI work through comfy-render, in batches
-
-`pi/skills/comfyui-batching/SKILL.md` tells pi two things:
-
-- run workflows with `comfy-render` rather than its own polling script;
-- batch as a best effort: one call per round, over-generate rather than
-  re-roll, one contact sheet per round.
-
-Every handover costs a ~30 s Strata reload plus a re-read of the conversation.
-pi still designs the workflows itself. The skill is installed for pi only, as a
-symlink in the `.pi/skills/` of the folder pi runs ComfyUI work from. Pi lists it in
-`<available_skills>` in headless runs too (checked 2026-10-13).
-
-**pi's retry window** (machine config, not in this repo): when ComfyUI is
-still rendering, Strata refuses pi with a 503 and pi retries. The default is 3
-retries, ~14 s in total, which a render that's still finishing outlasts.
-`~/.pi/agent/settings.json` sets
-
-```json
-"retry": {"maxRetries": 8, "baseDelayMs": 2000, "maxAgentDelayMs": 30000}
-```
-
-`maxAgentDelayMs` caps each delay, not the total. Measured 2026-10-13 against an
-always-503 server: delays of 2, 4, 8, 16 and then 30 s ×4, giving up after
-151 s.
-
-## `hold`: optional, for batches
-
-`hold` is no longer needed for safety; the guard covers every job. It's a speed
-optimisation: it keeps the GPU on comfy for a whole batch, so a Strata request
-arriving between jobs is refused instead of costing two ~30 s handovers.
+## Development
 
 ```sh
-vhotseat hold comfy --wait 600 -- ./render.sh
+uv run --group dev pytest       # ~2 min; fake LLM and ComfyUI servers, no GPU needed
+uvx ruff check .
 ```
 
-`hold` switches to comfy, then keeps the switch lock marked `hold comfy` until
-COMMAND exits, so every Strata load is refused for that whole time.
+The tests run the real CLI and arbiter against fake servers over HTTP on
+localhost; the config they use is [config.example.yaml](config.example.yaml),
+and every file in [examples/](examples/) is validated. CI runs both on Python
+3.10 to 3.13.
 
-- Inside a hold, `vhotseat switch comfy` is a no-op, and `switch strata`
-  fails. Both are detected via the `VHOTSEAT_HOLD` env var, since taking
-  the lock would deadlock.
-- A `switch comfy` from **outside** the hold's command, which is how the
-  ComfyUI guard runs (in ComfyUI's process, without that env var), is also a
-  no-op while a `hold comfy` owns the lock: the GPU is already ComfyUI's. Until
-  2026-10-17 it waited for the lock, so a job queued by a held script waited
-  on the hold, which waited on the job, until the guard's 420 s timeout.
-- SIGINT, SIGTERM and SIGHUP are forwarded to COMMAND. The lock is released
-  only after COMMAND exits.
-- A script that queues **all** its jobs at once gets the same effect without
-  `hold`, because the queue stays busy until they're done.
-- A `hold` inside another `hold` just runs its command, since the outer one
-  already owns the lock.
+## Licence
 
-## Strata hook: every model load goes through gpu-workload
-
-Strata's config runs `vhotseat gate strata` before it loads its
-model. It sets `before_load_strict: true`, so a non-zero exit means Strata
-answers **503** and doesn't load. The hook decides like this:
-
-| Situation | Decision |
-| --- | --- |
-| a `switch strata` is in progress (it triggered this load) | allow |
-| a `switch comfy` or `hold comfy` is in progress | refuse |
-| a request woke the lazy model; ComfyUI has jobs running or queued | refuse: a render is never interrupted |
-| a request woke the lazy model; ComfyUI holds models but its `/queue` doesn't answer | refuse: it may be rendering (until 2026-10-17 an unanswered `/queue` counted as no jobs) |
-| a request woke the lazy model; ComfyUI idle, no models loaded | allow |
-| a request woke the lazy model; ComfyUI idle but **holding models** | free ComfyUI's models (`/free`, wait up to 20 s for its VRAM to drop below 1500 MiB), then allow |
-| either of the two above, and ComfyUI's VRAM won't drop or its RAM + swap is still above 4 GiB | also [restart ComfyUI](#comfyui-restart-ram-not-just-vram) first, then allow |
-
-So whoever calls Strata, whether the chat bot, the `pi` CLI, curl or
-Strata's web page, gets the GPU back whenever ComfyUI is merely idle. Nobody
-has to run `switch strata` first.
-
-**How the hook frees ComfyUI:** it does that itself rather than calling
-`switch strata`, which ends in Strata's `/load` and would wait on the very load
-running the hook. It holds the switch lock while it works, so a
-`switch comfy` / `hold comfy` starting at the same moment waits for it. If a
-ComfyUI job is queued between the hook's queue check and its `/free`, ComfyUI
-postpones the free past that job. The VRAM wait then times out and the hook
-refuses: Strata answers 503, it doesn't collide.
-
-Measured 2026-10-13: a stray request with ComfyUI idle and holding 7 GB of
-SDXL was answered in 31 s (~2 s free plus ~26 s warm load).
-
-**How the hook tells a switch-triggered load from a stray one:** while a switch
-runs, it holds an flock on `~/.local/state/vhotseat/switch.lock` and writes
-its target mode into that file. The hook never *waits* on that lock. If it did,
-it would deadlock: `switch strata` holds the lock while it blocks on Strata's
-`/load`, and `/load` is what runs the hook.
-
-**Unloads aren't hooked.** Strata has no after-unload hook, so `idle_unload_s`
-is left unset. A Strata that's still loaded simply shows as `strata` mode until
-`switch comfy`.
-
-Leaving ComfyUI idle with a model loaded doesn't reserve the GPU: the next
-Strata request evicts it, and ComfyUI reloads it on its next job. ComfyUI's own
-side is covered by the guard node above.
-
-## ComfyUI restart: RAM, not just VRAM
-
-`/free` empties ComfyUI's VRAM but not its RAM. On 2026-10-16, after a video
-render, ComfyUI went from 34 GiB to 7 GiB of RAM plus 3.8 GiB of swap with no
-models loaded. Strata then loaded its ~38 GiB of experts on top: the user
-session's memory pressure reached 64%, Strata's load took 70 s instead of
-23 s, and systemd-oomd killed `chat-bot.service` (which restarted).
-
-So before Strata loads, whether from `switch strata` or the hook,
-gpu-workload restarts ComfyUI (`systemctl --user restart comfyui`) when its
-queue is empty (the existing rule: a render is never interrupted) **and**
-either:
-
-- **since 2026-10-17:** Strata's admission isn't met: less than
-  `min_available_ram_mib` (46000 for IQ3_XXS) of RAM is available after
-  ComfyUI released its models. That's measured on the machine, not on
-  ComfyUI: on 2026-10-16 at 20:00 ComfyUI was under the old 4 GiB threshold,
-  Strata loaded anyway, and oomd killed it. If a restart still doesn't make
-  room, Strata is refused (503) with the shortfall in the event log, e.g.
-  `Strata needs 46000 MiB of available RAM, 31200 MiB is available`; or
-- `/free` didn't get its VRAM below 1500 MiB, e.g. an extension that doesn't
-  unload fully, like IndexTTS without
-  [our patch](docs/tts-audio-suite-vram.md). Before, Strata was refused until
-  someone restarted ComfyUI by hand. If a job was queued meanwhile (ComfyUI
-  postpones `/free` past it), it still refuses instead.
-
-**History.** A restart wipes ComfyUI's `/history`, which comfy-render polls every
-2 s to report results. So it waits until the newest history entry finished
-at least 10 s ago, then re-checks the queue and gives up (Strata answers 503)
-if a job arrived meanwhile. A dashboard's list of recent
-jobs also starts empty after a restart.
-
-**Cost.** About 15–20 s more for that handover (ComfyUI starts in ~13 s),
-only when ComfyUI is heavy. Strata's `before_load_timeout_s` is 90 to fit it.
-ComfyUI reloads its models on its next job either way.
-
-**Tested with a fake ComfyUI unit** (2026-10-16):
-
-| Fake ComfyUI | Result |
-| --- | --- |
-| RAM over the threshold, last job finished 4 s ago | waited 4 s, restarted |
-| RAM under the threshold, VRAM clean | left alone |
-| a job queued during the wait | not restarted; failed with that reason |
-| VRAM stuck at 2066 MiB after `/free`, queue empty | restarted |
-
-**Measured on the real ComfyUI** (2026-10-16, Strata IQ2_XS, 128K context):
-
-| Test | Result |
-| --- | --- |
-| Strata woken by requests after video renders, ComfyUI holding 6.1, 7.6 and 6.3 GiB of RAM + swap (19:21, 19:23, 19:56) | each time: waited 6–8 s for history, restarted, ComfyUI answered ~10 s later, Strata loaded in 33–43 s; no oomd kill |
-| `comfy-render` of one SDXL job, then `switch strata` 1.5 s after queueing it (threshold lowered to 1024 MiB for the test) | the job finished, the switch waited 10 s, restarted ComfyUI (back in 11 s), loaded Strata; whole switch 57 s. comfy-render still reported the job `ok` with its file |
-| After the restart | ComfyUI 0.8 GiB RAM, guard `on` in its log; a smoke job then took the GPU back from Strata and succeeded in 10.9 s |
-
-`vhotseat status` shows the RAM picture:
-
-```
-ram:    26.9 of 60.5 GiB available, swap 4.5 of 8.0 GiB used (strata 0.1 GiB + 0.2 swap, comfy 29.7 GiB + 3.6 swap)
-```
-
-`--json` has the same under `ram` (`total_mib`, `available_mib`,
-`swap_total_mib`, `swap_used_mib`, and `strata` / `comfy` each with `ram_mib`,
-`swap_mib` and `file_mib`, the page cache charged to the unit).
-
-**Open question (2026-10-16).** At 20:00 systemd-oomd killed `strata.service`
-itself during a load that skipped the restart: ComfyUI had just rendered a
-video and was under the threshold (it was at ~3.7 GiB RAM + swap minutes
-later). Every load that day without a restart (16:15, 20:00) ended in an oomd
-kill; every one with a restart (19:21, 19:23, 19:56, 20:14) didn't. So the
-4 GiB threshold, or counting only anonymous memory, may be too lenient. Each
-hook-allowed load now logs `available_mib` and ComfyUI's `ram_mib` /
-`swap_mib` / `file_mib` in the event log; the next kill will show which. If
-that's still unclear, the simple fix is to always restart a ComfyUI that has
-run a job since its last start.
-
-## Event log
-
-`~/.local/state/vhotseat/events.jsonl` (last 500 lines) records every mode
-change made by `switch`, every `hold` / `hold-end` (with COMMAND's exit code),
-and every load decision the hook makes. Hook decisions carry a `source`
-(`hook` = during a switch or hold, `request` = a request that woke Strata) and
-a `reason`, e.g. `ComfyUI idle; freed its 7044 MiB of models`. `status`
-shows the latest event on its `last:` line, and `--json` includes it as
-`last_event`.
-
-## Strata config this relies on
-
-Each `~/Strata/strata-<size>.json` ([see strata-model](#strata-model-which-model-size-strata-serves);
-`strata-iq2_xs.json` and `strata-iq3_xxs.json` as of 2026-10-16) has `"lazy_load": true`, so
-`strata.service` can stay enabled without holding VRAM until something asks it
-to load. It also has `"min_free_vram_mib": 14000`: a stray request that arrives
-while ComfyUI holds models gets a 503 instead of loading on top of it. The file
-before this change is `strata-iq2_xs.json.pre-lazy`.
-
-It also has `before_load` (the hook above), `before_load_strict: true` and
-`before_load_timeout_s: 90` (30 until 2026-10-16; raised for the ComfyUI
-restart, backup `strata-iq2_xs.json.pre-restart`). The pre-hook config is the
-same `strata-iq2_xs.json.pre-lazy` backup, taken before any of these keys were
-added.
-
-## strata-model: which model size Strata serves
-
-```
-strata-model                   # list installed sizes, * = active
-strata-model iq3|iq2|SIZE      # switch (SIZE as in strata-SIZE.json)
-strata-model iq3 --wait 120    # let an answer Strata is writing finish first
-```
-
-Strata serves one model per server, and it answers whatever model name a
-request uses. So picking a model in pi doesn't change which size runs; the
-server's config does. `strata.service` runs `--config strata-active.json`, a
-symlink to one `strata-<size>.json` that Strata's setup wrote.
-
-Switching unloads Strata if it's loaded (refused while it answers, unless
-`--wait`), repoints the symlink and restarts the unloaded server (~3 s). The
-model then loads on the next request, through the `before_load` hook as
-always. It also sets pi's `defaultModel` to the new size, so pi's labels match
-the server. the chat bot names its pi model in `the chat bot's config`
-(`PI_DEFAULT_MODEL`); that one needs editing and a restart of the chat bot.
-
-Each `strata-<size>.json` needs its own copy of the hook, `lazy_load` and the
-other keys below. Strata's setup keeps them when it rewrites an installed
-size's config, but **not** when it installs a new size: on 2026-10-16 the new
-`strata-iq3_xxs.json` had none of them, and without the hook Strata would load
-on top of ComfyUI. After installing a size, copy `allowed_hosts`,
-`trusted_origins`, `open_browser`, `lazy_load`, `min_free_vram_mib`,
-`before_load`, `before_load_strict` and `before_load_timeout_s` from another
-size's config before switching to it.
-
-Measured 2026-10-16, IQ3_XXS (128K context, images on the CPU): first load from
-disk 38 s including a short answer; 82–97 tokens/s on a 700-token story (IQ2_XS:
-~100); memory pressure peaked at 49% during the load (oomd acts above 50% for
-20 s), with 14 GiB available once loaded. Installed as a symlink: `~/.local/bin/strata-model`.
-
-Installed as a symlink: `~/.local/bin/vhotseat`.
+MIT. See [LICENSE](LICENSE).

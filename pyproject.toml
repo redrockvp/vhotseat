@@ -56,4 +56,4 @@ ignore = ["E501"]  # long lines are the house style
 "tests/run_cli.py" = ["E402"]  # sets sys.path before importing vhotseat
 
 [tool.hatch.build.targets.sdist]
-exclude = [".github", "docs/plans", "docs/reports", "strata-model"]
+exclude = [".github"]

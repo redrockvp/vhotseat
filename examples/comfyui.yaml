@@ -1,0 +1,22 @@
+# ComfyUI (https://github.com/comfyanonymous/ComfyUI), with the built-in
+# `comfyui` driver: /queue says busy, /free releases, and a restart when /free
+# leaves VRAM or RAM behind (only with an empty queue).
+#
+# Gate: the vhotseat guard custom node, installed into custom_nodes/
+#   comfy node install vhotseat-guard
+#   or: ln -s /path/to/vhotseat/integrations/comfyui/vhotseat_guard ~/ComfyUI/custom_nodes/
+# then restart ComfyUI.
+
+workloads:
+  comfy:
+    driver: comfyui
+    label: ComfyUI
+    url: http://127.0.0.1:8188
+    service: {systemd-user: comfyui}
+    idle_vram_mib: 1500        # its CUDA context and caches; above this it holds models
+    gate:
+      kind: plugin
+      custom_nodes: ~/ComfyUI/custom_nodes
+      timeout: 300             # how long a job waits for the LLM to finish an answer
+    allow_restart: true
+    # restart_above_ram_mib: 8000   # also restart an idle ComfyUI holding more than this

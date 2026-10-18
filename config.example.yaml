@@ -1,6 +1,7 @@
 # vhotseat config: ~/.config/vhotseat/config.yaml (or $VHOTSEAT_CONFIG).
-# This is the setup on the machine vhotseat was built on: Strata (a local LLM
-# server) and ComfyUI on one 16 GB card. `vhotseat doctor` checks it.
+# Two workloads on one 16 GB card: Strata (a local LLM server) and ComfyUI.
+# Every key is commented. Change the paths, units and figures to your machine,
+# then run `vhotseat doctor`. examples/ has one snippet per workload.
 
 gpu:
   index: 0
@@ -26,11 +27,10 @@ workloads:
       # pre: {post: …}   # a request first, e.g. a proxy's drain (docs/guides/proxy-gate.md)
     confirm: {vram_at_most: 0}    # released once its VRAM is down to this
     load: {post: /load, timeout: 300}   # `switch strata` leaves it loaded
-    model: {get: /health, path: model}  # which model it serves (set by strata-model);
-                                        # picks the admission below
+    model: {get: /health, path: model}  # which model it serves; picks the admission below
     gate:
       kind: hook       # Strata runs `vhotseat gate strata` before every load
-      config: ~/Strata/strata-active.json   # checked by doctor
+      config: ~/Strata/strata.json   # its config file, checked by doctor
       timeout: 90      # Strata's before_load_timeout_s: the hook must fit in it
     admission:
       # RAM the machine must be able to give Strata before it may load: its
@@ -48,11 +48,11 @@ workloads:
       # catches what vhotseat doesn't manage (the desktop, a game, a release
       # that left VRAM behind).
       min_free_vram_mib: 14000
-      # Per model, as /health reports it. Measured 2026-10-17, loading from idle:
+      # Per model, as /health reports it. For example, loading from idle,
       #   IQ3_XXS took 44.5 GiB of available RAM (42.5 GiB resident, 56 GiB at the peak)
       #   IQ2_XS  took 38.2 GiB (35.6 GiB resident, 47 GiB at the peak)
-      # Both use ~14.7 GB of VRAM. A new size: load it (`vhotseat switch strata`
-      # from idle), note how much MemAvailable dropped, add ~1.5 GiB.
+      # Both use ~14.7 GB of VRAM. To measure a model: load it (`vhotseat switch
+      # strata` from idle), note how much MemAvailable dropped, add ~1.5 GiB.
       by_model:
         qwen3.8-flash-next-iq3_xxs: {min_available_ram_mib: 46000}
         qwen3.8-flash-next-iq2_xs: {min_available_ram_mib: 40000}
@@ -66,7 +66,7 @@ workloads:
     idle_vram_mib: 1500   # its CUDA context and caches; above this it holds models
     gate:
       kind: plugin     # the guard node takes the GPU before every job
-      custom_nodes: ~/ComfyUI/custom_nodes   # checked by doctor
+      custom_nodes: ~/ComfyUI/custom_nodes   # where the guard is installed; checked by doctor
       timeout: 300     # how long a job waits for an answer Strata is writing
     # No admission: what ComfyUI needs depends on the workflow, and it manages
     # its own memory. Other workloads still release the GPU before every job.
@@ -80,13 +80,12 @@ workloads:
 # of that project drops a patch silently, and the symptom shows up far away
 # (a release that leaves VRAM behind, so every handover is refused). `vhotseat
 # doctor` checks each marker is still in its file, and says when the installed
-# version has the fix upstream so the patch can go. None needed here since the
-# TTS Audio Suite fix went upstream (5.10.4). An entry looks like:
+# version has the fix upstream so the patch can go. An entry looks like:
 #
 #   - name: TTS Audio Suite IndexTTS unload
 #     file: ~/ComfyUI/custom_nodes/TTS-Audio-Suite/engines/index_tts/indextts/infer_v2_5.py
-#     marker: "LOCAL PATCH (vhotseat)"
-#     doc: ~/vhotseat/docs/tts-audio-suite-vram.md
+#     marker: "LOCAL PATCH (vhotseat)"           # a comment you put next to your change
+#     doc: ~/.config/vhotseat/patches/tts-audio-suite.md   # optional: what and why
 #     fixed_upstream_in: {version: 5.10.4, version_file: ~/ComfyUI/custom_nodes/TTS-Audio-Suite/pyproject.toml}
 patches: []
 

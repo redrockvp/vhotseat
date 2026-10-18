@@ -1,17 +1,19 @@
 ---
 name: comfyui-batching
-description: Use whenever you run ComfyUI workflows on this machine (anything that would POST to 127.0.0.1:8188/prompt). Run them with the `comfy-render` command, in as few large batches as possible, because the GPU is shared with the LLM you run on.
+description: Use whenever you run ComfyUI workflows (anything that would POST to ComfyUI's /prompt) and the GPU is shared with the LLM you run on, through vhotseat. Run them with the `comfy-render` command, in as few large batches as possible.
 ---
 
-# Running ComfyUI work
+# Running ComfyUI work on a shared GPU
 
-You run on **Strata**, a local LLM, and ComfyUI renders on the **same 16 GB
-GPU**. They can't both be loaded, so the GPU is handed over automatically:
+You run on a **local LLM on the same GPU as ComfyUI**. They can't both be
+loaded, so vhotseat hands the GPU over automatically:
 
-- When a ComfyUI job starts, your model is unloaded (about 1 s).
-- Your next request after the jobs finish reloads it (about 30 s). Because
-  unloading clears the cache, it also re-reads this whole conversation from
-  the start, at roughly 1 minute per 30K tokens.
+- When a ComfyUI job starts, your model is unloaded (usually a second or two).
+- Your next request after the jobs finish reloads it (often half a minute or
+  more). Unloading also clears the LLM's cache, so it re-reads this whole
+  conversation from the start.
+- While ComfyUI has jobs queued or running, your LLM refuses to load (HTTP
+  503). A render is never interrupted for you.
 
 You don't manage any of this yourself. But two things matter.
 
@@ -21,8 +23,8 @@ You don't manage any of this yourself. But two things matter.
 comfy-render jobs/<name>.json
 ```
 
-Write jobs files to the workspace's `jobs/` folder, never into the ComfyUI
-folder. Run it exactly like that:
+Keep job files and other scratch files in your own working folder, never
+inside ComfyUI's folder. Run it exactly like that:
 
 - **Don't pipe its output** (no `| tail`, `| head`, `| grep`). Its progress
   lines are how the user follows a long render live; a pipe holds them back
@@ -35,8 +37,14 @@ folder. Run it exactly like that:
 It queues every job, **waits until all of them have finished**, and prints one
 line per job: the files it saved, or ComfyUI's own error. A hand-written
 polling loop is easy to get subtly wrong. If it crashes while jobs are still
-queued, your next request to Strata arrives while ComfyUI holds the GPU, and
+queued, your next request to the LLM arrives while ComfyUI holds the GPU, and
 the turn fails with "GPU busy".
+
+**`--hold`**: `comfy-render --hold jobs/<name>.json` keeps the GPU on ComfyUI
+for the whole batch, even between jobs. Use it when someone else may talk to
+the same LLM while you render (the user in another chat, another agent): their
+request is refused until the batch is done, instead of costing two handovers
+in the middle of it.
 
 You still design the workflows yourself: any nodes, models, LoRAs, prompts,
 seeds and sizes. Write them as ComfyUI **API-format** JSON, the same graph you
@@ -62,23 +70,21 @@ Reading the result:
 - While it runs you'll see progress such as `job 1/2 running: node 5 KSampler
   step 57/150 (38%)` or `job 1/2 waiting to start …`. Just let it finish; don't
   start other ComfyUI work in the meantime.
-- `job 2/4 ok: /path/a.png, /path/b.png` — the files that job saved.
-- `job 3/4 rejected: node 7 PreviewImage: …` — ComfyUI refused the workflow
+- `job 2/4 ok: /path/a.png, /path/b.png`: the files that job saved.
+- `job 3/4 rejected: node 7 PreviewImage: …`: ComfyUI refused the workflow
   before running it (a wrong link type, a missing input, an unknown node, a
   model file that isn't installed, which also lists the valid names). Fix that
   node and re-run **only** the jobs that failed. ComfyUI reports the first
   problem it meets, so a second error may appear after you fix the first.
-- `job 1/4 failed: node 5 KSampler: …` — it ran but errored partway (e.g. out of
+- `job 1/4 failed: node 5 KSampler: …`: it ran but errored partway (e.g. out of
   memory). Add `--verbose` to see where in ComfyUI's code.
-- `job 2/4 cancelled: cancelled by the user …` — the user stopped that job
-  (from the dashboard or ComfyUI). It is not an error to fix. **Don't re-run
-  it; ask the user why they cancelled** and go on from their answer. The exit
-  code is 4 whenever any job was cancelled.
-- `job 4/9 timeout: no progress for 1800s; …` — nothing happened for 30
+- `job 2/4 cancelled: cancelled by the user …`: someone stopped that job. It is
+  not an error to fix. **Don't re-run it; ask the user why they cancelled** and
+  go on from their answer. The exit code is 4 whenever any job was cancelled.
+- `job 4/9 timeout: no progress for 1800s; …`: nothing happened for 30
   minutes, so ComfyUI is probably stuck. Those jobs are **still in ComfyUI's
-  queue**. Tell the user rather than re-running them, since your next
-  request may fail with "GPU busy" until the queue is cleared. The exit code
-  is 3.
+  queue**. Tell the user rather than re-running them, since your next request
+  may fail with "GPU busy" until the queue is cleared. The exit code is 3.
 - The last line is the total; the exit code is 0 only if every job saved files.
 
 Writing your own script is still fine for something `comfy-render` can't do.
@@ -98,12 +104,11 @@ when it's natural; don't bend the task out of shape for it.
 - **Put review material in one image.** After a batch, build one contact sheet
   per round (a labelled grid of thumbnails) and look at that, instead of opening
   every output.
-- **Scratch files go to the workspace's `intermediate/` folder.** Contact
-  sheets, extracted check frames and other review material that no workflow
-  loads belong there. ComfyUI's `input/` is only for files a workflow reads
-  (e.g. with `LoadImage`); its `output/` is only for deliverables. When an
-  output image feeds a later workflow (reference, init or start image),
-  move it from `output/` to `input/` with `mv`; don't copy it.
+- **Keep scratch files out of ComfyUI's folders.** Contact sheets, extracted
+  frames and other review material go in your working folder. ComfyUI's
+  `input/` is only for files a workflow reads (e.g. with `LoadImage`); its
+  `output/` is for deliverables. When an output feeds a later workflow,
+  move it to `input/` rather than copying it.
 - **Do non-GPU work outside the batch.** Layout, captions, file moves and
   contact sheets don't need the GPU. Do them before you queue the batch or after
   you've reviewed it.
@@ -114,9 +119,16 @@ image. Say so in your reply if you expect several rounds.
 
 ## If you see "GPU busy"
 
-- A **job** failing with `GPU busy, job not run: …` means your model was busy
+- A **job** failing with `GPU busy, job not run: …` means your LLM was busy
   when ComfyUI tried to take the GPU, for instance because another conversation
   was using it. Re-run that job a little later.
-- **Your own reply** failing with "the GPU is busy with ComfyUI jobs" means
+- **Your own reply** failing because the GPU is busy with ComfyUI jobs means
   ComfyUI was still rendering when you were asked to continue. It clears when
   the queue empties.
+
+## For whoever sets up the agent
+
+The agent's harness must retry a 503 (honouring `Retry-After`) from the LLM
+for at least as long as the tail of a batch can take, typically a few minutes.
+With a short retry window (some harnesses give up after ~15 s), turns fail at
+the end of renders even though nothing is wrong.

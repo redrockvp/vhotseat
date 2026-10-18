@@ -1,6 +1,6 @@
 """ComfyUI: /queue, /free, /history; restarted when /free isn't enough.
 
-Its gate is the guard custom node (comfyui/vhotseat_guard), which takes the
+Its gate is the guard custom node (integrations/comfyui/vhotseat_guard), which takes the
 GPU before every job. /free only takes effect between jobs, and empties VRAM
 but not RAM: after a video render an idle ComfyUI kept 6-15 GiB of RAM + swap
 (2026-10-16). The arbiter restarts it when another workload's admission needs
@@ -28,7 +28,7 @@ class ComfyUI(Workload):
     # None leaves it to the other workloads' admission.
     restart_above_ram_mib: int | None = None
     # A restart wipes /history. Clients that read results from it (comfy-cli,
-    # comfy-render after a websocket drop, a dashboard) may not
+    # comfy-render after a websocket drop, dashboards) may not
     # have read the latest job yet if it finished less than this long ago.
     history_settle_s: float = 10
 

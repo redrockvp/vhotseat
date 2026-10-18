@@ -1,0 +1,32 @@
+# Strata (https://github.com/Niko1221/Strata): a local LLM server with an
+# HTTP API for load/unload and a `before_load` hook. No Python needed.
+#
+# In Strata's own config (the file under gate.config), set:
+#   "lazy_load": true,                          # hold no VRAM until a request arrives
+#   "before_load": ["vhotseat", "gate", "strata"],
+#   "before_load_strict": true,                 # a refused gate means 503, not a load
+#   "before_load_timeout_s": 90                 # ≥ gate.timeout below
+
+workloads:
+  strata:
+    driver: http
+    label: Strata
+    url: http://127.0.0.1:2335
+    service: {systemd-user: strata}
+    resident: {get: /health, path: loaded}
+    release:
+      post: /unload?wait={wait}
+      always: true            # a load may be under way before any VRAM shows
+      busy_when: [{status: 409}, {path: status, in: [busy]}]
+      ok_when: [{status: 200, path: status, in: [unloaded, not loaded]}]
+    confirm: {vram_at_most: 0}
+    load: {post: /load, timeout: 300}
+    model: {get: /health, path: model}
+    gate:
+      kind: hook
+      config: ~/Strata/strata.json
+      timeout: 90
+    admission:
+      min_available_ram_mib: 46000   # RAM for its experts, measured for your model
+      min_free_vram_mib: 14000
+    allow_restart: true
