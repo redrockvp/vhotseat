@@ -9,9 +9,11 @@ answer it is writing and is unloaded. If that fails, the job is not run; it
 fails visibly with "GPU busy, job not run: <reason>".
 
 It needs [vhotseat](https://github.com/wandermyz/vhotseat) installed and
-configured (`vhotseat doctor` should pass). Install:
+configured (`vhotseat doctor` should pass). Install it from the latest
+GitHub release (run this again to update):
 
-    comfy node install vhotseat-guard
+    curl -fsSL https://github.com/wandermyz/vhotseat/releases/latest/download/vhotseat_guard.zip -o /tmp/vhotseat_guard.zip
+    unzip -o /tmp/vhotseat_guard.zip -d ComfyUI/custom_nodes/
 
 or symlink this folder into `ComfyUI/custom_nodes/`. Restart ComfyUI after
 installing or updating it.

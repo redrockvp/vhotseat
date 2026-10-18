@@ -97,6 +97,18 @@ wraps `execution.PromptExecutor.execute_async`, which ComfyUI's prompt worker
 thread calls once per job, and runs `vhotseat switch comfy --wait 300` first.
 The worker thread may block, so the web server stays responsive.
 
+**Install** it from the latest GitHub release (run again to update), then
+restart ComfyUI:
+
+```sh
+curl -fsSL https://github.com/wandermyz/vhotseat/releases/latest/download/vhotseat_guard.zip -o /tmp/vhotseat_guard.zip
+unzip -o /tmp/vhotseat_guard.zip -d ~/ComfyUI/custom_nodes/
+```
+
+Each release carries `vhotseat_guard.zip` and `vhotseat_guard-<version>.zip`;
+both unpack to a `vhotseat_guard/` folder. From a checkout, symlink
+`integrations/comfyui/vhotseat_guard` into `custom_nodes/` instead.
+
 - **On failure** the job is **not run** and fails visibly: an `execution_error`
   "GPU busy, job not run: <reason>" in the UI and in `/history`.
 - **It wraps a private API,** so a ComfyUI update can break it. If the method is
