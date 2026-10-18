@@ -5,6 +5,7 @@ one line per job: the files it produced, or ComfyUI's own error. It never
 crashes on a bad workflow; a job that fails is reported and the rest still run.
 
     comfy-render JOBS.json [--url URL] [--comfy-dir DIR] [--timeout SECONDS] [--json] [--verbose]
+                           [--hold [NAME]] [--hold-wait SECONDS]
 
 There is no limit on how long a batch may take: --timeout (default 1800) is how
 long it may go with no sign of progress (no job finishing, no node or sampler
@@ -20,6 +21,10 @@ JOBS.json is either
 Workflows are ComfyUI's API format (what "Export (API)" saves, and what
 POST /prompt takes). If the GPU is shared with an LLM through vhotseat, its
 guard node hands the GPU over before each job; nothing here needs to know.
+With --hold, the whole batch runs under `vhotseat hold NAME` (NAME defaults to
+comfy), so a request to the LLM between two jobs is refused instead of costing
+two handovers. That needs the `vhotseat` command (else $VHOTSEAT_BIN); without
+--hold, comfy-render works with ComfyUI alone.
 
 ComfyUI is at --url, else $COMFY_URL, else http://127.0.0.1:8188. Saved files
 are printed as absolute paths under --comfy-dir (else $COMFY_DIR, else the
@@ -37,8 +42,10 @@ import base64
 import copy
 import json
 import os
+import shutil
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -60,6 +67,9 @@ PROGRESS_EVERY_S = 10.0
 STALL_TIMEOUT_S = 1800
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_TIMEOUT, EXIT_CANCELLED = 0, 1, 2, 3, 4
+
+# Set by `vhotseat hold` in its command's environment.
+HOLD_ENV = "VHOTSEAT_HOLD"
 
 # Nothing interrupts or dequeues a job except a person: ComfyUI's own page, a
 # dashboard, `comfy jobs cancel`. The vhotseat guard fails a job with an error instead.
@@ -522,7 +532,13 @@ def main(argv: list[str] | None = None) -> int:
                         "a batch that keeps progressing may take any time")
     p.add_argument("--json", action="store_true", help="print the results as JSON")
     p.add_argument("--verbose", action="store_true", help="include traceback tails for runtime errors")
+    p.add_argument("--hold", nargs="?", const="comfy", metavar="NAME",
+                   help="run the batch under `vhotseat hold NAME` (default comfy): keep the GPU until it's done")
+    p.add_argument("--hold-wait", type=float, default=600, metavar="SECONDS",
+                   help="with --hold: how long to wait for the GPU's current work to finish (default 600)")
     args = p.parse_args(argv)
+    if args.hold and os.environ.get(HOLD_ENV) != args.hold:
+        return rerun_under_hold(args.hold, args.hold_wait, sys.argv[1:] if argv is None else argv)
     global COMFY_URL, COMFY_DIR
     if args.url:
         COMFY_URL = args.url.rstrip("/")
@@ -543,6 +559,21 @@ def main(argv: list[str] | None = None) -> int:
     if timed_out:
         return EXIT_TIMEOUT
     return EXIT_OK if all(r["status"] == "done" for r in results) else EXIT_FAILED
+
+
+def rerun_under_hold(name: str, wait: float, argv: list[str]) -> int:
+    """Run this same command again as `vhotseat hold NAME -- comfy-render ARGV`. The
+    copy inside sees VHOTSEAT_HOLD=NAME and just runs the batch; the hold keeps
+    every other workload's gate refusing until it exits, and passes signals on."""
+    vhotseat = os.environ.get("VHOTSEAT_BIN") or shutil.which("vhotseat")
+    if not vhotseat:
+        print("comfy-render: --hold needs the vhotseat command (not on PATH; or set $VHOTSEAT_BIN)",
+              file=sys.stderr)
+        return EXIT_USAGE
+    me = [sys.executable, "-m", "vhotseat.kit.comfy_render"]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(
+        filter(None, [str(Path(__file__).resolve().parents[2]), os.environ.get("PYTHONPATH")]))}
+    return subprocess.call([vhotseat, "hold", name, "--wait", str(wait), "--", *me, *argv], env=env)
 
 
 if __name__ == "__main__":

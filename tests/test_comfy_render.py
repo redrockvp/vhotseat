@@ -169,3 +169,40 @@ def test_result_survives_lost_history(cr, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "job 1/2 ok: /comfy/output/" in out and "job 2/2 ok: /comfy/output/" in out
     assert "cancelled" not in out
+
+
+def test_hold_keeps_the_gpu_for_the_whole_batch(rig, tmp_path, capsys, monkeypatch):
+    """--hold reruns the batch under `vhotseat hold comfy`: the LLM is unloaded
+    first, and a request to it while the batch runs is refused (503) instead of
+    taking the GPU back between two jobs."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    monkeypatch.setenv("VHOTSEAT_BIN", str(root / "tests" / "run_cli.py"))
+    monkeypatch.setenv("STRATA_URL", rig.strata.url)
+    monkeypatch.setenv("COMFY_URL", rig.comfy.url)
+    monkeypatch.setenv("XDG_STATE_HOME", str(rig.state.parent))
+    rig.strata.loaded = True
+    rig.comfy.slow_s = 1.0
+    slow = {"1": {"class_type": "Slow", "inputs": {}}, "2": {"class_type": "SaveImage", "inputs": {}}}
+    seen = {}
+
+    def between():
+        while not rig.comfy.pending and not rig.comfy.running:
+            time.sleep(0.01)
+        seen["status"] = rig.strata.request()
+
+    t = threading.Thread(target=between, daemon=True)
+    t.start()
+    from vhotseat.kit import comfy_render
+    code = comfy_render.main([write(tmp_path, [slow, save()]), "--hold"])
+    t.join(5)
+    assert code == 0
+    assert seen["status"] == 503 and not rig.strata.loaded
+    assert [e["event"] for e in rig.events() if e["event"].startswith("hold")] == ["hold", "hold-end"]
+
+
+def test_hold_without_vhotseat_is_a_usage_error(cr, tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("VHOTSEAT_BIN", raising=False)
+    monkeypatch.setattr("shutil.which", lambda *a, **k: None)
+    assert cr.main([write(tmp_path, save()), "--hold"]) == 2
+    assert "--hold needs the vhotseat command" in capsys.readouterr().err

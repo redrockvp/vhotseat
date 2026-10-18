@@ -257,6 +257,13 @@ def test_hold_refuses_strata_until_command_exits(rig, tmp_path):
     assert [e["event"] for e in rig.events() if e["event"].startswith("hold")] == ["hold", "hold-end"]
 
 
+def test_hold_takes_options_before_the_command(rig):
+    """`hold comfy --wait 600 -- CMD`, as the README writes it: --wait used to be
+    taken for the command."""
+    assert rig.cli("hold", "comfy", "--wait", "5", "--", sys.executable, "-c", "raise SystemExit(7)") == 7
+    assert rig.cli("hold", "--wait", "5", "comfy", "--", sys.executable, "-c", "raise SystemExit(7)") == 7
+
+
 def test_hold_exit_code_is_the_commands(rig):
     assert rig.cli("hold", "comfy", "--", sys.executable, "-c", "raise SystemExit(7)") == 7
 
