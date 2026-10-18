@@ -131,6 +131,8 @@ vhotseat hold NAME [--wait S] -- COMMAND...     give it to NAME and keep it unti
 vhotseat gate NAME                              for hook gates: may NAME load? (run by the server)
 vhotseat doctor [--json]                        check the config, the GPU, every workload and gate
 vhotseat doctor --exercise NAME [--wait S]      run a real cycle on NAME, timed
+vhotseat web [--host H] [--port P]              dashboard: RAM and VRAM over time, handovers, events, logs
+vhotseat record                                 sample RAM and VRAM into the telemetry until stopped
 ```
 
 Exit codes: `0` ok · `1` switch failed or gate refused · `2` usage or bad
@@ -159,7 +161,58 @@ gate refuse rather than letting a load through unchecked.
 
 **State** is in `~/.local/state/vhotseat/` (`$XDG_STATE_HOME`): the lock
 (`switch.lock`, one per GPU) and the event log (`events.jsonl`, the last 500
-decisions: every switch, hold and gate, with its reason).
+decisions: every switch, hold and gate, with its reason), and the telemetry
+(`telemetry.db`, below).
+
+## Dashboard
+
+```sh
+vhotseat web                 # http://localhost:8765/ ; --host 0.0.0.0 to reach it from elsewhere (no auth)
+```
+
+One page, refreshed every 5 s, that works on a phone too:
+
+- **Owner**: who holds the GPU now, each workload's state, and the owner over time.
+- **GPU load**: the card's model, load, temperature and power, now and over time.
+- **VRAM** and **RAM / Swap**: per workload, stacked against the totals.
+- **Events / Logs**: every switch, hold and gate decision, and every line a
+  vhotseat command logged, from any process (the guard's `switch comfy`,
+  Strata's `gate strata`, your `hold`).
+
+Every chart marks each event with a dashed line: hover it to see the event,
+click it to open it in the table. Ranges run from 15 minutes to the whole
+retention window. A button in the header switches the theme (system, light or
+dark; kept in the browser). It only reads; it never switches anything.
+
+**History doesn't need the page open.** Every vhotseat command records into
+`~/.local/state/vhotseat/telemetry.db` (SQLite) as it runs: each status probe
+is a sample, each event and log line a row, and a `hold` or a waiting `switch`
+samples every `interval_s` while it lasts. So a dashboard started later shows
+what happened before. Between commands nothing samples, which shows as gaps;
+for an unbroken history run the recorder as a service:
+
+```ini
+# ~/.config/systemd/user/vhotseat-record.service   (or run `vhotseat web` this way instead)
+[Service]
+ExecStart=%h/.local/bin/vhotseat record
+Restart=on-failure
+[Install]
+WantedBy=default.target
+```
+
+```yaml
+telemetry:
+  retention_hours: 24   # default; rows older than this are deleted as new ones arrive
+  interval_s: 5         # default
+  # enabled: false      # record nothing; the dashboard shows the live status only
+```
+
+**Disk:** about 6 MiB per day of retention with two workloads at the default
+5 s interval (~305 bytes a sample, 17,280 a day, plus events and logs), so
+~6 MiB for the default 24 h, ~43 MiB for a week. Each further workload adds
+~0.8 MiB a day. The file stays at that size: deleted rows' space is reused.
+Several processes sampling at once don't double up. Telemetry never gets in
+a handover's way: a write waits at most 2 s, and any error is ignored.
 
 ## Gates: how a workload asks for the GPU
 

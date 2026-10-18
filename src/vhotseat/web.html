@@ -1,0 +1,820 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vhotseat</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<script>
+  // Before the first paint, so a chosen theme never flashes the other one.
+  try { const t = localStorage.getItem("vhotseat-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10); --wash: rgba(11,11,11,0.04);
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+  --other: #b9b8b0; --none: #e1e0d9;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+}
+/* Dark: the OS setting, unless the theme button picked light; or the button picked dark. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.05);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    --other: #5c5b57; --none: #2c2c2a;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.05);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --other: #5c5b57; --none: #2c2c2a;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1280px; margin: 0 auto; padding: 16px 24px 48px; }
+header { display: flex; align-items: center; gap: 6px 12px; flex-wrap: wrap; }
+h1 { font-size: 20px; margin: 0; font-weight: 650; display: flex; align-items: center; gap: 8px; }
+h1 img { width: 26px; height: 26px; }
+.theme { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; border: 0; border-radius: 8px; padding: 6px 10px;
+  background: var(--surface); box-shadow: 0 0 0 1px var(--ring); color: var(--ink-2); font: inherit; font-size: 13px; cursor: pointer; }
+.theme:hover { background: var(--wash); color: var(--ink); }
+.theme svg { width: 16px; height: 16px; flex: none; }
+h2 { font-size: 17px; margin: 0; font-weight: 650; }
+h3 { font-size: 14px; margin: 0; font-weight: 600; }
+.sub { color: var(--ink-2); font-size: 13px; }
+.muted { color: var(--muted); }
+.card { background: var(--surface); border-radius: 12px; box-shadow: 0 0 0 1px var(--ring); padding: 16px; min-width: 0; }
+.bar { position: sticky; top: 0; z-index: 10; background: var(--page); padding: 10px 0; margin-bottom: 4px;
+  display: flex; gap: 8px 12px; align-items: center; flex-wrap: wrap; }
+.seg { display: inline-flex; border-radius: 8px; box-shadow: 0 0 0 1px var(--ring); background: var(--surface); overflow-x: auto; max-width: 100%; }
+.seg button { border: 0; background: none; color: var(--ink-2); padding: 7px 12px; font: inherit; cursor: pointer; white-space: nowrap; }
+.seg button:hover { background: var(--wash); }
+.seg button[aria-pressed="true"] { color: var(--ink); font-weight: 650; background: var(--wash); }
+.seg.small button { padding: 4px 10px; font-size: 13px; }
+section.card { margin-bottom: 14px; }
+.head { display: flex; align-items: baseline; justify-content: space-between; gap: 4px 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.head .right { color: var(--ink-2); font-size: 13px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.tile { background: var(--wash); border-radius: 10px; padding: 10px 14px; min-width: 0; }
+.tile .label { color: var(--ink-2); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+.tile .value { font-size: 26px; font-weight: 650; margin: 2px 0 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .value small { font-size: 14px; font-weight: 400; color: var(--ink-2); }
+.tile .detail { color: var(--muted); font-size: 12px; }
+.chart-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin: 4px 0 2px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 6px 0 4px; font-size: 12px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.key { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex: none; }
+.key.line { height: 2px; width: 14px; border-radius: 1px; }
+.key.dash { height: 0; width: 14px; border-top: 2px dashed var(--ink-2); border-radius: 0; }
+.key.mark { height: 12px; width: 0; border-left: 1.5px dashed var(--muted); border-radius: 0; }
+.chart { position: relative; touch-action: pan-y; }
+.chart + .chart-head { margin-top: 14px; }
+.chart svg { display: block; width: 100%; overflow: visible; }
+.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.chart .gridline { stroke: var(--grid); stroke-width: 1; }
+.chart .baseline { stroke: var(--axis); stroke-width: 1; }
+.chart .cross { stroke: var(--ink-2); stroke-width: 1; pointer-events: none; }
+.chart .nodata { fill: var(--muted); font-size: 13px; }
+.tip { position: absolute; pointer-events: none; z-index: 5; background: var(--surface); color: var(--ink); border-radius: 8px;
+  box-shadow: 0 0 0 1px var(--ring), 0 4px 16px rgba(0,0,0,.12); padding: 8px 10px; font-size: 12px; min-width: 170px; max-width: min(320px, 90%); display: none; }
+.tip .when { color: var(--ink-2); margin-bottom: 4px; }
+.tip .row { display: flex; align-items: center; gap: 8px; }
+.tip .row b { font-variant-numeric: tabular-nums; min-width: 62px; text-align: right; white-space: nowrap; }
+.tip .row .name { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; }
+.tip .evs { border-top: 1px solid var(--grid); margin-top: 6px; padding-top: 6px; display: grid; gap: 6px; }
+.tip .evs:first-child { border: 0; margin: 0; padding: 0; }
+.tip .ev-head { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.tip .ev-head .t { color: var(--ink-2); font-weight: 400; font-variant-numeric: tabular-nums; }
+.tip .ev-detail { color: var(--ink-2); overflow-wrap: anywhere; }
+.tip .ev-more { color: var(--muted); }
+.chart line[data-ev].on { stroke-width: 2.5; stroke-dasharray: none; opacity: 1; }
+tr.hl td { background: var(--wash); }
+.notice { color: var(--ink-2); font-size: 13px; margin: 0 0 14px; }
+.notice code, td code { font-size: 12px; background: var(--wash); padding: 1px 5px; border-radius: 4px; }
+.workloads { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.owner-now { font-size: 30px; font-weight: 650; display: flex; align-items: center; gap: 10px; }
+.owner-now .key { width: 14px; height: 14px; border-radius: 3px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: var(--ink-2); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--axis); position: sticky; top: 0; background: var(--surface); }
+td { padding: 6px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; overflow-wrap: anywhere; }
+td.t, td.nw { white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+td.nw { color: var(--ink); }
+.scroll { max-height: 480px; overflow: auto; margin-top: 8px; }
+.toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: space-between; margin-bottom: 4px; }
+.toolbar input, .toolbar select { font: inherit; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--axis); background: var(--surface); color: var(--ink); }
+.status { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.status i { font-style: normal; font-weight: 700; font-size: 11px; width: 14px; height: 14px; border-radius: 50%; color: #fff;
+  display: inline-flex; align-items: center; justify-content: center; }
+.ok i { background: var(--good); } .bad i { background: var(--critical); } .info i { background: var(--muted); }
+.err { color: var(--critical); }
+.loading { opacity: .55; transition: opacity .2s; }
+[hidden] { display: none !important; }
+
+/* Phones: tighter padding, two tiles a row, tables become stacked rows. */
+@media (max-width: 640px) {
+  main { padding: 8px 12px 32px; }
+  .card { padding: 12px; border-radius: 10px; }
+  .tiles { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .tile { padding: 8px 10px; }
+  .tile .value { font-size: 21px; }
+  .owner-now { font-size: 24px; }
+  header { display: grid; grid-template-columns: 1fr auto; }
+  header .sub { grid-row: 2; grid-column: 1 / -1; }
+  .theme .label { display: none; }
+  .theme { padding: 7px; }
+  .bar { padding: 8px 0; }
+  .scroll { max-height: 70vh; }
+  table, tbody, tr, td { display: block; }
+  thead { display: none; }
+  tr { padding: 8px 0; border-bottom: 1px solid var(--grid); display: grid; grid-template-columns: auto auto 1fr; gap: 2px 10px; }
+  td { border: 0; padding: 0; }
+  td.wide { grid-column: 1 / -1; color: var(--ink-2); }
+  td[colspan] { grid-column: 1 / -1; }
+}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1><img src="/favicon.svg" alt="">vhotseat</h1>
+    <span class="sub" id="subtitle">connecting…</span>
+    <button type="button" class="theme" id="theme"></button>
+  </header>
+  <div class="bar" role="toolbar" aria-label="Time range">
+    <div class="seg" id="ranges"></div>
+    <span class="sub" id="rangeNote"></span>
+  </div>
+  <p class="notice" id="notice" hidden></p>
+
+  <section class="card" id="owner">
+    <div class="head"><h2>Owner</h2><span class="right" id="ownerLast"></span></div>
+    <div class="owner-now" id="ownerNow"></div>
+    <div class="workloads" id="workloads" style="margin-top:12px"></div>
+    <div class="legend" id="modeLegend"></div>
+    <div class="chart" id="modeChart"></div>
+  </section>
+
+  <section class="card" id="gpu">
+    <div class="head"><h2>GPU load</h2><span class="right" id="gpuName"></span></div>
+    <div class="tiles" id="gpuTiles"></div>
+    <div class="chart-head">
+      <h3 id="gpuMetricTitle">Load</h3>
+      <div class="seg small" id="gpuMetric" role="group" aria-label="GPU chart"></div>
+    </div>
+    <div class="chart" id="gpuChart"></div>
+  </section>
+
+  <section class="card" id="vram">
+    <div class="head"><h2>VRAM</h2><span class="right" id="vramNote"></span></div>
+    <div class="tiles" id="vramTiles"></div>
+    <div class="legend" id="vramLegend"></div>
+    <div class="chart" id="vramChart"></div>
+  </section>
+
+  <section class="card" id="ram">
+    <div class="head"><h2>RAM / Swap</h2><span class="right" id="ramNote"></span></div>
+    <div class="tiles" id="ramTiles"></div>
+    <div class="chart-head"><h3>RAM used</h3></div>
+    <div class="legend" id="ramLegend"></div>
+    <div class="chart" id="ramChart"></div>
+    <div class="chart-head"><h3>Swap used</h3></div>
+    <div class="legend" id="swapLegend"></div>
+    <div class="chart" id="swapChart"></div>
+  </section>
+
+  <section class="card" id="history">
+    <div class="head">
+      <h2>Events / Logs</h2>
+      <div class="seg small" id="historyTab" role="tablist">
+        <button type="button" data-tab="events" aria-pressed="true">Events</button>
+        <button type="button" data-tab="logs" aria-pressed="false">Logs</button>
+      </div>
+    </div>
+    <div id="eventsPane">
+      <div class="toolbar">
+        <span class="sub">Every switch, hold and gate decision in the range, newest first.</span>
+        <select id="eventKind" aria-label="Show events"><option value="">All events</option><option value="switch">Switches</option>
+          <option value="hold">Holds</option><option value="gate">Gate decisions</option><option value="refused">Refused or failed</option></select>
+      </div>
+      <div class="scroll"><table><thead><tr><th>Time</th><th>Event</th><th>Result</th><th>Detail</th></tr></thead><tbody id="events"></tbody></table></div>
+    </div>
+    <div id="logsPane" hidden>
+      <div class="toolbar">
+        <span class="sub">What every vhotseat command printed, from any process, newest first.</span>
+        <input id="logFilter" type="search" placeholder="Filter logs" aria-label="Filter logs">
+      </div>
+      <div class="scroll"><table><thead><tr><th>Time</th><th>Command</th><th>PID</th><th>Message</th></tr></thead><tbody id="logs"></tbody></table></div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const SLOTS = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7", "--s8"];
+const PRESETS = [["15m", 900], ["1h", 3600], ["6h", 21600], ["24h", 86400], ["3d", 259200], ["7d", 604800]];
+const GPU_METRICS = {
+  util: { label: "Load", key: "gpu_util_pct", unit: "%", max: () => 100 },
+  temp: { label: "Temperature", key: "gpu_temp_c", unit: "°C", max: (m) => Math.max(100, m) },
+  power: { label: "Power", key: "gpu_power_w", unit: "W", max: (m, p) => Math.max(m, (p && p.gpu_power_limit_w) || 0) },
+};
+const M = { l: 48, r: 12, t: 8, b: 22 };
+const state = { range: 3600, status: null, samples: [], events: [], logs: [], eventKind: "", logFilter: "",
+  gpuMetric: "util", tab: "events", picked: null };
+
+const $ = (id) => document.getElementById(id);
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const el = (tag, attrs = {}, text) => {
+  const ns = ["svg", "path", "line", "rect", "text", "g"].includes(tag) ? "http://www.w3.org/2000/svg" : null;
+  const e = ns ? document.createElementNS(ns, tag) : document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (text !== undefined) e.textContent = text;
+  return e;
+};
+const gib = (mib) => mib == null ? "–" : (mib / 1024).toFixed(1);
+const num = (v, digits = 0) => v == null ? "–" : (+v).toFixed(digits);
+const narrow = () => matchMedia("(max-width: 640px)").matches;
+const fmtTime = (t, withDate) => new Date(t * 1000).toLocaleString([], withDate
+  ? { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" }
+  : { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+// Colour follows the workload, in config order: never its rank.
+function colorOf(name) {
+  const ws = state.status ? state.status.workloads : [];
+  const i = ws.indexOf(name);
+  return i >= 0 ? css(SLOTS[i % SLOTS.length]) : css("--other");
+}
+const labelOf = (n) => (state.status && state.status.labels[n]) || n;
+const modeLabel = (m) => m === "none" ? "Free" : m === "conflict" ? "Conflict" : labelOf(m);
+function modeColor(mode) {
+  if (mode === "none") return css("--none");
+  if (mode === "conflict") return css("--critical");
+  return colorOf(mode);
+}
+
+async function getJSON(url) {
+  const r = await fetch(url);
+  const body = await r.json();
+  if (!r.ok) throw new Error(body.error || r.statusText);
+  return body;
+}
+
+// --- data -----------------------------------------------------------------------
+
+async function refresh() {
+  document.body.classList.toggle("loading", !state.status);
+  try {
+    state.status = await getJSON("/api/status");
+    const until = Date.now() / 1000, since = until - state.range;
+    const width = document.querySelector("main").clientWidth || 1000;
+    const q = `since=${since}&until=${until}`;
+    const [samples, events, logs] = await Promise.all([
+      getJSON(`/api/history?${q}&points=${Math.max(120, Math.round(width / 2))}`),
+      getJSON(`/api/events?${q}&limit=2000`),
+      getJSON(`/api/logs?${q}&limit=2000`),
+    ]);
+    Object.assign(state, { samples, events, logs, since, until, error: null });
+  } catch (e) {
+    state.error = String(e.message || e);
+  }
+  document.body.classList.remove("loading");
+  render();
+}
+
+// --- rendering ------------------------------------------------------------------
+
+function render() {
+  renderHeader();
+  if (!state.status) return;
+  renderCharts();
+  renderEvents();
+  renderLogs();
+}
+
+function renderHeader() {
+  const s = state.status;
+  const sub = $("subtitle");
+  if (state.error) { sub.className = "err"; sub.textContent = `can't reach vhotseat: ${state.error}`; return; }
+  sub.className = "sub";
+  if (!s) return;
+  const parts = [`updated ${fmtTime(s.now)}`];
+  if (s.retention_hours != null) parts.push(`keeping ${s.retention_hours} h`);
+  sub.textContent = parts.join(" · ");
+  const ranges = $("ranges");
+  ranges.replaceChildren();
+  const keep = (s.retention_hours || 24) * 3600;
+  for (const [label, secs] of PRESETS.filter(([, secs]) => secs <= keep * 1.001)) {
+    const b = el("button", { type: "button", "aria-pressed": String(state.range === secs) }, label);
+    b.onclick = () => { state.range = secs; history.replaceState(null, "", `#${label}`); refresh(); };
+    ranges.append(b);
+  }
+  $("rangeNote").textContent = s.oldest ? `history since ${fmtTime(s.oldest, true)}` : "";
+}
+
+function tile(label, value, unit, detail, color) {
+  const t = el("div", { class: "tile" });
+  const l = el("div", { class: "label" });
+  if (color) { const k = el("i", { class: "key" }); k.style.background = color; l.append(k); }
+  l.append(label);
+  const v = el("div", { class: "value" }, value);
+  if (unit) v.append(" ", el("small", {}, unit));
+  t.append(l, v);
+  if (detail) t.append(el("div", { class: "detail" }, detail));
+  return t;
+}
+
+// Samples further apart than this belong to different runs: the gap is drawn as no data.
+function gapLimit() {
+  const s = state.status, interval = (s && s.interval_s) || 5;
+  return Math.max(interval * 4, (state.range / Math.max(1, (document.querySelector("main").clientWidth || 1000) / 2)) * 3);
+}
+
+function segments(samples) {
+  const out = [];
+  let cur = [];
+  for (const p of samples) {
+    if (cur.length && p.t - cur[cur.length - 1].t > gapLimit()) { out.push(cur); cur = []; }
+    cur.push(p);
+  }
+  if (cur.length) out.push(cur);
+  return out;
+}
+
+// A lone sample still gets a sliver of width.
+const padded = (seg) => seg.length === 1 ? [seg[0], { ...seg[0], t: seg[0].t + Math.min(gapLimit() / 4, state.range / 200) }] : seg;
+
+function niceStep(max) {
+  const raw = max / 4, pow = Math.pow(10, Math.floor(Math.log10(raw)));
+  return [1, 2, 2.5, 5, 10].map((m) => m * pow).find((s) => raw <= s);
+}
+
+function timeTicks(since, until, width) {
+  const span = until - since, want = Math.max(2, Math.floor(width / 90));
+  const steps = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+  const step = steps.find((s) => span / s <= want) || 86400;
+  const off = new Date().getTimezoneOffset() * 60;
+  const out = [];
+  for (let t = Math.ceil((since - off) / step) * step + off; t <= until; t += step) out.push(t);
+  return { ticks: out, withDate: step >= 86400 || span > 86400 };
+}
+
+// The chart frame: time axis, plus a dashed vertical marker at every event, so every
+// chart shows when the GPU changed hands. `y` is set by the caller for the value axis.
+function frame(box, height, { markers = true } = {}) {
+  const width = box.clientWidth || 800;
+  const ml = narrow() ? 40 : M.l;
+  const svg = el("svg", { viewBox: `0 0 ${width} ${height}`, height, role: "img" });
+  const x = (t) => ml + ((t - state.since) / (state.until - state.since)) * (width - ml - M.r);
+  const { ticks, withDate } = timeTicks(state.since, state.until, width - ml - M.r);
+  for (const t of ticks) {
+    const label = new Date(t * 1000).toLocaleString([], withDate ? { weekday: "short", hour: "2-digit", minute: "2-digit" } : { hour: "2-digit", minute: "2-digit" });
+    svg.append(el("text", { x: x(t), y: height - 6, "text-anchor": "middle" }, label));
+  }
+  const marks = el("g");
+  if (markers) {
+    for (const ev of state.events) {
+      if (ev.t < state.since || ev.t > state.until) continue;
+      const bad = ev.ok === false || ev.allowed === false;
+      marks.append(el("line", { "data-ev": ev.t, x1: x(ev.t), x2: x(ev.t), y1: M.t, y2: height - M.b, stroke: css(bad ? "--critical" : "--muted"),
+        "stroke-width": 1, "stroke-dasharray": "3 3", opacity: bad ? 0.9 : 0.7 }));
+    }
+  }
+  return { svg, width, x, ml, marks };
+}
+
+function yAxis(svg, width, ml, height, top, fmt) {
+  const plotH = height - M.t - M.b;
+  const y = (v) => M.t + plotH - (v / top) * plotH;
+  const step = niceStep(top);
+  for (let v = 0; v <= top + 1e-9; v += step) {
+    svg.append(el("line", { x1: ml, x2: width - M.r, y1: y(v), y2: y(v), class: v ? "gridline" : "baseline" }));
+    svg.append(el("text", { x: ml - 6, y: y(v) + 4, "text-anchor": "end" }, fmt(v)));
+  }
+  return y;
+}
+
+const niceTop = (max) => { const step = niceStep(max); return Math.ceil(max / step) * step; };
+
+// A smooth curve through [x, y] points, after a move to the first: monotone cubic
+// (Fritsch-Carlson), so it never overshoots a sample, never dips below zero, and
+// stacked layers never cross. Works on points in either x direction.
+function curve(p) {
+  const n = p.length;
+  if (n < 2) return "";
+  if (n === 2) return `L${p[1]}`;
+  const d = [], m = [];
+  for (let i = 0; i < n - 1; i++) {
+    const dx = p[i + 1][0] - p[i][0];
+    d.push(dx ? (p[i + 1][1] - p[i][1]) / dx : 0);
+  }
+  m.push(d[0]);
+  for (let i = 1; i < n - 1; i++) m.push(d[i - 1] * d[i] <= 0 ? 0 : (d[i - 1] + d[i]) / 2);
+  m.push(d[n - 2]);
+  for (let i = 0; i < n - 1; i++) {
+    if (!d[i]) { m[i] = m[i + 1] = 0; continue; }
+    const a = m[i] / d[i], b = m[i + 1] / d[i], h = a * a + b * b;
+    if (h > 9) { const t = 3 / Math.sqrt(h); m[i] = t * a * d[i]; m[i + 1] = t * b * d[i]; }
+  }
+  let out = "";
+  for (let i = 0; i < n - 1; i++) {
+    const dx = (p[i + 1][0] - p[i][0]) / 3;
+    out += `C${p[i][0] + dx},${p[i][1] + m[i] * dx} ${p[i + 1][0] - dx},${p[i + 1][1] - m[i + 1] * dx} ${p[i + 1]}`;
+  }
+  return out;
+}
+
+function legend(id, items) {
+  const box = $(id);
+  box.replaceChildren();
+  for (const [cls, color, label] of items) {
+    const k = el("span"); const key = el("i", { class: `key ${cls}` });
+    if (color) key.style.background = color;
+    k.append(key, document.createTextNode(label)); box.append(k);
+  }
+}
+const MARK_LEGEND = ["mark", null, "event (hover for details, click to open)"];
+
+const chartHeight = () => narrow() ? 170 : 220;
+
+// One stacked-area chart: `series` is [{label, color, get(sample)}], bottom first.
+function memChart(boxId, legendId, series, totalOf) {
+  const box = $(boxId), height = chartHeight();
+  const { svg, width, x, ml, marks } = frame(box, height);
+  legend(legendId, [...series.map((s) => ["", s.color, s.label]), ["dash", null, "total"], MARK_LEGEND]);
+  const samples = state.samples;
+  let max = 0;
+  for (const p of samples) max = Math.max(max, totalOf(p) || 0, series.reduce((a, s) => a + (s.get(p) || 0), 0));
+  // The axis is in GiB, so its ticks land on round GiB.
+  const yG = yAxis(svg, width, ml, height, niceTop((max || 1024) / 1024), (v) => `${+v.toFixed(1)} GiB`);
+  const y = (mib) => yG(mib / 1024);
+  if (!samples.length) svg.append(el("text", { x: width / 2, y: height / 2, "text-anchor": "middle", class: "nodata" }, "No samples in this range"));
+  for (const seg of segments(samples)) {
+    const pts = padded(seg);
+    const base = pts.map(() => 0);
+    for (const s of series) {
+      const tops = pts.map((p, i) => base[i] + Math.max(0, s.get(p) || 0));
+      // Along the tops left to right, then back along the base right to left.
+      const fwd = pts.map((p, i) => [x(p.t), y(tops[i])]);
+      const back = pts.map((p, i) => [x(p.t), y(base[i])]).reverse();
+      svg.append(el("path", { d: `M${fwd[0]}${curve(fwd)}L${back[0]}${curve(back)}Z`, fill: s.color, stroke: css("--surface"), "stroke-width": 1 }));
+      tops.forEach((v, i) => { base[i] = v; });
+    }
+    const total = pts.filter((p) => totalOf(p) != null).map((p) => [x(p.t), y(totalOf(p))]);
+    if (total.length) svg.append(el("path", { d: `M${total[0]}${curve(total)}`, fill: "none", stroke: css("--ink-2"), "stroke-width": 1.5, "stroke-dasharray": "5 4" }));
+  }
+  svg.append(marks);
+  box.replaceChildren(svg);
+  hover(box, svg, width, height, x, ml, (p) => [...series].reverse()
+    .map((s) => [s.color, s.label, s.get(p) == null ? "–" : `${gib(s.get(p))} GiB`])
+    .concat([[null, "total", totalOf(p) == null ? "–" : `${gib(totalOf(p))} GiB`, true]]));
+}
+
+// One line with a light fill under it, on its own value axis.
+function lineChart(boxId, metric) {
+  const box = $(boxId), height = chartHeight();
+  const { svg, width, x, ml, marks } = frame(box, height);
+  const get = (p) => p[metric.key];
+  const samples = state.samples.filter((p) => get(p) != null);
+  const max = samples.reduce((a, p) => Math.max(a, get(p)), 0);
+  const last = state.samples[state.samples.length - 1];
+  const top = niceTop(metric.max(max, last) || 1);
+  const y = yAxis(svg, width, ml, height, top, (v) => `${+v.toFixed(1)}${metric.unit === "%" ? "%" : metric.unit === "°C" ? "°" : " W"}`);
+  if (!samples.length) svg.append(el("text", { x: width / 2, y: height / 2, "text-anchor": "middle", class: "nodata" },
+    state.samples.length ? "Not recorded in this range" : "No samples in this range"));
+  const color = css("--s7");
+  for (const seg of segments(samples)) {
+    const pts = padded(seg).map((p) => [x(p.t), y(get(p))]);
+    const line = `M${pts[0]}${curve(pts)}`;
+    svg.append(el("path", { d: `${line}L${pts[pts.length - 1][0]},${y(0)}L${pts[0][0]},${y(0)}Z`, fill: color, opacity: 0.15 }));
+    svg.append(el("path", { d: line, fill: "none", stroke: color, "stroke-width": 2, "stroke-linejoin": "round" }));
+  }
+  if (metric.key === "gpu_power_w" && last && last.gpu_power_limit_w) {
+    svg.append(el("line", { x1: ml, x2: width - M.r, y1: y(last.gpu_power_limit_w), y2: y(last.gpu_power_limit_w),
+      stroke: css("--ink-2"), "stroke-width": 1.5, "stroke-dasharray": "5 4" }));
+  }
+  svg.append(marks);
+  box.replaceChildren(svg);
+  hover(box, svg, width, height, x, ml, (p) => [[color, metric.label, get(p) == null ? "–" : `${num(get(p), metric.unit === "W" ? 1 : 0)} ${metric.unit}`]]);
+}
+
+function modeChart() {
+  const box = $("modeChart"), height = 64;
+  const { svg, width, x, ml } = frame(box, height, { markers: false });
+  legend("modeLegend", [...state.status.workloads, "none", "conflict"].map((n) => ["", modeColor(n), modeLabel(n)])
+    .concat([["line", css("--ink-2"), "event"], ["line", css("--critical"), "refused / failed"]]));
+  const top = 16, h = height - M.b - top - 4;
+  // No track behind the blocks: a time nothing recorded must not look like "free".
+  svg.append(el("line", { x1: ml, x2: width - M.r, y1: top + h + 0.5, y2: top + h + 0.5, class: "baseline" }));
+  for (const seg of segments(state.samples)) {
+    // One block per run of samples with the same owner (per-sample rects show seams).
+    for (let i = 0; i < seg.length;) {
+      let j = i;
+      while (j + 1 < seg.length && seg[j + 1].mode === seg[i].mode) j++;
+      const end = j < seg.length - 1 ? seg[j + 1].t : seg[j].t + Math.min(gapLimit() / 4, state.range / 200);
+      const x0 = x(seg[i].t), x1 = Math.max(x(end), x0 + 2);
+      svg.append(el("rect", { x: x0, y: top, width: x1 - x0, height: h, fill: modeColor(seg[i].mode) }));
+      i = j + 1;
+    }
+  }
+  for (const ev of state.events) {
+    if (ev.t < state.since) continue;
+    const bad = ev.ok === false || ev.allowed === false;
+    svg.append(el("line", { "data-ev": ev.t, x1: x(ev.t), x2: x(ev.t), y1: 2, y2: top - 3, stroke: css(bad ? "--critical" : "--ink-2"), "stroke-width": 2, "stroke-linecap": "round" }));
+  }
+  box.replaceChildren(svg);
+  hover(box, svg, width, height, x, ml, (p) => [[modeColor(p.mode), "owner", modeLabel(p.mode)]]);
+}
+
+// The crosshair: every chart snaps to the sample nearest the pointer's time, and
+// they move together. Near an event marker (within a few pixels, more for a finger)
+// the tooltip shows the event, and the marker is highlighted on every chart; a click
+// on it opens the event in the table. Touch: tap or drag along a chart; the page
+// still scrolls vertically.
+const hovers = [];
+const MAX_TIP_EVENTS = 3;
+
+function eventRows(evs) {
+  const box = el("div", { class: "evs" });
+  for (const e of evs.slice(0, MAX_TIP_EVENTS)) {
+    const r = eventResult(e);
+    const head = el("div", { class: "ev-head" });
+    const res = el("span", { class: `status ${r.cls}` }); res.append(el("i", { "aria-hidden": "true" }, r.icon), r.text);
+    head.append(el("span", { class: "t" }, fmtTime(e.t)), document.createTextNode(e.event), res);
+    const detail = eventDetail(e);
+    box.append(head);
+    if (detail) box.append(el("div", { class: "ev-detail" }, detail.length > 180 ? `${detail.slice(0, 180)}…` : detail));
+  }
+  if (evs.length > MAX_TIP_EVENTS) box.append(el("div", { class: "ev-more" }, `+${evs.length - MAX_TIP_EVENTS} more; click to see them all`));
+  return box;
+}
+
+function hover(box, svg, width, height, x, ml, rowsOf) {
+  const cross = el("line", { class: "cross", y1: 0, y2: height - M.b, visibility: "hidden" });
+  svg.append(cross);
+  const tip = el("div", { class: "tip" });
+  box.append(tip);
+  const highlight = (evs) => {
+    const on = new Set(evs.map((e) => String(e.t)));
+    for (const l of svg.querySelectorAll("line[data-ev]")) l.classList.toggle("on", on.has(l.dataset.ev));
+  };
+  const show = (t, own, px, evs = []) => {
+    highlight(evs);
+    const p = nearest(t);
+    if ((!p && !evs.length) || t < state.since || t > state.until) { cross.setAttribute("visibility", "hidden"); tip.style.display = "none"; return; }
+    // On a marker the crosshair sits on the event; elsewhere it snaps to a sample.
+    const cx = evs.length ? x(evs[0].t) : x(p.t);
+    cross.setAttribute("x1", cx); cross.setAttribute("x2", cx); cross.setAttribute("visibility", "visible");
+    if (!own) { tip.style.display = "none"; return; }
+    tip.replaceChildren();
+    if (evs.length) tip.append(eventRows(evs));
+    if (p) {
+      tip.append(el("div", { class: "when", style: evs.length ? "margin-top:6px" : "" },
+        (evs.length ? "nearest sample " : "") + fmtTime(p.t, state.range > 86400) + (p.n > 1 ? ` · mean of ${p.n}` : "")));
+      for (const [color, label, value, dash] of rowsOf(p, t)) {
+        const row = el("div", { class: "row" });
+        const k = el("i", { class: dash ? "key dash" : "key line" });
+        if (color) k.style.background = color; else if (!dash) k.style.visibility = "hidden";
+        row.append(k, el("b", {}, value), el("span", { class: "name" }, label));
+        tip.append(row);
+      }
+    }
+    tip.style.display = "block";
+    const left = px + 16 + tip.offsetWidth > box.clientWidth ? px - 16 - tip.offsetWidth : px + 16;
+    tip.style.left = `${Math.max(0, left)}px`; tip.style.top = "4px";
+  };
+  const at = (e) => {
+    const r = svg.getBoundingClientRect(), sx = ((e.clientX - r.left) / r.width) * width;
+    const t = state.since + ((sx - ml) / (width - ml - M.r)) * (state.until - state.since);
+    const reach = e.pointerType === "mouse" ? 6 : 14;
+    const evs = state.events.filter((ev) => ev.t >= state.since && Math.abs(x(ev.t) - sx) <= reach)
+      .sort((a, b) => Math.abs(x(a.t) - sx) - Math.abs(x(b.t) - sx));
+    return { t, px: e.clientX - r.left, evs };
+  };
+  const move = (e) => {
+    const { t, px, evs } = at(e);
+    svg.style.cursor = evs.length ? "pointer" : "";
+    hovers.forEach((h) => h(t, h === show, px, evs));
+  };
+  svg.addEventListener("pointermove", move);
+  svg.addEventListener("pointerdown", move);
+  svg.addEventListener("pointerleave", (e) => { if (e.pointerType === "mouse") hovers.forEach((h) => h(-Infinity, false)); });
+  // pointerup rather than click: a refresh may redraw the chart between press and release.
+  svg.addEventListener("pointerup", (e) => { const { evs } = at(e); if (evs.length) openEvent(evs[0]); });
+  hovers.push(show);
+}
+// On touch the tooltip stays until a tap elsewhere.
+document.addEventListener("pointerdown", (e) => { if (!e.target.closest(".chart")) hovers.forEach((h) => h(-Infinity, false)); });
+
+// Show an event in the Events table: all events, scrolled to it, highlighted.
+function openEvent(ev) {
+  showTab("events");
+  if (state.eventKind) { state.eventKind = ""; $("eventKind").value = ""; renderEvents(); }
+  // Kept in the state, so the highlight survives the table's redraw on each refresh.
+  state.picked = ev.t;
+  renderEvents();
+  const row = document.querySelector(`#events tr[data-ev="${ev.t}"]`);
+  if (row) row.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
+function nearest(t) {
+  const s = state.samples;
+  if (!s.length) return null;
+  let lo = 0, hi = s.length - 1;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (s[mid].t < t) lo = mid; else hi = mid; }
+  const p = Math.abs(s[lo].t - t) <= Math.abs(s[hi].t - t) ? s[lo] : s[hi];
+  return Math.abs(p.t - t) <= gapLimit() ? p : null;
+}
+
+function workloadState(w) {
+  if (!w.service) return "service stopped";
+  if (!w.reachable) return "API not answering";
+  if ("loaded" in w) return w.loaded ? "model loaded" : "unloaded";
+  return `${w.holds_models ? "models loaded" : "no models"}, ${w.running} running / ${w.pending} queued`;
+}
+
+function renderOwner() {
+  const s = state.status;
+  const now = $("ownerNow");
+  const k = el("i", { class: "key" }); k.style.background = modeColor(s.mode);
+  now.replaceChildren(k, modeLabel(s.mode));
+  const ev = s.last_event;
+  $("ownerLast").textContent = ev ? `last ${ev.event} ${new Date(ev.time).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}` : "no events yet";
+  const box = $("workloads");
+  box.replaceChildren();
+  for (const n of s.workloads) box.append(tile(labelOf(n), workloadState(s[n]), "", null, colorOf(n)));
+  for (const t of box.querySelectorAll(".value")) { t.style.fontSize = "15px"; t.style.whiteSpace = "normal"; }
+  modeChart();
+}
+
+function renderGpu() {
+  const s = state.status, h = s.gpu_health || {}, g = s.gpu;
+  $("gpuName").textContent = (h.name || "").replace(/^NVIDIA /, "") || (h.error ? `can't read the card: ${h.error}` : "");
+  const box = $("gpuTiles");
+  box.replaceChildren(
+    tile("Load", num(h.util_pct), "%"),
+    tile("VRAM", g.error ? "–" : gib(g.total_mib - g.free_mib), g.error ? "" : `/ ${gib(g.total_mib)} GiB`),
+    tile("Temp", num(h.temp_c), "°C"),
+    tile("Power", num(h.power_w), h.power_limit_w ? `/ ${num(h.power_limit_w)} W` : "W"));
+  const seg = $("gpuMetric");
+  seg.replaceChildren();
+  for (const [key, m] of Object.entries(GPU_METRICS)) {
+    const b = el("button", { type: "button", "aria-pressed": String(state.gpuMetric === key) }, m.label);
+    b.onclick = () => { state.gpuMetric = key; renderCharts(); };
+    seg.append(b);
+  }
+  const m = GPU_METRICS[state.gpuMetric];
+  $("gpuMetricTitle").textContent = m.key === "gpu_power_w" ? "Power (dashed: limit)" : m.label;
+  lineChart("gpuChart", m);
+}
+
+function renderVram() {
+  const s = state.status, g = s.gpu, ws = s.workloads;
+  $("vramNote").textContent = g.error || `${gib(g.free_mib)} of ${gib(g.total_mib)} GiB free`;
+  $("vramTiles").replaceChildren(...ws.map((n) => tile(labelOf(n), gib(g[`${n}_mib`]), "GiB", null, colorOf(n))),
+    tile("Other", gib(g.other_mib), "GiB", null, css("--other")));
+  memChart("vramChart", "vramLegend", [...ws.map((n) => ({ label: labelOf(n), color: colorOf(n), get: (p) => p.w && p.w[n] ? p.w[n].vram : null })),
+    { label: "other processes", color: css("--other"), get: (p) => p.vram_other }], (p) => p.vram_total);
+}
+
+function renderRam() {
+  const s = state.status, r = s.ram, ws = s.workloads;
+  $("ramNote").textContent = r.error || `${gib(r.available_mib)} of ${gib(r.total_mib)} GiB available`;
+  $("ramTiles").replaceChildren(
+    tile("Available", gib(r.available_mib), `/ ${gib(r.total_mib)} GiB`),
+    tile("Swap used", gib(r.swap_used_mib), `/ ${gib(r.swap_total_mib)} GiB`),
+    ...ws.map((n) => { const m = r[n] || {}; return tile(labelOf(n), gib(m.ram_mib), "GiB", m.swap_mib ? `+ ${gib(m.swap_mib)} GiB swap` : null, colorOf(n)); }));
+  const wl = (field) => ws.map((n) => ({ label: labelOf(n), color: colorOf(n), get: (p) => p.w && p.w[n] ? p.w[n][field] : null }));
+  const sumW = (p, field) => ws.reduce((a, n) => a + ((p.w && p.w[n] && p.w[n][field]) || 0), 0);
+  memChart("ramChart", "ramLegend", [...wl("ram"), { label: "rest of the machine", color: css("--other"),
+    get: (p) => p.ram_total == null ? null : Math.max(0, p.ram_total - p.ram_available - sumW(p, "ram")) }], (p) => p.ram_total);
+  memChart("swapChart", "swapLegend", [...wl("swap"), { label: "rest of the machine", color: css("--other"),
+    get: (p) => p.swap_used == null ? null : Math.max(0, p.swap_used - sumW(p, "swap")) }], (p) => p.swap_total);
+}
+
+function renderCharts() {
+  const s = state.status;
+  if (!s) return;
+  hovers.length = 0;
+  renderOwner();
+  renderGpu();
+  renderVram();
+  renderRam();
+
+  const notice = $("notice");
+  const covered = segments(state.samples).reduce((a, seg) => a + (seg[seg.length - 1].t - seg[0].t), 0);
+  const sparse = state.samples.length && covered < (state.until - Math.max(state.since, state.samples[0].t)) * 0.5;
+  notice.hidden = !sparse && s.retention_hours != null;
+  notice.replaceChildren();
+  if (s.retention_hours == null) {
+    notice.append("Telemetry is off in the config (", el("code", {}, "telemetry.enabled: false"), "), so there's no history: only the live status.");
+  } else if (sparse) {
+    notice.append("Gaps are times when nothing was recording. For an unbroken history, run ", el("code", {}, "vhotseat web"),
+      " or ", el("code", {}, "vhotseat record"), " as a service.");
+  }
+}
+
+function eventResult(e) {
+  if (e.ok === true || e.allowed === true) return { cls: "ok", icon: "✓", text: e.event.endsWith("-load") ? "allowed" : "ok" };
+  if (e.ok === false || e.allowed === false) return { cls: "bad", icon: "✕", text: e.event.endsWith("-load") ? "refused" : "failed" };
+  return { cls: "info", icon: "i", text: "exit" in e ? `exit ${e.exit}` : "–" };
+}
+
+function eventDetail(e) {
+  const skip = new Set(["t", "time", "event", "ok", "allowed", "exit"]);
+  const flat = (v) => Array.isArray(v) ? v.map(flat).join("; ")
+    : v && typeof v === "object" ? Object.entries(v).filter(([, x]) => x != null).map(([a, b]) => `${a} ${flat(b)}`).join(", ")
+    : String(v);
+  return Object.entries(e).filter(([k]) => !skip.has(k)).map(([k, v]) => `${k}: ${flat(v)}`).join(" · ");
+}
+
+function emptyRow(cols, text) {
+  const tr = el("tr"); tr.append(el("td", { colspan: cols, class: "muted" }, text)); return tr;
+}
+
+function renderEvents() {
+  const body = $("events");
+  body.replaceChildren();
+  const kind = state.eventKind;
+  const rows = state.events.filter((e) => !kind
+    || (kind === "switch" && e.event === "switch")
+    || (kind === "hold" && e.event.startsWith("hold"))
+    || (kind === "gate" && e.event.endsWith("-load"))
+    || (kind === "refused" && (e.ok === false || e.allowed === false)));
+  if (!rows.length) { body.append(emptyRow(4, "No events in this range")); return; }
+  for (const e of rows) {
+    const r = eventResult(e);
+    const tr = el("tr", { "data-ev": e.t, class: e.t === state.picked ? "hl" : "" });
+    const res = el("span", { class: `status ${r.cls}` }); res.append(el("i", { "aria-hidden": "true" }, r.icon), r.text);
+    const tdRes = el("td"); tdRes.append(res);
+    tr.append(el("td", { class: "t" }, fmtTime(e.t, state.range > 21600)), el("td", { class: "nw" }, e.event), tdRes, el("td", { class: "wide" }, eventDetail(e)));
+    body.append(tr);
+  }
+}
+
+function renderLogs() {
+  const body = $("logs");
+  body.replaceChildren();
+  const f = state.logFilter.toLowerCase();
+  const rows = state.logs.filter((l) => !f || `${l.source} ${l.message}`.toLowerCase().includes(f));
+  if (!rows.length) { body.append(emptyRow(4, state.logs.length ? "No log lines match" : "No log lines in this range")); return; }
+  for (const l of rows) {
+    const tr = el("tr");
+    tr.append(el("td", { class: "t" }, fmtTime(l.t, state.range > 21600)), el("td", { class: "nw" }, l.source || "–"),
+      el("td", { class: "t" }, String(l.pid)), el("td", { class: "wide" }, l.message));
+    body.append(tr);
+  }
+}
+
+function showTab(tab) {
+  state.tab = tab;
+  for (const b of $("historyTab").querySelectorAll("button")) b.setAttribute("aria-pressed", String(b.dataset.tab === tab));
+  $("eventsPane").hidden = tab !== "events";
+  $("logsPane").hidden = tab !== "logs";
+}
+for (const b of $("historyTab").querySelectorAll("button")) b.onclick = () => showTab(b.dataset.tab);
+$("eventKind").onchange = (e) => { state.eventKind = e.target.value; renderEvents(); };
+$("logFilter").oninput = (e) => { state.logFilter = e.target.value; renderLogs(); };
+let resizeTimer, lastWidth = window.innerWidth;
+// Mobile browsers fire resize when the address bar hides: redraw only when the width changes.
+window.addEventListener("resize", () => {
+  if (window.innerWidth === lastWidth) return;
+  lastWidth = window.innerWidth;
+  clearTimeout(resizeTimer); resizeTimer = setTimeout(renderCharts, 150);
+});
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+
+// The theme button cycles system → light → dark; the choice is kept in this browser.
+const THEMES = {
+  system: { label: "System", next: "light", icon: '<rect x="2" y="3" width="12" height="8" rx="1.5"/><path d="M5.5 14h5M8 11v3"/>' },
+  light: { label: "Light", next: "dark", icon: '<circle cx="8" cy="8" r="3"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3 3l1 1M12 12l1 1M3 13l1-1M12 4l1-1"/>' },
+  dark: { label: "Dark", next: "system", icon: '<path d="M13.5 9.5A5.5 5.5 0 0 1 6.5 2.5a5.5 5.5 0 1 0 7 7z"/>' },
+};
+function applyTheme(name) {
+  const t = THEMES[name] ? name : "system";
+  if (t === "system") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+  try { if (t === "system") localStorage.removeItem("vhotseat-theme"); else localStorage.setItem("vhotseat-theme", t); } catch (e) {}
+  const b = $("theme");
+  b.innerHTML = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${THEMES[t].icon}</svg>`;
+  b.append(el("span", { class: "label" }, THEMES[t].label));
+  b.title = `Theme: ${THEMES[t].label}. Click for ${THEMES[THEMES[t].next].label}.`;
+  b.setAttribute("aria-label", b.title);
+  b.onclick = () => applyTheme(THEMES[t].next);
+  // Chart colours are read from the CSS when drawn: redraw in the new theme.
+  render();
+}
+applyTheme(document.documentElement.dataset.theme || "system");
+
+// The range is kept in the URL (#24h), so a bookmark opens on it.
+const fromHash = PRESETS.find(([label]) => `#${label}` === location.hash);
+if (fromHash) state.range = fromHash[1];
+refresh();
+setInterval(() => { if (!document.hidden) refresh(); }, 5000);
+</script>
+</body>
+</html>

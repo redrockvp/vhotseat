@@ -71,7 +71,7 @@ def _rules(rules, where: str):
 
 def validate(raw) -> dict:
     _check(isinstance(raw, dict), "config", "expected a mapping at the top level")
-    unknown = set(raw) - {"gpu", "workloads", "events", "patches"}
+    unknown = set(raw) - {"gpu", "workloads", "events", "telemetry", "patches"}
     _check(not unknown, "config", f"unknown key(s): {', '.join(sorted(unknown))}")
     gpu = raw.get("gpu") or {}
     _check(isinstance(gpu, dict), "gpu", "expected a mapping")
@@ -81,6 +81,16 @@ def validate(raw) -> dict:
     events = raw.get("events") or {}
     _check(isinstance(events, dict), "events", "expected a mapping")
     _int(events, "keep", "events", 10)
+    tel = raw.get("telemetry") or {}
+    _check(isinstance(tel, dict), "telemetry", "expected a mapping")
+    unknown = set(tel) - {"enabled", "retention_hours", "interval_s"}
+    _check(not unknown, "telemetry", f"unknown key(s): {', '.join(sorted(unknown))}")
+    _check(isinstance(tel.get("enabled", True), bool), "telemetry.enabled", "expected true or false")
+    for k, minimum in (("retention_hours", 0.1), ("interval_s", 1)):
+        if k in tel:
+            v = tel[k]
+            _check(isinstance(v, (int, float)) and not isinstance(v, bool) and v >= minimum,
+                   f"telemetry.{k}", f"expected a number ≥ {minimum:g}, got {v!r}")
 
     patches = raw.get("patches") or []
     _check(isinstance(patches, list), "patches", "expected a list of {name, file, marker}")

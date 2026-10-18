@@ -1,0 +1,201 @@
+"""Telemetry: RAM and VRAM over time, the event log and vhotseat's own log lines,
+kept in one SQLite file (~/.local/state/vhotseat/telemetry.db) for `vhotseat web`.
+
+Every CLI process writes as it runs, so the dashboard has history even when it
+starts later: each status probe is a sample (switch, hold and status probe as
+they go; a hold or a waiting switch also samples every `interval_s`), every
+event and every log line is a row. Between commands nothing samples, so for an
+unbroken history run `vhotseat record` (or `vhotseat web`, which records too)
+as a service. Samplers in several processes don't double up: each skips a tick
+when another process wrote a sample less than an interval ago.
+
+Rows older than `retention_hours` are deleted as new ones arrive, and SQLite
+reuses the freed pages, so the file stays at its size for one retention window:
+about 6 MiB a day at the default 5 s interval with two workloads, so ~6 MiB for
+the default 24 h (measured 2026-10-18: 17,280 samples of ~305 bytes, plus 300
+events and 1,000 log lines). Each further workload adds ~0.8 MiB a day; halving
+the interval doubles it.
+
+Telemetry never gets in the way of a handover: any error while writing it is
+swallowed, and a write waits at most 2 s for another process's.
+"""
+
+import datetime
+import json
+import os
+import sqlite3
+import threading
+import time
+from pathlib import Path
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS samples (t REAL NOT NULL, mode TEXT, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS samples_t ON samples (t);
+CREATE TABLE IF NOT EXISTS events (t REAL NOT NULL, kind TEXT, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS events_t ON events (t);
+CREATE TABLE IF NOT EXISTS logs (t REAL NOT NULL, source TEXT, pid INTEGER, message TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS logs_t ON logs (t);
+"""
+TABLES = ("samples", "events", "logs")
+# The status keys that aren't a workload's.
+NOT_WORKLOADS = {"mode", "gpu", "ram", "last_event"}
+
+
+def compact(status: dict, health: dict | None = None) -> dict:
+    """The numbers of a status probe worth keeping, per sample, plus the card's
+    load, temperature and power (its model goes in the status, not every sample)."""
+    g, r = status["gpu"], status["ram"]
+    names = [n for n in status if n not in NOT_WORKLOADS]
+    out = {"vram_total": g.get("total_mib"), "vram_free": g.get("free_mib"), "vram_other": g.get("other_mib"),
+           "ram_total": r.get("total_mib"), "ram_available": r.get("available_mib"),
+           "swap_total": r.get("swap_total_mib"), "swap_used": r.get("swap_used_mib"),
+           "w": {n: {"vram": g.get(f"{n}_mib"), "ram": (r.get(n) or {}).get("ram_mib"),
+                     "swap": (r.get(n) or {}).get("swap_mib")} for n in names}}
+    if health:
+        out.update({f"gpu_{k}": health.get(k) for k in ("util_pct", "temp_c", "power_w", "power_limit_w")})
+    if "error" in g:
+        out["gpu_error"] = g["error"]
+    return out
+
+
+class Telemetry:
+    def __init__(self, path: Path, retention_hours: float = 24, interval_s: float = 5,
+                 seed_events: Path | None = None):
+        self.path = path
+        # The event log to copy in when the database is new, so the history starts with it.
+        self.seed_events = seed_events
+        self.retention_s = retention_hours * 3600
+        self.interval_s = interval_s
+        # What this process is doing ("switch comfy"), stored with its log lines.
+        self.source = ""
+        self._db = None
+        self._mutex = threading.Lock()
+        self._last_sample = 0.0
+        self._last_mode = None
+        self._last_prune = 0.0
+
+    def _conn(self) -> sqlite3.Connection:
+        if self._db is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            new = not self.path.exists()
+            db = sqlite3.connect(self.path, timeout=2, check_same_thread=False, isolation_level=None)
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=NORMAL")
+            db.executescript(SCHEMA)
+            if new and self.seed_events is not None:
+                db.executemany("INSERT INTO events VALUES (?, ?, ?)", self._seed())
+            self._db = db
+        return self._db
+
+    def _seed(self):
+        try:
+            lines = self.seed_events.read_text().splitlines()
+        except OSError:
+            return
+        oldest = time.time() - self.retention_s
+        for line in lines:
+            try:
+                event = json.loads(line)
+                t = datetime.datetime.fromisoformat(event["time"]).timestamp()
+            except (ValueError, KeyError, TypeError):
+                continue
+            if t >= oldest:
+                yield t, event.get("event"), json.dumps(event, separators=(",", ":"))
+
+    def _write(self, sql: str, args: tuple) -> None:
+        try:
+            with self._mutex:
+                db = self._conn()
+                db.execute(sql, args)
+                now = time.time()
+                if now - self._last_prune > 60:
+                    self._last_prune = now
+                    for table in TABLES:
+                        db.execute(f"DELETE FROM {table} WHERE t < ?", (now - self.retention_s,))
+        except (sqlite3.Error, OSError):
+            pass
+
+    def _read(self, sql: str, args: tuple) -> list:
+        with self._mutex:
+            return self._conn().execute(sql, args).fetchall()
+
+    # --- writing ---------------------------------------------------------------
+
+    def sample(self, status: dict, health=None) -> None:
+        """Keep a status probe: at most one a second per process, unless the GPU
+        changed hands (a switch's last probe is the one that shows it did)."""
+        now = time.time()
+        if now - self._last_sample < 1 and status.get("mode") == self._last_mode:
+            return
+        self._last_sample, self._last_mode = now, status.get("mode")
+        # `health` is a callable: read only when the sample is kept.
+        self._write("INSERT INTO samples VALUES (?, ?, ?)",
+                    (now, status.get("mode"), json.dumps(compact(status, health() if health else None),
+                                                         separators=(",", ":"))))
+
+    def event(self, event: dict) -> None:
+        self._write("INSERT INTO events VALUES (?, ?, ?)",
+                    (time.time(), event.get("event"), json.dumps(event, separators=(",", ":"))))
+
+    def log(self, message: str) -> None:
+        self._write("INSERT INTO logs VALUES (?, ?, ?, ?)", (time.time(), self.source, os.getpid(), message))
+
+    def due(self) -> bool:
+        """Whether a sampler should take a sample now: no process wrote one for an interval."""
+        try:
+            last = self._read("SELECT max(t) FROM samples", ())[0][0] or 0
+        except (sqlite3.Error, OSError):
+            last = 0
+        return time.time() - max(last, self._last_sample) >= self.interval_s * 0.8
+
+    # --- reading ---------------------------------------------------------------
+
+    def samples(self, since: float, until: float) -> list[dict]:
+        rows = self._read("SELECT t, mode, data FROM samples WHERE t >= ? AND t <= ? ORDER BY t", (since, until))
+        return [{"t": t, "mode": mode, **json.loads(data)} for t, mode, data in rows]
+
+    def events(self, since: float, until: float, limit: int = 1000) -> list[dict]:
+        rows = self._read("SELECT t, data FROM events WHERE t >= ? AND t <= ? ORDER BY t DESC LIMIT ?",
+                          (since, until, limit))
+        return [{"t": t, **json.loads(data)} for t, data in rows]
+
+    def logs(self, since: float, until: float, limit: int = 1000) -> list[dict]:
+        rows = self._read("SELECT t, source, pid, message FROM logs WHERE t >= ? AND t <= ? "
+                          "ORDER BY t DESC LIMIT ?", (since, until, limit))
+        return [{"t": t, "source": s, "pid": p, "message": m} for t, s, p, m in rows]
+
+    def oldest(self) -> float | None:
+        return self._read("SELECT min(t) FROM samples", ())[0][0]
+
+
+class Sampler:
+    """Probe every `interval_s` in a background thread, while no other process does."""
+
+    def __init__(self, arbiter):
+        self.arbiter = arbiter
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="vhotseat-sampler", daemon=True)
+
+    def _run(self) -> None:
+        tel = self.arbiter.telemetry
+        while True:
+            started = time.monotonic()
+            if tel.due():
+                try:
+                    self.arbiter.probe()
+                except Exception:  # noqa: BLE001 - a failed probe mustn't end the sampling
+                    pass
+            # A probe takes seconds (systemctl, every workload's API): keep to the
+            # interval rather than adding it after each probe.
+            if self._stop.wait(max(0.5, tel.interval_s - (time.monotonic() - started))):
+                return
+
+    def __enter__(self):
+        if self.arbiter.telemetry is not None:
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=5)

@@ -12,10 +12,14 @@ from .errors import SwitchError
 # change state on a scale of seconds.
 SCALE = 1.0
 LOG_PREFIX = "vhotseat"
+# Also gets every line logged (telemetry keeps them for `vhotseat web`), if set.
+LOG_SINK = None
 
 
 def log(msg: str) -> None:
     print(f"{LOG_PREFIX}: {msg}", file=sys.stderr)
+    if LOG_SINK is not None:
+        LOG_SINK(msg)
 
 
 def sleep(seconds: float) -> None:
