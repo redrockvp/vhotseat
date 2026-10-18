@@ -175,6 +175,7 @@ class Arbiter:
             util.log(f"already in {name} mode")
             return []
         done = self._make_room(x, wait, self.release_timeout_s, ensure=True, admit=not resident)
+        self.lock.bump()
         if x is None:
             return done
         x.ensure_running()
@@ -226,6 +227,7 @@ class Arbiter:
             if not reason:
                 try:
                     done = self._make_room(x, 0, self.gate_release_timeout_s, ensure=False, deadline=deadline)
+                    self.lock.bump()
                 except SwitchError as e:
                     reason = (f"could not make room in {e.workload.label}: {e}" if e.workload is not None
                               else str(e))
@@ -246,7 +248,7 @@ class Arbiter:
         unless = (lambda h: h == f"hold {name}") if skip_if_held else None
         return self.lock.take(f"switch {name}", unless=unless, on_wait=waiting)
 
-    def switch(self, name: str, wait: float) -> dict:
+    def switch(self, name: str, wait: float, load: bool = True) -> dict:
         """Move the GPU to `name` (or free it, for "none") under the lock. Returns
         {"ok": …} plus "held" or "error"; the caller prints status.
 
@@ -267,14 +269,18 @@ class Arbiter:
         with lock:
             before = self.probe()["mode"]
             try:
-                done = self.acquire(name, wait, load=True)
+                done = self.acquire(name, wait, load=load)
             except SwitchError as e:
                 self.events.record("switch", to=name, ok=False, error=str(e))
                 util.log(f"switch to {name} failed: {e}")
-                return {"ok": False, "error": str(e)}
-        if before != name or done:
+                return {"ok": False, "error": str(e), "exception": e}
+        # Log a switch when the GPU changed hands. A lazy workload's switch leaves it
+        # "none" (it loads on its first job), so "none" → it with nothing done is no change.
+        x = self.workloads.get(name)
+        lazy_and_free = before == NONE and x is not None and not x.can_load()
+        if done or (before != name and not lazy_and_free):
             self.events.record("switch", to=name, ok=True, previous=before, **({"done": done} if done else {}))
-        return {"ok": True}
+        return {"ok": True, **({"done": done} if done else {})}
 
     def hold(self, name: str, command: list[str], wait: float) -> int:
         """Switch to `name` and keep the GPU there until `command` exits; returns

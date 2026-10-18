@@ -74,5 +74,19 @@ workloads:
     # finished at least history_settle_s ago (a restart wipes /history).
     allow_restart: true
 
+# Local patches to other projects' code that a handover depends on. An update
+# of that project drops a patch silently, and the symptom shows up far away
+# (a release that leaves VRAM behind, so every handover is refused). `vhotseat
+# doctor` checks each marker is still in its file, and says when the installed
+# version has the fix upstream so the patch can go.
+patches:
+  - name: TTS Audio Suite IndexTTS unload
+    file: ~/ComfyUI/custom_nodes/TTS-Audio-Suite/engines/index_tts/indextts/infer_v2_5.py
+    marker: "LOCAL PATCH (gpu-workload)"
+    doc: ~/vhotseat/docs/tts-audio-suite-vram.md
+    fixed_upstream_in:   # wandermyz PR #373, merged; released in 5.10.4
+      version: 5.10.4
+      version_file: ~/ComfyUI/custom_nodes/TTS-Audio-Suite/pyproject.toml
+
 events:
   keep: 500            # ~/.local/state/vhotseat/events.jsonl
