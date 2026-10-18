@@ -1,5 +1,3 @@
-![vhotseat: one GPU, local agentic GenAI. pi drives, ComfyUI renders, Strata reviews and composites.](https://raw.githubusercontent.com/wandermyz/vhotseat/a619e2e66e284521f3a8f66e2892790a562403df/branding/social-preview.png)
-
 # vhotseat
 
 **Want your local LLM agent to drive ComfyUI on the same consumer graphics
@@ -10,6 +8,8 @@ vhotseat makes [Strata](https://github.com/Niko1221/Strata) and
 [ComfyUI](https://github.com/comfyanonymous/ComfyUI) take turns on VRAM *and*
 RAM, so an agent session can hand work to ComfyUI and come back for the
 results safely.
+
+![vhotseat: one GPU, local agentic GenAI. pi drives, ComfyUI renders, Strata reviews and composites.](https://raw.githubusercontent.com/wandermyz/vhotseat/a619e2e66e284521f3a8f66e2892790a562403df/branding/social-preview.png)
 
 **Tested on:**
 
