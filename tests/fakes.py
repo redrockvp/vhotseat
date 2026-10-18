@@ -73,6 +73,7 @@ class FakeStrata(_Server):
     def __init__(self):
         self.loaded = False
         self.loading = False
+        self.model = "qwen3.8-flash-next-iq3_xxs"
         self.answering = 0          # requests being answered
         self.load_s = 0.05
         self.on_load = lambda: True
@@ -119,7 +120,7 @@ class FakeStrata(_Server):
         path, q = url
         self.calls.append(f"{method} {path}")
         if path == "/health":
-            return h.send_json(200, {"status": "ok", "loaded": self.loaded})
+            return h.send_json(200, {"status": "ok", "loaded": self.loaded, "model": self.model})
         if path == "/_vram":  # for a gpu-workload running in a subprocess (tests/run_cli.py)
             return h.send_json(200, {"vram": self.vram})
         if path == "/unload" and method == "POST":

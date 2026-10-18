@@ -99,14 +99,16 @@ class Arbiter:
         """What `x`'s admission is missing right now, or None if it's met."""
         if x is None or not x.admission:
             return None
-        if (need := x.admission.get("min_available_ram_mib")) is not None:
+        adm, model = x.admission_for()
+        who = f"{x.label} ({model})" if model else x.label
+        if (need := adm.get("min_available_ram_mib")) is not None:
             have = self.machine_ram().get("available_mib")
             if have is None or have < need:
-                return f"{x.label} needs {need} MiB of available RAM, {have} MiB is available"
-        if (need := x.admission.get("min_free_vram_mib")) is not None:
+                return f"{who} needs {need} MiB of available RAM, {have} MiB is available"
+        if (need := adm.get("min_free_vram_mib")) is not None:
             have = self.snapshot().get("free_mib")
             if have is None or have < need:
-                return f"{x.label} needs {need} MiB of free VRAM, {have} MiB is free"
+                return f"{who} needs {need} MiB of free VRAM, {have} MiB is free"
         return None
 
     def _make_room(self, x: Workload | None, wait: float, timeout: float, ensure: bool,

@@ -52,7 +52,7 @@ def _gate_plugin(w, gate: dict) -> list:
     nodes = gate.get("custom_nodes")
     if not nodes:
         return [(WARN, f"{w.name}: gate", "no gate.custom_nodes set, so the guard can't be checked")]
-    guard = Path(nodes).expanduser() / "gpu_workload_guard"
+    guard = Path(nodes).expanduser() / "vhotseat_guard"
     if not (guard / "__init__.py").exists():
         return [(FAIL, f"{w.name}: gate", f"guard node not installed in {nodes}: jobs aren't guarded")]
     return [(OK, f"{w.name}: gate", f"guard node installed ({guard.resolve()})")]
@@ -85,10 +85,23 @@ def checks(arbiter, cfg: dict | None) -> list:
             out += _gate_plugin(w, w.gate)
         else:
             out.append((OK, f"{w.name}: gate", "hold: guarded only while run under `vhotseat hold`"))
-        if (need := w.admission.get("min_free_vram_mib")) and g.get("total_mib") and need > g["total_mib"]:
-            out.append((FAIL, f"{w.name}: admission", f"min_free_vram_mib {need} is more than the card has"))
-        if (need := w.admission.get("min_available_ram_mib")) and ram.get("total_mib") and need > ram["total_mib"]:
-            out.append((FAIL, f"{w.name}: admission", f"min_available_ram_mib {need} is more than the machine has"))
+        per = w.admission.get("by_model") or {}
+        sets = [("", w.admission), *((f" ({m})", lim) for m, lim in per.items())]
+        for label, adm in sets:
+            if (need := adm.get("min_free_vram_mib")) and g.get("total_mib") and need > g["total_mib"]:
+                out.append((FAIL, f"{w.name}: admission", f"min_free_vram_mib{label} {need} is more than the card has"))
+            if (need := adm.get("min_available_ram_mib")) and ram.get("total_mib") and need > ram["total_mib"]:
+                out.append((FAIL, f"{w.name}: admission",
+                            f"min_available_ram_mib{label} {need} is more than the machine has"))
+        if per and w.service_active():
+            model = w.model()
+            if model is None:
+                out.append((WARN, f"{w.name}: admission", "can't tell which model it serves; using the defaults"))
+            elif model not in per:
+                out.append((WARN, f"{w.name}: admission",
+                            f"serves {model}, which isn't in by_model; using the defaults"))
+            else:
+                out.append((OK, f"{w.name}: admission", f"serves {model}: {per[model]}"))
     return out
 
 

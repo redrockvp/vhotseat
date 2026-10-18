@@ -12,6 +12,8 @@
         ok_when:   [{path: status, in: [unloaded, not loaded]}]
       confirm: {vram_at_most: 0, timeout: 30}         # default: its VRAM ≤ idle_vram_mib
       load: {post: /load, timeout: 300}               # optional
+      model: {get: /health, path: model}              # optional: the model it serves,
+                                                      # for admission.by_model
 
 Paths are dotted (`a.b.0.c`; a leading `$.` is allowed). `{wait}` in a URL is
 replaced by the seconds the release may wait for running work.
@@ -88,6 +90,14 @@ class HttpWorkload(Workload):
 
     def describe(self, st: dict) -> str:
         return super().describe(st) or ("model loaded" if st["loaded"] else "model unloaded")
+
+    def model(self) -> str | None:
+        spec = self.spec.get("model")
+        if not spec or not self.service_active():
+            return None
+        code, body = self._call(spec)
+        value = lookup(body, spec["path"]) if code == 200 else MISSING
+        return value if isinstance(value, str) and value else None
 
     def busy(self) -> str | None:
         spec = self.spec.get("busy")

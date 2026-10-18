@@ -34,7 +34,7 @@ Reference material, such as commands, flags and env vars, is in
 | --- | --- | --- |
 | `vhotseat` CLI | `gpu-workload/vhotseat`, on PATH; config `~/.config/vhotseat/config.yaml` | `status` / `switch` / `hold` / `doctor`, and `gate` for Strata's hook. Reads state live; keeps no state file. |
 | **Strata's `before_load` hook** | `strata-*.json` → `vhotseat gate strata`, with `before_load_strict: true` | Runs before Strata loads its model. Decides allow / refuse; may free an idle ComfyUI first. |
-| **ComfyUI guard node** | `comfyui/gpu_workload_guard`, symlinked into `custom_nodes/` | Wraps `PromptExecutor.execute_async`; runs `vhotseat switch comfy --wait 300` before **every** job. |
+| **ComfyUI guard node** | `comfyui/vhotseat_guard`, symlinked into `custom_nodes/` | Wraps `PromptExecutor.execute_async`; runs `vhotseat switch comfy --wait 300` before **every** job. |
 | `comfy-render` | `gpu-workload/comfy-render`, on PATH | Submits a batch of workflows, waits for **all** of them, and reports files or errors plus live progress. It never touches the GPU itself. |
 | pi skill `comfyui-batching` | `pi/skills/`, symlinked into the pi workspace's `.pi/skills/` | Tells pi to use `comfy-render` and to batch. Best effort. |
 | pi retry window | `~/.pi/agent/settings.json` | When Strata answers 503, pi retries for ~151 s instead of ~14 s. |
@@ -351,7 +351,7 @@ This is a **bounded wait**, not a deadlock.
 | --- | --- | --- |
 | hook: ComfyUI VRAM to drop | 20 s (`HOOK_RELEASE_TIMEOUT_S`) | refuse → Strata answers 503 |
 | Strata: the hook itself | 90 s (`before_load_timeout_s`) | strict → 503 |
-| guard: `switch comfy --wait` | 300 s (`GPU_WORKLOAD_GUARD_WAIT_S`), +120 s subprocess cap | job fails visibly: "GPU busy, job not run" |
+| guard: `switch comfy --wait` | 300 s (`VHOTSEAT_GUARD_WAIT_S`), +120 s subprocess cap | job fails visibly: "GPU busy, job not run" |
 | `switch strata`: Strata `/load` | `max(300, --wait)` s | switch fails, exit 1 |
 | comfy-render: no progress | 1800 s without a job finishing, a node or step starting, or the queue changing (`--timeout`); the batch as a whole is unbounded | exit 3, jobs left queued |
 | pi: Strata 503s | ~151 s (8 retries, ≤ 30 s apart) | turn ends `stopReason: error` → "GPU busy" reply |

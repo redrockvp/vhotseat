@@ -1,6 +1,6 @@
 # Handling ComfyUI updates
 
-`comfyui/gpu_workload_guard` makes each ComfyUI job take the GPU from Strata
+`comfyui/vhotseat_guard` makes each ComfyUI job take the GPU from Strata
 before it runs. It does that by wrapping a **private** ComfyUI method,
 `execution.PromptExecutor.execute_async`. ComfyUI doesn't promise to keep that
 method stable, so an update can break the guard.
@@ -9,7 +9,7 @@ method stable, so an update can break the guard.
 
 | Change in ComfyUI | What happens | Visible as |
 | --- | --- | --- |
-| `execution.PromptExecutor` or `execute_async` renamed or removed | Guard turns itself **off**; ComfyUI keeps working, unguarded | `gpu_workload_guard: OFF, ComfyUI internals changed` in the log at startup |
+| `execution.PromptExecutor` or `execute_async` renamed or removed | Guard turns itself **off**; ComfyUI keeps working, unguarded | `vhotseat_guard: OFF, ComfyUI internals changed` in the log at startup |
 | `execute_async` gets new parameters | Guard is on, but every job fails with a `TypeError` | Every job errors right after you queue it |
 | The worker stops calling `execute_async` once per job | Guard is on but never runs | Jobs run while Strata is loaded; most likely an out-of-memory error |
 | Fields read by `_fail_job` change (`status_messages`, `history_result`, `add_message`) | Only the failure path breaks: a refused job crashes instead of failing cleanly | Test 4 below |
@@ -26,9 +26,9 @@ update rather than wait to notice.
 
 2. **Confirm the guard loaded and is on:**
    ```sh
-   journalctl --user -u comfyui --since "-5min" | grep gpu_workload_guard
+   journalctl --user -u comfyui --since "-5min" | grep vhotseat_guard
    ```
-   Expect `gpu_workload_guard: on (…/vhotseat, wait 300s)`. If you see
+   Expect `vhotseat_guard: on (…/vhotseat, wait 300s)`. If you see
    `OFF` or an import error, stop here and go to *Fixing it* below.
 
 3. **Check that the method's signature hasn't changed.** The guard mirrors it:
@@ -48,7 +48,7 @@ update rather than wait to notice.
    | 1 | `vhotseat switch strata`, then queue a job | Job succeeds; `vhotseat status` shows `comfy`, Strata unloaded |
    | 2 | Start a long Strata answer, queue a job 2–3 s later | Strata's answer completes; job runs after it and succeeds |
    | 3 | Queue a job, send a Strata request, queue another | Both jobs succeed; each Strata request frees ComfyUI first |
-   | 4 | `systemctl --user set-environment GPU_WORKLOAD_GUARD_WAIT_S=2`, restart ComfyUI, start a long Strata answer, queue a job | Job ends `status: error` with `GPU busy, job not run: …` in `/history/<id>`; Strata's answer completes. Then `systemctl --user unset-environment GPU_WORKLOAD_GUARD_WAIT_S` and restart ComfyUI |
+   | 4 | `systemctl --user set-environment VHOTSEAT_GUARD_WAIT_S=2`, restart ComfyUI, start a long Strata answer, queue a job | Job ends `status: error` with `GPU busy, job not run: …` in `/history/<id>`; Strata's answer completes. Then `systemctl --user unset-environment VHOTSEAT_GUARD_WAIT_S` and restart ComfyUI |
 
    Queue a job with `gpu-workload/comfyui/smoke_job.py`. It prints
    `success in 9.0s`, or `error in 2.5s: GPU busy, job not run: …`. For a
@@ -69,7 +69,7 @@ update rather than wait to notice.
 - **Do not move the guard into `PromptServer.add_on_prompt_handler`.** That
   runs at submit time, on the web server's event loop. Blocking there for up
   to 300 s would freeze ComfyUI's UI and API.
-- **To run unguarded until it's fixed:** set `GPU_WORKLOAD_GUARD=0` in the
+- **To run unguarded until it's fixed:** set `VHOTSEAT_GUARD=0` in the
   unit's environment (`systemctl --user edit comfyui`). Then queue ComfyUI
   work only after running `vhotseat switch comfy` by hand.
 

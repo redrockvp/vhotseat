@@ -370,15 +370,15 @@ def _guard(rig, monkeypatch):
     """The real guard node's take_gpu(), running vhotseat as a subprocess
     (tests/run_cli.py: the real CLI with GPU and services read from the fakes)."""
     sys.path.insert(0, str(ROOT / "comfyui"))
-    monkeypatch.setenv("GPU_WORKLOAD_BIN", str(ROOT / "tests" / "run_cli.py"))
+    monkeypatch.setenv("VHOTSEAT_BIN", str(ROOT / "tests" / "run_cli.py"))
     monkeypatch.setenv("STRATA_URL", rig.strata.url)
     monkeypatch.setenv("COMFY_URL", rig.comfy.url)
     monkeypatch.setenv("XDG_STATE_HOME", str(rig.state.parent))
     monkeypatch.setattr("shutil.which", lambda *a, **k: None)
-    monkeypatch.setenv("GPU_WORKLOAD_GUARD_WAIT_S", "2")
-    sys.modules.pop("gpu_workload_guard", None)
-    import gpu_workload_guard  # its install() logs "ComfyUI internals changed" here: no ComfyUI
-    return gpu_workload_guard
+    monkeypatch.setenv("VHOTSEAT_GUARD_WAIT_S", "2")
+    sys.modules.pop("vhotseat_guard", None)
+    import vhotseat_guard  # its install() logs "ComfyUI internals changed" here: no ComfyUI
+    return vhotseat_guard
 
 
 def test_guard_unloads_strata_before_a_job(rig, monkeypatch):
@@ -390,7 +390,7 @@ def test_guard_unloads_strata_before_a_job(rig, monkeypatch):
 
 def test_guard_reports_why_gpu_is_busy(rig, monkeypatch):
     guard = _guard(rig, monkeypatch)
-    # The guard waits up to 2 s (GPU_WORKLOAD_GUARD_WAIT_S) for Strata's answer;
+    # The guard waits up to 2 s (VHOTSEAT_GUARD_WAIT_S) for Strata's answer;
     # this one takes longer. (The fake's waits aren't scaled down like the CLI's.)
     rig.strata.loaded = True
     t = rig.strata.request_async(4.0)

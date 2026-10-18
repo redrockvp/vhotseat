@@ -37,7 +37,8 @@ class Workload:
     # Whether the arbiter may restart its service when releasing isn't enough.
     allow_restart: bool = False
     restart_timeout_s: float = 50
-    # What must be available before it may load: min_available_ram_mib, min_free_vram_mib.
+    # What must be available before it may load: min_available_ram_mib, min_free_vram_mib,
+    # and by_model: {MODEL: {...}} overriding them for the model it's about to load.
     admission: dict = field(default_factory=dict)
     # How it asks for the GPU: {"kind": "hook" | "plugin" | "hold", "timeout": s, …}.
     gate: dict = field(default_factory=dict)
@@ -52,6 +53,21 @@ class Workload:
 
     def memory(self) -> dict:
         return self.service.memory()
+
+    def model(self) -> str | None:
+        """The model it will load (or has loaded), if it can say; None otherwise."""
+        return None
+
+    def admission_for(self) -> tuple[dict, str | None]:
+        """(the admission to check, the model it was picked for). A model listed
+        under by_model gets its own figures; any other, or an unknown one, the
+        defaults, so an unreadable model never means no check."""
+        base = {k: v for k, v in self.admission.items() if k != "by_model"}
+        per = self.admission.get("by_model") or {}
+        if not per:
+            return base, None
+        model = self.model()
+        return ({**base, **per[model]}, model) if model in per else (base, model)
 
     def held_mib(self) -> int:
         """RAM plus swap (MiB), 0 if unknown."""

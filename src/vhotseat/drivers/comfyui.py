@@ -1,6 +1,6 @@
 """ComfyUI: /queue, /free, /history; restarted when /free isn't enough.
 
-Its gate is the guard custom node (comfyui/gpu_workload_guard), which takes the
+Its gate is the guard custom node (comfyui/vhotseat_guard), which takes the
 GPU before every job. /free only takes effect between jobs, and empties VRAM
 but not RAM: after a video render an idle ComfyUI kept 6-15 GiB of RAM + swap
 (2026-10-16). The arbiter restarts it when another workload's admission needs
