@@ -1,5 +1,8 @@
 # vhotseat
 
+[![CI](https://github.com/wandermyz/vhotseat/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/wandermyz/vhotseat/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/wandermyz/vhotseat?sort=semver)](https://github.com/wandermyz/vhotseat/releases/latest)
+
 **Want your local LLM agent to drive ComfyUI on the same consumer graphics
 card?** Without coordination, the first video render lands on top of the
 loaded LLM, and something runs out of memory. **Boom, OOM!**
