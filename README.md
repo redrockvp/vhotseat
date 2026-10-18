@@ -186,6 +186,8 @@ click it to open it in the table. Ranges run from 15 minutes to the whole
 retention window. A button in the header switches the theme (system, light or
 dark; kept in the browser). It only reads; it never switches anything.
 
+![The dashboard on an RTX 5070 Ti: Strata hands the GPU to ComfyUI at 01:04, and a render is running.](https://raw.githubusercontent.com/wandermyz/vhotseat/24999a8e62e3a6342e9af6c3bc70042e77765c60/web-dashboard/desktop.png)
+
 **History doesn't need the page open.** Every vhotseat command records into
 `~/.local/state/vhotseat/telemetry.db` (SQLite) as it runs: each status probe
 is a sample, each event and log line a row, and a `hold` or a waiting `switch`
