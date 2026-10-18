@@ -1,6 +1,7 @@
 """Telemetry and `vhotseat web`: samples, events and log lines recorded by the
 CLI, read back by the dashboard's API, and pruned after their retention."""
 
+import datetime
 import json
 import sqlite3
 import threading
@@ -142,7 +143,9 @@ def test_sampler_samples_in_the_background(rig, monkeypatch):
 def test_a_new_database_starts_with_the_event_log(tmp_path):
     now = time.time()
     old = {"time": "2020-01-01T00:00:00+00:00", "event": "switch", "to": "comfy"}
-    recent = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now - 60)), "event": "hold", "mode": "comfy"}
+    # As EventLog writes it (an offset with a colon: Python 3.10 parses no other).
+    when = datetime.datetime.fromtimestamp(now - 60).astimezone().isoformat(timespec="seconds")
+    recent = {"time": when, "event": "hold", "mode": "comfy"}
     (tmp_path / "events.jsonl").write_text("\n".join([json.dumps(old), "not json", json.dumps(recent)]) + "\n")
     tel = Telemetry(tmp_path / "t.db", seed_events=tmp_path / "events.jsonl")
     assert [e["event"] for e in tel.events(0, now + 1)] == ["hold"]
