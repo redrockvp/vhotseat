@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vhotseat — One GPU. Local Agentic GenAI</title>
+<meta name="description" content="One GPU. Local Agentic GenAI. pi drives, ComfyUI renders, Strata reviews and composites.">
+<link rel="icon" href="icon.svg">
+<style>
+/* Social card for GitHub: 1280×640, everything that matters inside the
+   80px (40pt @2x) safe border. Add ?guides to the URL to see it. */
+:root{
+  --bg:#041a30; --panel:rgba(8,32,57,.45); --line:#224c77; --grid:#1d3858;
+  --text:#f6f7fc; --muted:#a9bbe0;
+  --blue:#20a7f0;   /* Strata + pi */
+  --orange:#ff922e; /* ComfyUI */
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:#020f1d}
+body{font-family:Inter,"Helvetica Neue",Arial,sans-serif;color:var(--text);min-height:100vh;display:grid;place-items:center}
+#frame{position:relative;width:min(100vw,1280px);overflow:hidden}
+.card{position:absolute;left:0;top:0;width:1280px;height:640px;transform-origin:top left;overflow:hidden;
+  background:radial-gradient(ellipse 70% 80% at 30% 35%,#0a2744 0%,var(--bg) 75%)}
+.safe{position:absolute;left:80px;top:80px;width:1120px;height:480px}
+
+/* header */
+.top{position:absolute;left:0;top:0;right:0;height:52px;display:flex;align-items:center;justify-content:space-between}
+.brand{display:flex;align-items:center;gap:14px;font-size:50px;font-weight:800;letter-spacing:-2px}
+.brand img{width:54px;height:54px}
+.repo{font-size:19px;color:var(--muted);letter-spacing:.2px}
+.repo b{color:var(--text)}
+h1{position:absolute;left:0;top:66px;margin:0;font-size:40px;line-height:1;font-weight:800;letter-spacing:-1.2px}
+.sub{position:absolute;left:0;top:118px;margin:0;font-size:23px;font-weight:700;color:var(--muted);letter-spacing:-.2px}
+.b{color:var(--blue)} .o{color:var(--orange)}
+
+/* pipeline */
+.pipe{position:absolute;left:0;right:0;top:166px;height:150px;display:grid;
+  grid-template-columns:192px 1fr 224px 1fr 224px 1fr 236px;align-items:stretch}
+.panel{border:1.5px solid var(--line);border-radius:12px;background:var(--panel);padding:10px 11px;position:relative}
+.label{font-size:14px;color:var(--muted);white-space:nowrap}
+.label b{font-weight:700}
+.prompt p{margin:14px 0 0;font-size:16px;line-height:1.42;color:var(--text)}
+.shots{display:flex;gap:6px;margin-top:9px}
+.shots .s{position:relative;flex:1;height:104px;border-radius:7px;background-size:cover;background-position:center}
+.tick{position:absolute;right:5px;bottom:5px;width:20px;height:20px;border-radius:50%;background:var(--blue);
+  display:grid;place-items:center;box-shadow:0 0 0 2px rgba(4,26,48,.6)}
+.tick svg{width:12px;height:12px}
+.final{margin-top:8px;height:78px;border-radius:7px;background:url(img/final.png) center bottom/100% auto}
+.strip{display:flex;gap:4px;margin-top:5px;height:20px}
+.strip i{flex:1;border-radius:4px;background-size:cover;background-position:center 30%}
+.strip i:last-child{flex:0 0 3px;background:var(--text);border-radius:2px}
+.step{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;
+  font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--blue)}
+.step svg{width:52px;height:24px}
+
+/* VRAM graph */
+.graph{position:absolute;left:0;right:0;top:330px;height:150px;border:1.5px solid var(--line);border-radius:12px;background:var(--panel)}
+.gtitle{position:absolute;left:14px;top:9px;font-size:15px;color:var(--muted)}
+.gtitle b{color:var(--text)}
+.legend{position:absolute;right:16px;top:10px;display:flex;gap:22px;font-size:13px;color:var(--muted)}
+.legend b{color:var(--text);font-weight:600}
+.key{display:inline-block;width:26px;height:9px;border-radius:5px;margin-right:8px;vertical-align:1px}
+.plot{position:absolute;left:0;top:30px;width:1117px;height:117px}
+
+.guides .card::after{content:"";position:absolute;inset:0;pointer-events:none;
+  border:80px solid rgba(255,70,70,.12);outline:1px solid #b9202b;outline-offset:-80px}
+</style>
+</head>
+<body>
+<main id="frame"><article class="card" aria-label="vhotseat social card"><div class="safe">
+
+<div class="top">
+  <div class="brand"><img src="icon.svg" alt=""><span>vhotseat</span></div>
+  <div class="repo">github.com/wandermyz/<b>vhotseat</b></div>
+</div>
+<h1>One GPU. Local Agentic <span class="b">GenAI</span></h1>
+<p class="sub"><span class="b">pi</span> drives. <span class="o">ComfyUI</span> renders. <span class="b">Strata</span> reviews &amp; composites.</p>
+
+<div class="pipe">
+  <section class="panel prompt">
+    <div class="label"><b class="b">pi</b> · prompt</div>
+    <p>“Make a 3-min cartoon video about my cat. Pick the best shots.”</p>
+  </section>
+  <div class="step">DRIVE<svg viewBox="0 0 52 24" aria-hidden="true"><path d="M4 12H46M36 3L46 12L36 21" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+  <section class="panel">
+    <div class="label"><b class="o">ComfyUI</b> · render</div>
+    <div class="shots">
+      <div class="s" style="background-image:url(img/render1.png)"></div>
+      <div class="s" style="background-image:url(img/render2.png)"></div>
+      <div class="s" style="background-image:url(img/render3.png)"></div>
+    </div>
+  </section>
+  <div class="step">REVIEW<svg viewBox="0 0 52 24" aria-hidden="true"><path d="M4 12H46M36 3L46 12L36 21" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+  <section class="panel">
+    <div class="label"><b class="b">Strata</b> · pick the best</div>
+    <div class="shots">
+      <div class="s" style="background-image:url(img/review1.png)"><span class="tick"><svg viewBox="0 0 12 12"><path d="M2.5 6.2L5 8.6L9.5 3.6" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span></div>
+      <div class="s" style="background-image:url(img/review2.png)"><span class="tick"><svg viewBox="0 0 12 12"><path d="M2.5 6.2L5 8.6L9.5 3.6" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span></div>
+      <div class="s" style="background-image:url(img/review3.png)"><span class="tick"><svg viewBox="0 0 12 12"><path d="M2.5 6.2L5 8.6L9.5 3.6" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span></div>
+    </div>
+  </section>
+  <div class="step">COMPOSITE<svg viewBox="0 0 52 24" aria-hidden="true"><path d="M4 12H46M36 3L46 12L36 21" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+  <section class="panel">
+    <div class="label"><b class="b">Strata</b> · composite</div>
+    <div class="final" role="img" aria-label="Final three-minute cat video"></div>
+    <div class="strip"><i style="background-image:url(img/review1.png)"></i><i style="background-image:url(img/review2.png)"></i><i style="background-image:url(img/review3.png)"></i><i></i></div>
+  </section>
+</div>
+
+<section class="graph" aria-label="Illustrative overnight VRAM usage">
+  <div class="gtitle"><b>VRAM</b> · one night, one GPU</div>
+  <div class="legend"><span><i class="key" style="background:var(--orange)"></i><b>ComfyUI</b> · render</span><span><i class="key" style="background:var(--blue)"></i><b>Strata</b> · review / composite</span></div>
+  <svg class="plot" viewBox="0 0 1117 117" role="img" aria-label="From 23:00 to 07:00: a short Strata session, long ComfyUI renders alternating with brief Strata reviews, and a longer final Strata composite.">
+    <defs>
+      <linearGradient id="go" x2="0" y2="1"><stop stop-color="#ff922e" stop-opacity=".6"/><stop offset="1" stop-color="#ff922e" stop-opacity=".12"/></linearGradient>
+      <linearGradient id="gb" x2="0" y2="1"><stop stop-color="#20a7f0" stop-opacity=".6"/><stop offset="1" stop-color="#20a7f0" stop-opacity=".15"/></linearGradient>
+    </defs>
+    <g stroke="#1d3858" stroke-width="1"><path d="M70 50H1095M323 8V82M578 8V82M833 8V82M1088 8V82"/></g>
+    <path d="M70 8H1095" stroke="#8ea3c9" stroke-width="1" stroke-dasharray="8 6"/>
+    <path d="M70 8V82H1095" stroke="#8ea3c9" stroke-width="1.2" fill="none"/>
+    <g fill="url(#go)" stroke="#ff922e" stroke-width="3" stroke-linejoin="round">
+      <path d="M92 82L95 22Q95 18 99 18H333Q336 18 336 22L338 82Z"/>
+      <path d="M348 82L351 22Q351 18 355 18H733Q736 18 736 22L738 82Z"/>
+      <path d="M748 82L751 22Q751 18 755 18H1007Q1010 18 1011 22L1020 82Z"/>
+    </g>
+    <g fill="url(#gb)" stroke="#20a7f0" stroke-width="3" stroke-linejoin="round">
+      <path d="M71 82L73 24Q74 18 78 18H86Q89 18 89 24L91 82Z"/>
+      <path d="M339 82L341 26Q343 16 345 26L347 82Z"/>
+      <path d="M739 82L741 26Q743 16 745 26L747 82Z"/>
+      <path d="M1021 82L1024 24Q1025 18 1029 18H1092V82Z"/>
+    </g>
+    <g fill="#a9bbe0" font-size="13" font-family="Inter,'Helvetica Neue',Arial,sans-serif">
+      <text x="60" y="12" text-anchor="end">16 GB</text><text x="60" y="54" text-anchor="end">8</text><text x="60" y="86" text-anchor="end">0</text>
+      <text x="70" y="104" text-anchor="middle">23:00</text><text x="323" y="104" text-anchor="middle">01:00</text><text x="578" y="104" text-anchor="middle">03:00</text><text x="833" y="104" text-anchor="middle">05:00</text><text x="1088" y="104" text-anchor="middle">07:00</text>
+    </g>
+  </svg>
+</section>
+
+</div></article></main>
+<script>
+if(new URLSearchParams(location.search).has('guides'))document.body.classList.add('guides');
+const frame=document.getElementById('frame'),card=document.querySelector('.card');
+function fit(){const s=frame.clientWidth/1280;frame.style.height=640*s+'px';card.style.transform='scale('+s+')'}
+addEventListener('resize',fit);fit();
+</script>
+</body>
+</html>
