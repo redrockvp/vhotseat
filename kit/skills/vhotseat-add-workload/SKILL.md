@@ -22,13 +22,23 @@ the vhotseat repo: `config.example.yaml` (every config key, commented),
 - **Back up every config you edit** (`cp X X.pre-vhotseat`).
 - **Don't report success without step 6.**
 - Run everything while the GPU is idle (`vhotseat status`: nothing running).
+- **Run the server only the way it's normally run** (its systemd unit, its
+  container), even to experiment. A copy started by hand in a shell or in the
+  background holds VRAM that vhotseat can't see or release, and it outlives your
+  session. To try other flags, edit the unit (keep a backup) and restart it.
+- **Stop everything you started before you hand back**: the server if it was
+  stopped when you began, any proxy, anything in the background. Then check
+  `vhotseat doctor` shows no warning about VRAM held by other processes.
 
 ## 1. Learn the server
 
 From its docs and by trying it, answer each of these and write the answers down
 (you'll need them in step 3):
 
-1. What loads a model? (a request, a CLI command, starting the process)
+1. What loads a model? (a request, a CLI command, starting the process). Check
+   whether it has a mode that loads and unloads models over its API (a "router",
+   "multi-model" or "model management" mode): that's usually the best way to run
+   it under vhotseat.
 2. How do you know a model is loaded? (an endpoint, a field, or only `nvidia-smi`)
 3. How do you know it's working on something? (a queue, an in-flight count, or nothing)
 4. How do you unload it without killing work? If there's no way, can it be

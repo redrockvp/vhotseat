@@ -30,12 +30,12 @@ Find, from its docs and by trying it, and write down:
 
 | Question | Ollama | llama-server |
 | --- | --- | --- |
-| Which requests load a model? | `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` | `/completion`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/infill` (if it was started without a model loaded, or with one it can unload) |
+| Which requests load a model? | `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` | In **router mode** (started without `-m`, with `--models-dir DIR`): any request naming a model loads it, unless started with `--no-models-autoload`; then only `POST /models/load {"model": M}`. With a single `-m` model: it's loaded at startup, always. |
 | Which don't? (pass straight through) | `/api/tags`, `/api/ps`, `/api/show`, `/api/pull`, `/api/version`, … | `/health`, `/props`, `/v1/models`, `/slots`, … |
 | How does a streaming answer end? | the response body closes (NDJSON lines, last has `"done": true`) | the body closes (SSE, last event `data: [DONE]`) |
-| Is a model loaded right now? | `GET /api/ps` → `models` non-empty | depends on the build: `/health`, `/props`, or the process's VRAM |
-| How do you unload it? | `POST /api/generate {"model": M, "keep_alive": 0}` for each model in `/api/ps` | often only by restarting the process: then `release` is a restart (`allow_restart`) |
-| Does it unload on its own? | yes, after `OLLAMA_KEEP_ALIVE` (set it to `-1` so vhotseat decides) | no |
+| Is a model loaded right now? | `GET /api/ps` → `models` non-empty | router mode: `GET /models` → each model's `status.value` (`loaded`, `loading`, `unloaded`, `sleeping`). Single model: always, while the process runs |
+| How do you unload it? | `POST /api/generate {"model": M, "keep_alive": 0}` for each model in `/api/ps` | router mode: `POST /models/unload {"model": M}`. Single model: only by stopping the process (`allow_restart` won't do: a restart reloads it) |
+| Does it unload on its own? | yes, after `OLLAMA_KEEP_ALIVE` (set it to `-1` so vhotseat decides) | only with `--sleep-idle-seconds` (default off) |
 | Which port do clients use? | 11434 | 8080 |
 
 **Check:** you've loaded a model through one of the "loads" requests, seen it in

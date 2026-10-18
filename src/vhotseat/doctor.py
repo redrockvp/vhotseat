@@ -15,6 +15,8 @@ from pathlib import Path
 from . import util
 
 OK, WARN, FAIL = "ok", "warn", "fail"
+# VRAM outside every workload above which doctor warns (a desktop alone uses a few hundred MiB).
+OTHER_WARN_MIB = 1024
 
 
 def _gate_hook(w, gate: dict) -> list:
@@ -110,6 +112,12 @@ def checks(arbiter, cfg: dict | None) -> list:
         out.append((FAIL, "gpu", g["error"]))
     else:
         out.append((OK, "gpu", f"{arbiter.gpu.name}: {g['free_mib']} of {g['total_mib']} MiB free"))
+        # VRAM no configured workload owns: a desktop, a game, or a server started by
+        # hand outside its service, which no gate protects (seen 2026-10-17: a trial
+        # llama-server left running outside its unit). Admission can't see it coming.
+        if g["other_mib"] > OTHER_WARN_MIB:
+            out.append((WARN, "gpu: other", f"{g['other_mib']} MiB held by processes that aren't a configured "
+                        "workload; nothing gates them. `nvidia-smi` shows which."))
     ram = arbiter.machine_ram()
     out += check_patches(cfg)
     out.append((FAIL, "ram", ram["error"]) if "error" in ram else

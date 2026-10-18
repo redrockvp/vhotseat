@@ -124,3 +124,12 @@ def test_proxy_guide_config_validates():
     block = guide.split("```yaml\n", 1)[1].split("```", 1)[0]
     raw["workloads"].update(yaml.safe_load(block)["workloads"])
     config.validate(raw)
+
+
+def test_doctor_warns_about_unattributed_vram(rig):
+    """A server started by hand outside its unit holds VRAM no gate protects."""
+    rig.gpu.other = 2956
+    found = [(s, d) for s, c, d in doctor.checks(rig.arb, rig.cfg) if c == "gpu: other"]
+    assert found and found[0][0] == "warn" and "2956 MiB" in found[0][1]
+    rig.gpu.other = 300
+    assert not [c for _, c, _ in doctor.checks(rig.arb, rig.cfg) if c == "gpu: other"]
