@@ -325,3 +325,12 @@ def test_doctor_names_the_models_admission(vh):
     vh.strata.model = "something-new"
     found = [(s, d) for s, c, d in doctor.checks(vh.arb, vh.cfg) if c == "strata: admission"]
     assert found == [("warn", "serves something-new, which isn't in by_model; using the defaults")]
+
+
+def test_gate_doesnt_count_a_loaded_workloads_own_memory(vh):
+    """`vhotseat gate strata` with Strata already loaded (42 GB of RAM its own):
+    nothing to make room for, so no ComfyUI restart (seen 2026-10-17, run by hand)."""
+    vh.strata.loaded = True
+    vh.host.available_mib = 14000
+    assert vh.arb.gate("strata") is True
+    assert vh.host.restarts == []
