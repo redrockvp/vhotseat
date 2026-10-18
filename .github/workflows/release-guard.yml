@@ -1,0 +1,26 @@
+# Attaches the ComfyUI guard to each GitHub release, as vhotseat_guard.zip (a
+# fixed name, so releases/latest/download/vhotseat_guard.zip always gets the
+# newest) and vhotseat_guard-<tag>.zip. Each unpacks to a vhotseat_guard/ folder
+# for ComfyUI's custom_nodes/. This is how the docs install the guard.
+name: Attach guard to release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the zips
+        working-directory: integrations/comfyui
+        run: |
+          zip -qrX "$RUNNER_TEMP/vhotseat_guard.zip" vhotseat_guard -x '*/__pycache__/*' '*.pyc'
+          cp "$RUNNER_TEMP/vhotseat_guard.zip" "$RUNNER_TEMP/vhotseat_guard-${GITHUB_REF_NAME#v}.zip"
+      - name: Upload them
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP"/vhotseat_guard*.zip --clobber

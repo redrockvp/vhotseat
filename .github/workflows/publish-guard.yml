@@ -1,13 +1,13 @@
 # Publishes integrations/comfyui/vhotseat_guard to the ComfyUI Registry as
-# vhotseat-guard when its version changes. Needs the REGISTRY_ACCESS_TOKEN secret.
+# vhotseat-guard. Needs the REGISTRY_ACCESS_TOKEN secret. Run by hand (Actions >
+# Run workflow) after bumping the guard's version: a version can be uploaded
+# only once. The docs install the guard from the GitHub release instead until
+# the Registry listing is live (release-guard.yml).
 # comfy-cli packages the git-tracked files under the directory it runs in.
 name: Publish guard to the ComfyUI Registry
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths: ["integrations/comfyui/vhotseat_guard/pyproject.toml"]
 
 jobs:
   publish:

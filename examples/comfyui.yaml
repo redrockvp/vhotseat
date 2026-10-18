@@ -2,9 +2,11 @@
 # `comfyui` driver: /queue says busy, /free releases, and a restart when /free
 # leaves VRAM or RAM behind (only with an empty queue).
 #
-# Gate: the vhotseat guard custom node, installed into custom_nodes/
-#   comfy node install vhotseat-guard
-#   or: ln -s /path/to/vhotseat/integrations/comfyui/vhotseat_guard ~/ComfyUI/custom_nodes/
+# Gate: the vhotseat guard custom node, installed into custom_nodes/ from the
+# latest GitHub release:
+#   curl -fsSL https://github.com/wandermyz/vhotseat/releases/latest/download/vhotseat_guard.zip -o /tmp/vhotseat_guard.zip \
+#     && unzip -o /tmp/vhotseat_guard.zip -d ~/ComfyUI/custom_nodes/
+#   or from a checkout: ln -s /path/to/vhotseat/integrations/comfyui/vhotseat_guard ~/ComfyUI/custom_nodes/
 # then restart ComfyUI.
 
 workloads:

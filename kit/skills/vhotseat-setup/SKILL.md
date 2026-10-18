@@ -95,14 +95,17 @@ otherwise.
 `before_load_timeout_s` must be at least the workload's `gate.timeout`. Leave
 Strata's idle unload off: vhotseat decides when it unloads. Restart Strata.
 
-**ComfyUI** (plugin gate). Install the guard node, either from the ComfyUI
-Registry or from the repo:
+**ComfyUI** (plugin gate). Install the guard node from the latest GitHub
+release, or symlink it from a checkout of the repo:
 
 ```sh
-comfy node install vhotseat-guard
+curl -fsSL https://github.com/wandermyz/vhotseat/releases/latest/download/vhotseat_guard.zip -o /tmp/vhotseat_guard.zip
+unzip -o /tmp/vhotseat_guard.zip -d <ComfyUI>/custom_nodes/
 # or
 ln -s /path/to/vhotseat/integrations/comfyui/vhotseat_guard <ComfyUI>/custom_nodes/vhotseat_guard
 ```
+
+Not from the ComfyUI Registry for now: its listing isn't live yet.
 
 Restart ComfyUI. Its log should show `vhotseat_guard: on (…, wait 300s)`. If
 `vhotseat` isn't on ComfyUI's PATH, set `VHOTSEAT_BIN` in its unit's

@@ -139,11 +139,14 @@ differ: `workloads.strata.gate.config` (the Strata JSON from step 1) and
 Install the ComfyUI guard, the node that makes every job ask vhotseat first:
 
 ```sh
-comfy node install vhotseat-guard
+curl -fsSL https://github.com/wandermyz/vhotseat/releases/latest/download/vhotseat_guard.zip -o /tmp/vhotseat_guard.zip
+unzip -o /tmp/vhotseat_guard.zip -d ~/ComfyUI/custom_nodes/
 # or from a checkout of this repo:
-ln -s "$PWD/integrations/comfyui/vhotseat_guard" ~/ComfyUI/custom_nodes/
+#   ln -s "$PWD/integrations/comfyui/vhotseat_guard" ~/ComfyUI/custom_nodes/
 systemctl --user restart comfyui
 ```
+
+To update the guard later, run the same two lines again.
 
 **Check:** `journalctl --user -u comfyui -n 50 | grep vhotseat_guard` shows
 `vhotseat_guard: on`.
