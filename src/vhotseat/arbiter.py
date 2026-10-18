@@ -20,7 +20,7 @@ import time
 
 from . import host, util
 from .drivers.base import Workload
-from .errors import ReleaseFailed, SwitchError
+from .errors import Busy, ReleaseFailed, SwitchError
 from .events import EventLog
 from .lock import GpuLock, Held
 
@@ -175,6 +175,7 @@ class Arbiter:
             util.log(f"already in {name} mode")
             return []
         done = self._make_room(x, wait, self.release_timeout_s, ensure=True, admit=not resident)
+        self.lock.bump()
         if x is None:
             return done
         x.ensure_running()
@@ -226,6 +227,7 @@ class Arbiter:
             if not reason:
                 try:
                     done = self._make_room(x, 0, self.gate_release_timeout_s, ensure=False, deadline=deadline)
+                    self.lock.bump()
                 except SwitchError as e:
                     reason = (f"could not make room in {e.workload.label}: {e}" if e.workload is not None
                               else str(e))
@@ -240,13 +242,31 @@ class Arbiter:
             util.log(f"refusing {x.label} load: {reason}")
             return False
 
+    def _busy_other(self, name: str) -> str | None:
+        """Why another workload mustn't be released now, if one says it's working."""
+        return next((r for y in self._others(name) if y.service_active() and (r := y.busy())), None)
+
+    def _wait_idle(self, name: str, deadline: float) -> None:
+        """Wait, without the lock, until no other workload says it's working, or raise
+        Busy at the deadline. Workloads that only learn they're busy when asked to
+        release (Strata's 409) say nothing here; release() waits for those."""
+        said = False
+        while (reason := self._busy_other(name)):
+            if time.monotonic() >= deadline:
+                raise Busy(reason + " (use --wait SECONDS to wait for it)" if not said else
+                           f"timed out waiting: {reason}")
+            if not said:
+                util.log(f"waiting: {reason}")
+                said = True
+            util.sleep(1.0)
+
     def _take(self, name: str, *, skip_if_held: bool):
         def waiting(_holder):
             util.log("waiting for another switch or hold to finish")
         unless = (lambda h: h == f"hold {name}") if skip_if_held else None
         return self.lock.take(f"switch {name}", unless=unless, on_wait=waiting)
 
-    def switch(self, name: str, wait: float) -> dict:
+    def switch(self, name: str, wait: float, load: bool = True) -> dict:
         """Move the GPU to `name` (or free it, for "none") under the lock. Returns
         {"ok": …} plus "held" or "error"; the caller prints status.
 
@@ -261,20 +281,42 @@ class Arbiter:
                 util.log(f"can't switch to {name} inside `hold {held}`")
                 return {"ok": False, "error": f"inside hold {held}", "inside_hold": held}
             return {"ok": True, "held": held}
-        lock = self._take(name, skip_if_held=True)
-        if lock is None:
-            return {"ok": True, "held": name}
-        with lock:
-            before = self.probe()["mode"]
+        # Wait for the others' running work *without* the lock: a ComfyUI job's guard
+        # needs the lock to start, so holding it while waiting for ComfyUI's queue
+        # to drain would stop the queue (it did, until 2026-10-17: the batch stalled
+        # for the whole wait, then the switch failed). Under the lock, release
+        # without waiting; if work slipped in meanwhile, let go and wait again.
+        deadline = time.monotonic() + wait * util.SCALE
+        while True:
             try:
-                done = self.acquire(name, wait, load=True)
+                self._wait_idle(name, deadline)
             except SwitchError as e:
                 self.events.record("switch", to=name, ok=False, error=str(e))
                 util.log(f"switch to {name} failed: {e}")
-                return {"ok": False, "error": str(e)}
-        if before != name or done:
+                return {"ok": False, "error": str(e), "exception": e}
+            lock = self._take(name, skip_if_held=True)
+            if lock is None:
+                return {"ok": True, "held": name}
+            with lock:
+                # Work that started between the wait and the lock: wait again outside.
+                if self._busy_other(name) and time.monotonic() < deadline:
+                    continue
+                left = max(0.0, (deadline - time.monotonic()) / util.SCALE)
+                before = self.probe()["mode"]
+                try:
+                    done = self.acquire(name, left, load=load)
+                except SwitchError as e:
+                    self.events.record("switch", to=name, ok=False, error=str(e))
+                    util.log(f"switch to {name} failed: {e}")
+                    return {"ok": False, "error": str(e), "exception": e}
+            break
+        # Log a switch when the GPU changed hands. A lazy workload's switch leaves it
+        # "none" (it loads on its first job), so "none" → it with nothing done is no change.
+        x = self.workloads.get(name)
+        lazy_and_free = before == NONE and x is not None and not x.can_load()
+        if done or (before != name and not lazy_and_free):
             self.events.record("switch", to=name, ok=True, previous=before, **({"done": done} if done else {}))
-        return {"ok": True}
+        return {"ok": True, **({"done": done} if done else {})}
 
     def hold(self, name: str, command: list[str], wait: float) -> int:
         """Switch to `name` and keep the GPU there until `command` exits; returns

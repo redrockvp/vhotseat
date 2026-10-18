@@ -22,6 +22,8 @@ workloads:
       always: true                # ask even when it looks unloaded: a load may be under way
       busy_when: [{status: 409}, {path: status, in: [busy]}]
       ok_when: [{status: 200, path: status, in: [unloaded, not loaded]}]
+      # timeout: 30      # seconds the request may take on top of {wait} (default 30)
+      # pre: {post: …}   # a request first, e.g. a proxy's drain (docs/guides/proxy-gate.md)
     confirm: {vram_at_most: 0}    # released once its VRAM is down to this
     load: {post: /load, timeout: 300}   # `switch strata` leaves it loaded
     model: {get: /health, path: model}  # which model it serves (set by strata-model);
@@ -73,6 +75,20 @@ workloads:
     # after a video render). Only when its queue is empty and its last result
     # finished at least history_settle_s ago (a restart wipes /history).
     allow_restart: true
+
+# Local patches to other projects' code that a handover depends on. An update
+# of that project drops a patch silently, and the symptom shows up far away
+# (a release that leaves VRAM behind, so every handover is refused). `vhotseat
+# doctor` checks each marker is still in its file, and says when the installed
+# version has the fix upstream so the patch can go. None needed here since the
+# TTS Audio Suite fix went upstream (5.10.4). An entry looks like:
+#
+#   - name: TTS Audio Suite IndexTTS unload
+#     file: ~/ComfyUI/custom_nodes/TTS-Audio-Suite/engines/index_tts/indextts/infer_v2_5.py
+#     marker: "LOCAL PATCH (vhotseat)"
+#     doc: ~/vhotseat/docs/tts-audio-suite-vram.md
+#     fixed_upstream_in: {version: 5.10.4, version_file: ~/ComfyUI/custom_nodes/TTS-Audio-Suite/pyproject.toml}
+patches: []
 
 events:
   keep: 500            # ~/.local/state/vhotseat/events.jsonl

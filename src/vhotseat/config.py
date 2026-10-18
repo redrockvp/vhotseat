@@ -30,11 +30,11 @@ def state_dir(env=os.environ) -> Path:
 
 # --- validation ----------------------------------------------------------------
 
-GATE_KINDS = ("hook", "plugin", "hold")
+GATE_KINDS = ("hook", "plugin", "proxy", "hold")
 SERVICE_KINDS = ("systemd-user", "systemd")
 COMMON = {"driver", "label", "url", "service", "vram", "idle_vram_mib", "gate", "admission",
           "allow_restart", "restart_timeout_s"}
-GATE_KEYS = {"kind", "timeout", "config", "custom_nodes"}
+GATE_KEYS = {"kind", "timeout", "config", "custom_nodes", "status"}
 DRIVER_KEYS = {
     "http": {"resident", "busy", "release", "confirm", "load", "model"},
     "comfyui": {"restart_above_ram_mib", "history_settle_s"},
@@ -56,7 +56,8 @@ def _request(d, where: str, needs_path=False):
     _check(isinstance(d, dict), where, "expected a mapping with `get:` or `post:`")
     _check(("get" in d) != ("post" in d), where, "needs exactly one of `get:` or `post:`")
     url = d.get("get") or d.get("post")
-    _check(isinstance(url, str) and url.startswith("/"), where, f"the path must start with /, got {url!r}")
+    _check(isinstance(url, str) and url.startswith(("/", "http://", "https://")), where,
+           f"the path must start with / (or be a full http:// URL), got {url!r}")
     if needs_path:
         _check(isinstance(d.get("path"), str), where, "needs `path:`, the JSON field to read")
 
@@ -70,7 +71,7 @@ def _rules(rules, where: str):
 
 def validate(raw) -> dict:
     _check(isinstance(raw, dict), "config", "expected a mapping at the top level")
-    unknown = set(raw) - {"gpu", "workloads", "events"}
+    unknown = set(raw) - {"gpu", "workloads", "events", "patches"}
     _check(not unknown, "config", f"unknown key(s): {', '.join(sorted(unknown))}")
     gpu = raw.get("gpu") or {}
     _check(isinstance(gpu, dict), "gpu", "expected a mapping")
@@ -80,6 +81,21 @@ def validate(raw) -> dict:
     events = raw.get("events") or {}
     _check(isinstance(events, dict), "events", "expected a mapping")
     _int(events, "keep", "events", 10)
+
+    patches = raw.get("patches") or []
+    _check(isinstance(patches, list), "patches", "expected a list of {name, file, marker}")
+    for i, p in enumerate(patches):
+        where = f"patches[{i}]"
+        _check(isinstance(p, dict), where, "expected a mapping")
+        unknown = set(p) - {"name", "file", "marker", "doc", "fixed_upstream_in"}
+        _check(not unknown, where, f"unknown key(s): {', '.join(sorted(unknown))}")
+        for k in ("name", "file", "marker"):
+            _check(isinstance(p.get(k), str) and p[k], f"{where}.{k}", "expected text")
+        fixed = p.get("fixed_upstream_in")
+        if fixed is not None:
+            _check(isinstance(fixed, dict) and isinstance(fixed.get("version"), str)
+                   and isinstance(fixed.get("version_file"), str), f"{where}.fixed_upstream_in",
+                   "expected {version: X.Y.Z, version_file: PATH} (a file with `version = \"…\"`)")
 
     wls = raw.get("workloads")
     _check(isinstance(wls, dict) and wls, "workloads", "expected at least one workload")
@@ -133,12 +149,17 @@ def validate(raw) -> dict:
         _int(gate, "timeout", f"{where}.gate", 1)
         unknown = set(gate) - GATE_KEYS
         _check(not unknown, f"{where}.gate", f"unknown key(s): {', '.join(sorted(unknown))}")
+        if "status" in gate:
+            _check(isinstance(gate["status"], str) and gate["status"].startswith(("http://", "https://")),
+                   f"{where}.gate.status", "expected the proxy's http://…/_vhotseat/status URL")
         if driver == "http":
             _request(w.get("resident"), f"{where}.resident", needs_path=True)
             if "busy" in w:
                 _request(w["busy"], f"{where}.busy", needs_path=True)
             rel = w.get("release")
             _request(rel, f"{where}.release")
+            if "pre" in rel:
+                _request(rel["pre"], f"{where}.release.pre")
             for k in ("busy_when", "ok_when"):
                 if k in rel:
                     _rules(rel[k], f"{where}.release.{k}")

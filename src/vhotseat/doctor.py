@@ -8,12 +8,15 @@ switches, loads or unloads anything.
 """
 
 import json
+import re
 import shutil
 from pathlib import Path
 
 from . import util
 
 OK, WARN, FAIL = "ok", "warn", "fail"
+# VRAM outside every workload above which doctor warns (a desktop alone uses a few hundred MiB).
+OTHER_WARN_MIB = 1024
 
 
 def _gate_hook(w, gate: dict) -> list:
@@ -58,6 +61,64 @@ def _gate_plugin(w, gate: dict) -> list:
     return [(OK, f"{w.name}: gate", f"guard node installed ({guard.resolve()})")]
 
 
+def _gate_proxy(w, gate: dict) -> list:
+    """A proxy gate (docs/guides/proxy-gate.md): it runs, and answers /_vhotseat/status.
+    A proxy that's down doesn't guard anything; clients just can't reach the server."""
+    url = gate.get("status")
+    if not url:
+        return [(WARN, f"{w.name}: gate", "no gate.status set, so the proxy can't be checked")]
+    code, body = util.http("GET", url)
+    if code is None:
+        return [(FAIL, f"{w.name}: gate", f"proxy not answering at {url}: {body}")]
+    if code != 200 or not isinstance(body, dict) or "in_flight" not in body:
+        return [(FAIL, f"{w.name}: gate", f"{url} answered {code} {body!r:.120}, not a proxy's status")]
+    return [(OK, f"{w.name}: gate", f"proxy answers at {url} (in flight: {body['in_flight']})")]
+
+
+def _version_tuple(v: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+def _installed_version(path: Path) -> str | None:
+    """`version = "X.Y.Z"` (pyproject.toml and the like), or None."""
+    try:
+        m = re.search(r"""^\s*version\s*=\s*["']([^"']+)["']""", path.read_text(), re.M)
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def check_patches(cfg: dict | None) -> list:
+    """Local patches to other projects' code (config `patches:`). An update of
+    that project silently drops a patch, and the symptom (a release that leaves
+    VRAM behind, every handover refused) shows up far from the cause: catch it
+    here instead. Once upstream ships the fix, say the patch can go."""
+    out = []
+    for p in (cfg or {}).get("patches") or []:
+        where = f"patch: {p['name']}"
+        f = Path(p["file"]).expanduser()
+        try:
+            present = p["marker"] in f.read_text()
+        except OSError as e:
+            out.append((FAIL, where, f"can't read {f}: {e.strerror}"))
+            continue
+        fixed = p.get("fixed_upstream_in")
+        have = _installed_version(Path(fixed["version_file"]).expanduser()) if fixed else None
+        upstream_has_it = bool(have and _version_tuple(have) >= _version_tuple(fixed["version"]))
+        doc = f"; see {p['doc']}" if p.get("doc") else ""
+        if present and upstream_has_it:
+            out.append((WARN, where, f"still applied, but version {have} has the fix upstream "
+                        f"(since {fixed['version']}): the local patch can go{doc}"))
+        elif present:
+            out.append((OK, where, f"applied ({f.name})" + (f"; upstream has it from {fixed['version']}, "
+                                                             f"installed {have}" if fixed else "")))
+        elif upstream_has_it:
+            out.append((OK, where, f"not needed: version {have} has the fix upstream; remove this entry"))
+        else:
+            out.append((FAIL, where, f"missing from {f}: an update dropped it; re-apply it{doc}"))
+    return out
+
+
 def checks(arbiter, cfg: dict | None) -> list:
     out = []
     g = arbiter.snapshot()
@@ -65,7 +126,14 @@ def checks(arbiter, cfg: dict | None) -> list:
         out.append((FAIL, "gpu", g["error"]))
     else:
         out.append((OK, "gpu", f"{arbiter.gpu.name}: {g['free_mib']} of {g['total_mib']} MiB free"))
+        # VRAM no configured workload owns: a desktop, a game, or a server started by
+        # hand outside its service, which no gate protects (seen 2026-10-17: a trial
+        # llama-server left running outside its unit). Admission can't see it coming.
+        if g["other_mib"] > OTHER_WARN_MIB:
+            out.append((WARN, "gpu: other", f"{g['other_mib']} MiB held by processes that aren't a configured "
+                        "workload; nothing gates them. `nvidia-smi` shows which."))
     ram = arbiter.machine_ram()
+    out += check_patches(cfg)
     out.append((FAIL, "ram", ram["error"]) if "error" in ram else
                (OK, "ram", f"{ram['available_mib']} of {ram['total_mib']} MiB available"))
     for w in arbiter.workloads.values():
@@ -83,6 +151,8 @@ def checks(arbiter, cfg: dict | None) -> list:
             out += _gate_hook(w, w.gate)
         elif kind == "plugin":
             out += _gate_plugin(w, w.gate)
+        elif kind == "proxy":
+            out += _gate_proxy(w, w.gate)
         else:
             out.append((OK, f"{w.name}: gate", "hold: guarded only while run under `vhotseat hold`"))
         per = w.admission.get("by_model") or {}
@@ -114,3 +184,71 @@ def run(arbiter, cfg: dict | None, json_out: bool) -> int:
         for s, c, d in results:
             print(f"{mark[s]}  {c}: {d}")
     return 1 if any(s == FAIL for s, _, _ in results) else 0
+
+
+def exercise(arbiter, name: str, wait: float, json_out: bool) -> int:
+    """Run one real cycle on a workload, under the lock, and time each step:
+    take the GPU for it (releasing the others), load it when it can be loaded
+    ahead of a request, then release it and confirm its VRAM came back. Ends
+    with the GPU free. This is the test for a new driver: everything it would
+    do in a real handover, in one go."""
+    import time
+
+    from .arbiter import NONE
+    from .errors import SwitchError
+
+    w = arbiter.workloads[name]
+    steps = []
+
+    def step(what: str, fn) -> bool:
+        t = time.monotonic()
+        try:
+            detail = fn() or ""
+        except SwitchError as e:
+            steps.append((FAIL, what, f"{e}", time.monotonic() - t))
+            return False
+        steps.append((OK, what, detail, time.monotonic() - t))
+        return True
+
+    def vram():
+        return arbiter.snapshot()[f"{name}_mib"]
+
+    if (busy := w.busy()):
+        steps.append((FAIL, "idle", busy, 0.0))
+    else:
+        lock = arbiter.lock.take(f"switch {name}", on_wait=lambda _h: util.log("waiting for another switch or hold"))
+        with lock:
+            ok = step("take the GPU", lambda: "; ".join(arbiter.acquire(name, wait, load=False)) or "others released")
+            if ok and w.can_load():
+                ok = step("load", lambda: (w.load(wait), f"{vram()} MiB of VRAM")[1])
+                if ok:
+                    s = arbiter.probe()
+                    if not w.active(s[name], s["gpu"]):
+                        steps.append((FAIL, "resident", f"loaded, but `resident` doesn't say so ({s[name]})", 0.0))
+                        ok = False
+                    else:
+                        steps.append((OK, "resident", "`resident` says loaded", 0.0))
+            elif ok:
+                steps.append((OK, "load", "loads on its own first request: skipped", 0.0))
+            if ok:
+                before = vram()
+                ok = step("release", lambda: "; ".join(w.release(wait, arbiter.release_timeout_s))
+                          or f"{before} → {vram()} MiB")
+            if ok:
+                s = arbiter.probe()
+                if w.active(s[name], s["gpu"]):
+                    steps.append((FAIL, "released", f"still resident after release ({s[name]}, {vram()} MiB)", 0.0))
+                else:
+                    steps.append((OK, "released", f"{vram()} MiB left (idle: ≤ {w.idle_vram_mib})", 0.0))
+        arbiter.events.record("exercise", workload=name, ok=all(s == OK for s, *_ in steps),
+                              steps=[{"step": n, "ok": s == OK, "s": round(t, 1), "detail": d} for s, n, d, t in steps])
+        if arbiter.probe()["mode"] not in (NONE, name):
+            util.log("the GPU isn't free after the exercise; run `vhotseat status`")
+
+    if json_out:
+        print(json.dumps([{"status": s, "step": n, "detail": d, "seconds": round(t, 1)} for s, n, d, t in steps]))
+    else:
+        mark = {OK: "ok  ", WARN: "warn", FAIL: "FAIL"}
+        for s, n, d, t in steps:
+            print(f"{mark[s]}  {name}: {n} ({t:.1f}s){': ' + d if d else ''}")
+    return 1 if any(s == FAIL for s, *_ in steps) else 0

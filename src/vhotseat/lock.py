@@ -45,6 +45,35 @@ class Held:
 class GpuLock:
     def __init__(self, path: Path):
         self.path = path
+        # Bumped by every handover (see bump()); read without the lock.
+        self.generation_path = path.with_name(path.stem + ".generation")
+
+    def generation(self) -> int:
+        """How many handovers this GPU has seen. A long-running gate (a proxy)
+        caches "my workload owns the GPU" together with this number and skips the
+        lock while it's unchanged: one small file read per request, no nvidia-smi,
+        no HTTP. Any switch, hold or gate that makes room bumps it."""
+        try:
+            return int(self.generation_path.read_text() or 0)
+        except (OSError, ValueError):
+            return 0
+
+    def bump(self) -> int:
+        """Called with the lock held, after the GPU changed hands (or might have)."""
+        n = self.generation() + 1
+        tmp = self.generation_path.with_suffix(".tmp")
+        tmp.write_text(str(n))
+        tmp.replace(self.generation_path)
+        return n
+
+    def holder(self) -> str:
+        """What the current holder is doing ("switch comfy", "hold comfy"), or ""
+        when the lock is free (releasing it clears the note). A plain read: the
+        lock isn't touched."""
+        try:
+            return self.path.read_text().strip()
+        except OSError:
+            return ""
 
     def try_take(self, holder: str) -> Held | str:
         """Take the lock if it's free; otherwise return the current holder's note."""

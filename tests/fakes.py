@@ -323,7 +323,10 @@ class FakeGpu:
         if self.error:
             return {"total_mib": None, "free_mib": None, **{f"{n}_mib": 0 for n in selectors}, "other_mib": 0,
                     "error": self.error}
-        used = {"strata_mib": self.strata.vram, "comfy_mib": self.comfy.vram, "other_mib": self.other}
+        if getattr(self, "strata_as_other", False):   # a workload the backend can't attribute
+            used = {"strata_mib": 0, "comfy_mib": self.comfy.vram, "other_mib": self.other + self.strata.vram}
+        else:
+            used = {"strata_mib": self.strata.vram, "comfy_mib": self.comfy.vram, "other_mib": self.other}
         return {"total_mib": 16303, "free_mib": 16303 - sum(used.values()), **used}
 
 

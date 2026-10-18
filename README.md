@@ -113,11 +113,9 @@ after installing or changing it.
 - **It's a private API:** an update can break it. The guard switches itself off
   with an error in the log if the method disappears. After every ComfyUI update,
   follow [docs/comfyui-updates.md](docs/comfyui-updates.md).
-- **TTS Audio Suite:** IndexTTS needs a local patch to fully leave the GPU on
-  unload. Re-apply it after every suite update; see
-  [docs/tts-audio-suite-vram.md](docs/tts-audio-suite-vram.md). Sending it
-  upstream is planned in
-  [docs/plans/2026-10-16-upstream-indextts-unload-fix.md](docs/plans/2026-10-16-upstream-indextts-unload-fix.md).
+- **TTS Audio Suite:** IndexTTS used to keep ~2 GB after unload; our fix is
+  upstream since 5.10.4, so no local patch is needed any more. See
+  [docs/tts-audio-suite-vram.md](docs/tts-audio-suite-vram.md).
 - **Env:**
   - `VHOTSEAT_GUARD=0` disables it;
   - `VHOTSEAT_GUARD_WAIT_S` sets how long it waits;

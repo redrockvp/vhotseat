@@ -6,6 +6,8 @@
       resident: {get: /health, path: loaded}          # loaded = this field is true
       busy:     {get: /status, path: busy}            # optional; else learned from release
       release:
+        pre: {post: http://127.0.0.1:11434/_vhotseat/drain?wait={wait}}   # optional:
+                                                      # first, e.g. a proxy stops forwarding
         post: /unload?wait={wait}
         always: true                                  # ask even when it looks unloaded
         busy_when: [{status: 409}, {path: status, in: [busy]}]
@@ -16,7 +18,9 @@
                                                       # for admission.by_model
 
 Paths are dotted (`a.b.0.c`; a leading `$.` is allowed). `{wait}` in a URL is
-replaced by the seconds the release may wait for running work.
+replaced by the seconds the release may wait for running work. A request path
+starting with http:// goes to that address instead of `url` (a proxy in front
+of the server, say).
 """
 
 from dataclasses import dataclass, field
@@ -73,7 +77,8 @@ class HttpWorkload(Workload):
     def _call(self, spec: dict, timeout: float = 5.0, **fmt):
         method, path = _request(spec)
         body = {} if method == "POST" else None
-        return util.http(method, self.url + path.format(**fmt), body, timeout=timeout)
+        url = path if path.startswith(("http://", "https://")) else self.url + path
+        return util.http(method, url.format(**fmt), body, timeout=timeout)
 
     def probe(self, gpu: dict) -> dict:
         st = {"service": self.service_active(), "reachable": False, "loaded": False}
@@ -111,6 +116,13 @@ class HttpWorkload(Workload):
 
     def release(self, wait: float, timeout: float) -> list[str]:
         spec = self.spec["release"]
+        if pre := spec.get("pre"):
+            # e.g. a proxy: stop forwarding new requests, let running ones finish (up to wait).
+            code, body = self._call(pre, timeout=wait + 30, wait=int(wait))
+            if code == 409 or (code is not None and code >= 500 and lookup(body, "status") == "busy"):
+                raise Busy(f"{self.label} is still answering (use --wait SECONDS to let it finish)")
+            if code != 200:
+                raise SwitchError(f"{self.label} {_request(pre)[1].split('?')[0]} failed: {code} {body}")
         code, body = self._call(spec, timeout=wait + spec.get("timeout", 30), wait=int(wait))
         if any(matches(r, code, body) for r in spec.get("busy_when", [])):
             raise Busy(f"{self.label} is answering or loading (use --wait SECONDS to let it finish)")

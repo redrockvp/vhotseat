@@ -5,6 +5,7 @@
   vhotseat hold NAME [--wait S] -- CMD...   give it to NAME and keep it until CMD exits
   vhotseat gate NAME                        for hook gates (a server's pre-load hook): may NAME load?
   vhotseat doctor [--json]                  check the config, the GPU and every workload and gate
+  vhotseat doctor --exercise NAME [--wait S]   run a real cycle on NAME (take, load, release), timed
 
 Exit codes: 0 ok · 1 failed / refused · 2 usage or bad config. `hold` exits with
 CMD's own exit code once CMD has started.
@@ -43,6 +44,10 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp.add_argument("name")
     sp = sub.add_parser("doctor", help="check the config, the GPU, and every workload and gate")
     sp.add_argument("--json", action="store_true")
+    sp.add_argument("--exercise", metavar="NAME",
+                    help="run a real cycle on NAME: take the GPU, load, release, confirm (it unloads things)")
+    sp.add_argument("--wait", type=float, default=60, metavar="SECONDS",
+                    help="with --exercise: how long to wait for running work")
     args = p.parse_args(argv)
 
     if arbiter is None:
@@ -55,7 +60,7 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
             return EXIT_FAIL if args.cmd == "gate" else EXIT_USAGE
 
     names = set(arbiter.workloads)
-    name = getattr(args, "name", None)
+    name = getattr(args, "name", None) or getattr(args, "exercise", None)
     if name is not None and name not in names and not (args.cmd == "switch" and name == NONE):
         util.log(f"no workload named {name!r}; configured: {', '.join(sorted(names))}")
         return EXIT_FAIL if args.cmd == "gate" else EXIT_USAGE
@@ -76,9 +81,12 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
             p.error("hold needs a command after --")
         return arbiter.hold(name, command, args.wait)
     if args.cmd == "doctor":
-        from .doctor import run
+        from .doctor import exercise, run
+        if args.exercise:
+            return exercise(arbiter, args.exercise, args.wait, json_out)
         return run(arbiter, cfg, json_out)
     result = arbiter.switch(name, args.wait)
+    result.pop("exception", None)
     if result.pop("inside_hold", None):
         return EXIT_FAIL
     emit(arbiter.probe(), result)
