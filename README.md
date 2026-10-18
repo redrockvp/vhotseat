@@ -1,5 +1,34 @@
 # vhotseat
 
+**Want your local LLM agent to drive ComfyUI on the same consumer graphics
+card?** Without coordination, the first video render lands on top of the
+loaded LLM, and something runs out of memory. **Boom, OOM!**
+
+vhotseat makes [Strata](https://github.com/Niko1221/Strata) and
+[ComfyUI](https://github.com/comfyanonymous/ComfyUI) take turns on VRAM *and*
+RAM, so an agent session can hand work to ComfyUI and come back for the
+results safely.
+
+**Tested on:**
+
+| Part | Tested with |
+| --- | --- |
+| GPU / RAM | RTX 5070 Ti (16 GB VRAM), 64 GB RAM |
+| LLM | Strata serving Qwen3.8-Flash-Next IQ3_XXS (128K context) |
+| Agent | [pi](https://github.com/earendil-works/pi) |
+| ComfyUI | MiniMax H3 video (int8 `fl2va` / `ref2va`) |
+
+With this setup, pi drove long-running video workflows unattended, over
+several rounds of render → review → render, overnight.
+
+**→ [Quick start for this exact setup](docs/guides/quickstart-strata-pi-comfyui.md)**:
+a step-by-step guide that you, or your coding agent, can follow.
+
+Strata and ComfyUI are just the built-in examples: any server with a "drop
+your model" API can join through a config entry or a small driver.
+
+## Overview
+
 **Take turns on one GPU.** Your local LLM agent drives ComfyUI on the same
 card: when it queues a render, the LLM is unloaded; when it asks the LLM its
 next question, ComfyUI is freed. Neither ever loads on top of the other, and
