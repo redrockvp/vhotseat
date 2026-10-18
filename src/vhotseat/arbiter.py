@@ -225,8 +225,12 @@ class Arbiter:
             gpu = self.snapshot()
             reason = gpu.get("error") or next((r for y in others if (r := y.busy())), None)
             if not reason:
+                # Already loaded (a hook fired again, or `vhotseat gate` run by hand):
+                # its own memory isn't a shortfall, so don't restart anyone for it.
+                resident = x.active(x.probe(gpu), gpu)
                 try:
-                    done = self._make_room(x, 0, self.gate_release_timeout_s, ensure=False, deadline=deadline)
+                    done = self._make_room(x, 0, self.gate_release_timeout_s, ensure=False, deadline=deadline,
+                                           admit=not resident)
                     self.lock.bump()
                 except SwitchError as e:
                     reason = (f"could not make room in {e.workload.label}: {e}" if e.workload is not None
