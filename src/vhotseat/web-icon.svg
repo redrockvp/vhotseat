@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">vhotseat — GPU swap</title>
+  <desc id="desc">A blue GPU chip containing orange and blue arrows pointing in opposite directions, representing workloads taking turns.</desc>
+  <g fill="#20A7F0">
+    <rect x="82" y="16" width="20" height="24" rx="4"/>
+    <rect x="118" y="16" width="20" height="24" rx="4"/>
+    <rect x="154" y="16" width="20" height="24" rx="4"/>
+    <rect x="82" y="216" width="20" height="24" rx="4"/>
+    <rect x="118" y="216" width="20" height="24" rx="4"/>
+    <rect x="154" y="216" width="20" height="24" rx="4"/>
+    <rect x="16" y="82" width="24" height="20" rx="4"/>
+    <rect x="16" y="118" width="24" height="20" rx="4"/>
+    <rect x="16" y="154" width="24" height="20" rx="4"/>
+    <rect x="216" y="82" width="24" height="20" rx="4"/>
+    <rect x="216" y="118" width="24" height="20" rx="4"/>
+    <rect x="216" y="154" width="24" height="20" rx="4"/>
+  </g>
+  <rect x="54" y="54" width="148" height="148" rx="20" stroke="#20A7F0" stroke-width="12"/>
+  <g stroke="#FF922E" stroke-width="17" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M96 103H172M151 82L172 103L151 124"/>
+  </g>
+  <g stroke="#20A7F0" stroke-width="17" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M160 153H84M105 132L84 153L105 174"/>
+  </g>
+</svg>

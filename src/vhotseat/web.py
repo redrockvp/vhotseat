@@ -103,6 +103,7 @@ class Dashboard:
     def handler(self):
         dash = self
         page = resources.files("vhotseat").joinpath("web.html").read_bytes()
+        icon = resources.files("vhotseat").joinpath("web-icon.svg").read_bytes()
 
         class Handler(BaseHTTPRequestHandler):
             def _send(self, code: int, body: bytes, kind: str) -> None:
@@ -117,6 +118,8 @@ class Dashboard:
                 url = urlparse(self.path)
                 if url.path in ("/", "/index.html"):
                     return self._send(200, page, "text/html; charset=utf-8")
+                if url.path in ("/favicon.svg", "/favicon.ico"):
+                    return self._send(200, icon, "image/svg+xml")
                 try:
                     code, body = dash.api(url.path, parse_qs(url.query))
                 except Exception as e:  # noqa: BLE001 - report it to the page rather than drop the connection

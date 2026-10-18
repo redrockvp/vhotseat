@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>vhotseat</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<script>
+  // Before the first paint, so a chosen theme never flashes the other one.
+  try { const t = localStorage.getItem("vhotseat-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
 <style>
 :root {
   color-scheme: light;
@@ -13,8 +18,9 @@
   --other: #b9b8b0; --none: #e1e0d9;
   --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
 }
+/* Dark: the OS setting, unless the theme button picked light; or the button picked dark. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     color-scheme: dark;
     --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
     --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.05);
@@ -22,12 +28,24 @@
     --other: #5c5b57; --none: #2c2c2a;
   }
 }
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.05);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --other: #5c5b57; --none: #2c2c2a;
+}
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
 body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
 main { max-width: 1280px; margin: 0 auto; padding: 16px 24px 48px; }
-header { display: flex; align-items: baseline; gap: 6px 16px; flex-wrap: wrap; }
-h1 { font-size: 20px; margin: 0; font-weight: 650; }
+header { display: flex; align-items: center; gap: 6px 12px; flex-wrap: wrap; }
+h1 { font-size: 20px; margin: 0; font-weight: 650; display: flex; align-items: center; gap: 8px; }
+h1 img { width: 26px; height: 26px; }
+.theme { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; border: 0; border-radius: 8px; padding: 6px 10px;
+  background: var(--surface); box-shadow: 0 0 0 1px var(--ring); color: var(--ink-2); font: inherit; font-size: 13px; cursor: pointer; }
+.theme:hover { background: var(--wash); color: var(--ink); }
+.theme svg { width: 16px; height: 16px; flex: none; }
 h2 { font-size: 17px; margin: 0; font-weight: 650; }
 h3 { font-size: 14px; margin: 0; font-weight: 600; }
 .sub { color: var(--ink-2); font-size: 13px; }
@@ -107,6 +125,10 @@ td.nw { color: var(--ink); }
   .tile { padding: 8px 10px; }
   .tile .value { font-size: 21px; }
   .owner-now { font-size: 24px; }
+  header { display: grid; grid-template-columns: 1fr auto; }
+  header .sub { grid-row: 2; grid-column: 1 / -1; }
+  .theme .label { display: none; }
+  .theme { padding: 7px; }
   .bar { padding: 8px 0; }
   .scroll { max-height: 70vh; }
   table, tbody, tr, td { display: block; }
@@ -121,8 +143,9 @@ td.nw { color: var(--ink); }
 <body>
 <main>
   <header>
-    <h1>vhotseat</h1>
+    <h1><img src="/favicon.svg" alt="">vhotseat</h1>
     <span class="sub" id="subtitle">connecting…</span>
+    <button type="button" class="theme" id="theme"></button>
   </header>
   <div class="bar" role="toolbar" aria-label="Time range">
     <div class="seg" id="ranges"></div>
@@ -765,6 +788,27 @@ window.addEventListener("resize", () => {
   clearTimeout(resizeTimer); resizeTimer = setTimeout(renderCharts, 150);
 });
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+
+// The theme button cycles system → light → dark; the choice is kept in this browser.
+const THEMES = {
+  system: { label: "System", next: "light", icon: '<rect x="2" y="3" width="12" height="8" rx="1.5"/><path d="M5.5 14h5M8 11v3"/>' },
+  light: { label: "Light", next: "dark", icon: '<circle cx="8" cy="8" r="3"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3 3l1 1M12 12l1 1M3 13l1-1M12 4l1-1"/>' },
+  dark: { label: "Dark", next: "system", icon: '<path d="M13.5 9.5A5.5 5.5 0 0 1 6.5 2.5a5.5 5.5 0 1 0 7 7z"/>' },
+};
+function applyTheme(name) {
+  const t = THEMES[name] ? name : "system";
+  if (t === "system") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+  try { if (t === "system") localStorage.removeItem("vhotseat-theme"); else localStorage.setItem("vhotseat-theme", t); } catch (e) {}
+  const b = $("theme");
+  b.innerHTML = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${THEMES[t].icon}</svg>`;
+  b.append(el("span", { class: "label" }, THEMES[t].label));
+  b.title = `Theme: ${THEMES[t].label}. Click for ${THEMES[THEMES[t].next].label}.`;
+  b.setAttribute("aria-label", b.title);
+  b.onclick = () => applyTheme(THEMES[t].next);
+  // Chart colours are read from the CSS when drawn: redraw in the new theme.
+  render();
+}
+applyTheme(document.documentElement.dataset.theme || "system");
 
 // The range is kept in the URL (#24h), so a bookmark opens on it.
 const fromHash = PRESETS.find(([label]) => `#${label}` === location.hash);

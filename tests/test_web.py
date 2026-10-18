@@ -131,6 +131,8 @@ def test_web_serves_the_page_and_history_recorded_before_it_started(rig, server)
     assert [e["to"] for e in events if e["event"] == "switch"][:2] == ["strata", "comfy"]
     assert get(f"{server}/api/history?since=x")[0] == 400
     assert get(f"{server}/api/nope")[0] == 404
+    code, icon = get(server + "/favicon.svg")
+    assert code == 200 and icon.startswith(b"<svg") and b'href="/favicon.svg"' in page
 
 
 def test_sampler_samples_in_the_background(rig, monkeypatch):

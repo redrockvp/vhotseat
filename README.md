@@ -181,7 +181,8 @@ One page, refreshed every 5 s, that works on a phone too:
 
 Every chart marks each event with a dashed line: hover it to see the event,
 click it to open it in the table. Ranges run from 15 minutes to the whole
-retention window. It only reads; it never switches anything.
+retention window. A button in the header switches the theme (system, light or
+dark; kept in the browser). It only reads; it never switches anything.
 
 **History doesn't need the page open.** Every vhotseat command records into
 `~/.local/state/vhotseat/telemetry.db` (SQLite) as it runs: each status probe
