@@ -1,14 +1,15 @@
-"""vhotseat_guard: make every ComfyUI job take the GPU from Strata first.
+"""vhotseat_guard: make every ComfyUI job take the GPU through vhotseat first.
 
-ComfyUI and Strata (local LLM) can't hold VRAM at the same time. Strata's
-side is guarded by its before_load hook (`vhotseat gate strata`); this is the
+ComfyUI and the other workloads vhotseat manages (a local LLM, say) can't hold
+VRAM at the same time. Each of them asks vhotseat before it loads; this is the
 ComfyUI side. Before each job runs, it calls
 
     vhotseat switch comfy --wait VHOTSEAT_GUARD_WAIT_S
 
-which lets an answer Strata is writing finish, then unloads Strata. If that
-fails, the job fails visibly: an `execution_error` in the UI and history,
-with vhotseat's reason. It never runs on top of a loaded Strata.
+which lets the other workloads finish what they're running (an answer the LLM
+is writing), then releases them. If that fails, the job fails visibly: an
+`execution_error` in the UI and history, with vhotseat's reason. It never runs
+on top of another loaded workload.
 
 How: it wraps `execution.PromptExecutor.execute_async`, the method ComfyUI's
 prompt worker thread calls once per job. That thread may block, so waiting
@@ -19,10 +20,8 @@ breaking ComfyUI.
 
 Env:
   VHOTSEAT_BIN            default: vhotseat on PATH, else ~/.local/bin/vhotseat
-  VHOTSEAT_GUARD_WAIT_S   how long to wait for Strata to finish an answer (default 300)
+  VHOTSEAT_GUARD_WAIT_S   how long to wait for running work elsewhere to finish (default 300)
   VHOTSEAT_GUARD          set to 0 to disable
-
-Until 2026-10-17 this was gpu_workload_guard, with GPU_WORKLOAD_* variables.
 """
 
 import functools

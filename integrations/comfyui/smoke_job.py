@@ -2,19 +2,21 @@
 """Queue one tiny ComfyUI job (1-step SDXL ending in PreviewImage, so nothing
 is written to output/) and print how it ended. Used by docs/comfyui-updates.md.
 
-    smoke_job.py [--no-wait] [--ckpt NAME]
+    smoke_job.py --ckpt NAME [--no-wait] [--url URL]
 """
 import argparse
 import json
+import os
 import time
 import urllib.request
 
-URL = "http://127.0.0.1:8188"
-
 ap = argparse.ArgumentParser()
 ap.add_argument("--no-wait", action="store_true", help="queue and exit")
-ap.add_argument("--ckpt", default="sd_xl_base_1.0.safetensors")
+ap.add_argument("--ckpt", required=True, help="an SDXL checkpoint installed in ComfyUI")
+ap.add_argument("--url", default=os.environ.get("COMFY_URL", "http://127.0.0.1:8188"),
+                help="ComfyUI's address (default: $COMFY_URL, else http://127.0.0.1:8188)")
 args = ap.parse_args()
+URL = args.url.rstrip("/")
 
 wf = {
     "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": args.ckpt}},

@@ -1,0 +1,16 @@
+[project]
+name = "vhotseat-guard"
+description = "Makes every ComfyUI job take the GPU through vhotseat first, so ComfyUI and a local LLM take turns on one GPU instead of loading on top of each other. Needs the vhotseat CLI."
+version = "0.1.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/wandermyz/vhotseat"
+Documentation = "https://github.com/wandermyz/vhotseat#readme"
+"Bug Tracker" = "https://github.com/wandermyz/vhotseat/issues"
+
+[tool.comfy]
+PublisherId = "wandermyz"
+DisplayName = "vhotseat guard"
