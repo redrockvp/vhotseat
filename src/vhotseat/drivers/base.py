@@ -1,7 +1,7 @@
 """The contract between the arbiter and a workload driver."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 from .. import util
 from ..errors import ReleaseFailed, SwitchError
@@ -131,4 +131,4 @@ class Workload:
                         f"{self.label} to answer after its restart")
 
 
-__all__ = ["Context", "Workload", "ReleaseFailed", "SwitchError"]
+__all__ = ["Context", "ReleaseFailed", "SwitchError", "Workload"]

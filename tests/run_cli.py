@@ -13,8 +13,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "tests"))
 
-from conftest import example_config  # noqa: E402
-from vhotseat import cli, setup  # noqa: E402
+from conftest import example_config
+
+from vhotseat import cli, setup
 
 
 def _vram(url):

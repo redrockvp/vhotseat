@@ -82,7 +82,7 @@ def _version_tuple(v: str) -> tuple:
 def _installed_version(path: Path) -> str | None:
     """`version = "X.Y.Z"` (pyproject.toml and the like), or None."""
     try:
-        m = re.search(r"""^\s*version\s*=\s*["']([^"']+)["']""", path.read_text(), re.M)
+        m = re.search(r"""^\s*version\s*=\s*["']([^"']+)["']""", path.read_text(), re.MULTILINE)
     except OSError:
         return None
     return m.group(1) if m else None

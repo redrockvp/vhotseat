@@ -2,15 +2,14 @@
 `vhotseat` CLI, GPU attribution and doctor."""
 
 import json
-import textwrap
 import time
 from pathlib import Path
 
 import pytest
-
 from fakes import FakeComfy, FakeGpu, FakeHost, FakeStrata
+
 from vhotseat import cli, config, doctor, gpu, setup
-from vhotseat.drivers.http import lookup, matches, MISSING
+from vhotseat.drivers.http import MISSING, lookup, matches
 
 ROOT = Path(__file__).resolve().parent.parent
 

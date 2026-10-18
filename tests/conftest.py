@@ -2,8 +2,8 @@ import json
 from pathlib import Path
 
 import pytest
-
 from fakes import FakeComfy, FakeGpu, FakeHost, FakeStrata
+
 from vhotseat import cli, config, setup, util
 
 ROOT = Path(__file__).resolve().parent.parent

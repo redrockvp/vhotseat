@@ -113,7 +113,7 @@ def validate(raw) -> dict:
         svc = w.get("service")
         if svc is not None:
             _check(isinstance(svc, dict) and len(svc) == 1 and next(iter(svc)) in SERVICE_KINDS,
-                   f"{where}.service", f"expected {{systemd-user: UNIT}} or {{systemd: UNIT}}")
+                   f"{where}.service", "expected {systemd-user: UNIT} or {systemd: UNIT}")
         vram = w.get("vram")
         if vram is not None:
             _check(isinstance(vram, dict) and len(vram) == 1 and next(iter(vram)) in ("unit", "process"),

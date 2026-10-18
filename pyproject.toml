@@ -3,11 +3,35 @@ name = "vhotseat"
 version = "0.1.0"
 description = "Take turns on one GPU: hand it between workloads without interrupting work."
 requires-python = ">=3.10"
+readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "wandermyz" }]
+keywords = ["gpu", "vram", "comfyui", "llm", "scheduler"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Hardware",
+]
 dependencies = ["pyyaml>=6"]
+
+[project.urls]
+Homepage = "https://github.com/wandermyz/vhotseat"
+Issues = "https://github.com/wandermyz/vhotseat/issues"
 
 [project.scripts]
 vhotseat = "vhotseat.cli:main"
+comfy-render = "vhotseat.kit.comfy_render:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
 
 [build-system]
 requires = ["hatchling"]
@@ -19,3 +43,17 @@ packages = ["src/vhotseat"]
 [tool.pytest.ini_options]
 pythonpath = ["src", "tests"]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = ["E501"]  # long lines are the house style
+
+[tool.ruff.lint.per-file-ignores]
+"tests/run_cli.py" = ["E402"]  # sets sys.path before importing vhotseat
+
+[tool.hatch.build.targets.sdist]
+exclude = [".github", "docs/plans", "docs/reports", "strata-model"]

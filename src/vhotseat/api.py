@@ -29,7 +29,7 @@ from .arbiter import NONE, Arbiter
 from .errors import Busy, ReleaseFailed, SwitchError
 from .setup import build
 
-__all__ = ["Seat", "open", "Busy", "SwitchError", "ReleaseFailed"]
+__all__ = ["Busy", "ReleaseFailed", "Seat", "SwitchError", "open"]
 
 
 class Seat:
@@ -84,6 +84,6 @@ class Seat:
         return result.get("done", [])
 
 
-def open(config_path: str | os.PathLike | None = None) -> Seat:  # noqa: A001 (mirrors builtins on purpose)
+def open(config_path: str | os.PathLike | None = None) -> Seat:  # mirrors builtins.open on purpose
     path = Path(config_path) if config_path else cfgmod.default_path()
     return Seat(build(cfgmod.load(path)))

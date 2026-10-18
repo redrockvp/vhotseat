@@ -6,8 +6,6 @@ the ComfyUI restart cases from the README (tested by hand on 2026-10-16).
 """
 
 import json
-import os
-import subprocess
 import sys
 import threading
 import time
@@ -369,7 +367,7 @@ def test_switch_strata_restarts_too(rig):
 def _guard(rig, monkeypatch):
     """The real guard node's take_gpu(), running vhotseat as a subprocess
     (tests/run_cli.py: the real CLI with GPU and services read from the fakes)."""
-    sys.path.insert(0, str(ROOT / "comfyui"))
+    sys.path.insert(0, str(ROOT / "integrations" / "comfyui"))
     monkeypatch.setenv("VHOTSEAT_BIN", str(ROOT / "tests" / "run_cli.py"))
     monkeypatch.setenv("STRATA_URL", rig.strata.url)
     monkeypatch.setenv("COMFY_URL", rig.comfy.url)

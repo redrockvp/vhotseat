@@ -13,7 +13,6 @@ CMD's own exit code once CMD has started.
 
 import argparse
 import json
-import os
 import sys
 
 from . import config as cfgmod

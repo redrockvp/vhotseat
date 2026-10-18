@@ -1,25 +1,18 @@
 """comfy-render against the fake ComfyUI: batch formats, results, progress, exit codes."""
 
-import importlib.machinery
-import importlib.util
+import importlib
 import json
 import threading
 import time
-from pathlib import Path
 
 import pytest
-
 from fakes import FakeComfy
-
-ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture
 def cr(monkeypatch):
-    loader = importlib.machinery.SourceFileLoader("comfy_render", str(ROOT / "comfy-render"))
-    spec = importlib.util.spec_from_loader("comfy_render", loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
+    # A fresh copy each test: comfy-render keeps its settings in module globals.
+    mod = importlib.reload(importlib.import_module("vhotseat.kit.comfy_render"))
     comfy = FakeComfy()
     monkeypatch.setattr(mod, "COMFY_URL", comfy.url)
     monkeypatch.setattr(mod, "COMFY_DIR", None)
