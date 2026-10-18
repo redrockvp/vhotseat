@@ -95,7 +95,7 @@ sequenceDiagram
     P->>S: chat request (plan the job)
     S->>H: before_load
     H->>L: try-lock (non-blocking) → acquired
-    H->>C: GET /queue → empty; GPU → ComfyUI idle
+    H->>C: GET /queue → empty, GPU → ComfyUI idle
     H->>L: release
     H-->>S: allow (exit 0)
     Note over S: load model ~26 s warm / ~68 s cold
@@ -125,7 +125,7 @@ sequenceDiagram
     P->>S: chat request (+ tool result: 8 paths)
     S->>H: before_load
     H->>L: try-lock → acquired
-    H->>C: GET /queue → empty; GPU → ComfyUI holds ~7 GB
+    H->>C: GET /queue → empty, GPU → ComfyUI holds ~7 GB
     H->>C: POST /free (unload_models)
     H->>H: wait until ComfyUI VRAM ≤ 1500 MiB (≤ 20 s)
     opt VRAM won't drop, or the LLM's admission needs RAM ComfyUI holds
