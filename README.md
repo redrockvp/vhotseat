@@ -338,6 +338,31 @@ a timeout the unfinished jobs are left in ComfyUI's queue.
   between two jobs. `--hold-wait` is how long to wait for the current owner's
   work first (default 600 s).
 
+## Adding a workload, and the agent kit
+
+**Another server.** Anything that uses the GPU can be a workload: another LLM
+server, a TTS server, a training run. It needs a *driver* (how vhotseat asks
+"loaded? busy?" and says "drop your VRAM") and a *gate* (see above). Most
+servers need no code: the generic `http` driver describes one in YAML.
+[Writing a driver](docs/guides/driver-authoring.md) covers the contract, the
+`http` driver, when a Python driver is worth it, picking a gate, admission and
+testing; [building a proxy gate](docs/guides/proxy-gate.md) is for a server
+with no pre-load hook.
+
+**The agent kit.** [kit/](kit/README.md) makes vhotseat cheap for an agent to
+use, and lets a coding agent set it up and keep it working. It holds
+`comfy-render` and a set of [Agent Skills](https://agentskills.io) for Claude
+Code, Codex, pi and others:
+
+- `comfyui-batching`, for the agent on the local LLM: run ComfyUI work in as
+  few batches as possible;
+- for your coding agent: `vhotseat-setup` (install, write the config, install
+  the gates), `vhotseat-add-workload` (the short version of the driver guide),
+  `vhotseat-comfyui-update` and `vhotseat-vram-leak`.
+
+The core doesn't depend on the kit. Install a skill by symlinking its folder
+into your agent's skills folder; [kit/README.md](kit/README.md) shows how.
+
 ## Development
 
 ```sh
