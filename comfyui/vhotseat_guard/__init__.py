@@ -1,10 +1,10 @@
-"""gpu_workload_guard: make every ComfyUI job take the GPU from Strata first.
+"""vhotseat_guard: make every ComfyUI job take the GPU from Strata first.
 
 ComfyUI and Strata (local LLM) can't hold VRAM at the same time. Strata's
 side is guarded by its before_load hook (`vhotseat gate strata`); this is the
 ComfyUI side. Before each job runs, it calls
 
-    vhotseat switch comfy --wait GPU_WORKLOAD_GUARD_WAIT_S
+    vhotseat switch comfy --wait VHOTSEAT_GUARD_WAIT_S
 
 which lets an answer Strata is writing finish, then unloads Strata. If that
 fails, the job fails visibly: an `execution_error` in the UI and history,
@@ -18,9 +18,11 @@ method is missing, the guard logs an error and stays off rather than
 breaking ComfyUI.
 
 Env:
-  GPU_WORKLOAD_BIN            default: vhotseat on PATH, else ~/.local/bin/vhotseat
-  GPU_WORKLOAD_GUARD_WAIT_S   how long to wait for Strata to finish an answer (default 300)
-  GPU_WORKLOAD_GUARD          set to 0 to disable
+  VHOTSEAT_BIN            default: vhotseat on PATH, else ~/.local/bin/vhotseat
+  VHOTSEAT_GUARD_WAIT_S   how long to wait for Strata to finish an answer (default 300)
+  VHOTSEAT_GUARD          set to 0 to disable
+
+Until 2026-10-17 this was gpu_workload_guard, with GPU_WORKLOAD_* variables.
 """
 
 import functools
@@ -29,16 +31,16 @@ import os
 import shutil
 import subprocess
 
-log = logging.getLogger("gpu_workload_guard")
+log = logging.getLogger("vhotseat_guard")
 
 NODE_CLASS_MAPPINGS: dict = {}  # no nodes; ComfyUI requires the attribute to load the package
 NODE_DISPLAY_NAME_MAPPINGS: dict = {}
 
-WAIT_S = int(os.environ.get("GPU_WORKLOAD_GUARD_WAIT_S", "300"))
-BIN = os.environ.get("GPU_WORKLOAD_BIN") or shutil.which("vhotseat") or os.path.expanduser(
+WAIT_S = int(os.environ.get("VHOTSEAT_GUARD_WAIT_S", "300"))
+BIN = os.environ.get("VHOTSEAT_BIN") or shutil.which("vhotseat") or os.path.expanduser(
     "~/.local/bin/vhotseat"
 )
-MARKER = "_gpu_workload_guard"
+MARKER = "_vhotseat_guard"
 
 
 class GpuBusy(RuntimeError):
@@ -73,7 +75,7 @@ def _fail_job(executor, prompt_id: str, prompt: dict, reason: str) -> None:
         "node_type": prompt.get(node_id, {}).get("class_type", ""),
         "executed": [],
         "exception_message": f"GPU busy, job not run: {reason}",
-        "exception_type": "gpu_workload_guard.GpuBusy",
+        "exception_type": "vhotseat_guard.GpuBusy",
         "traceback": [],
         "current_inputs": {},
         "current_outputs": [],
@@ -81,17 +83,19 @@ def _fail_job(executor, prompt_id: str, prompt: dict, reason: str) -> None:
 
 
 def install() -> bool:
-    if os.environ.get("GPU_WORKLOAD_GUARD", "1") == "0":
-        log.warning("gpu_workload_guard: disabled by GPU_WORKLOAD_GUARD=0")
+    if os.environ.get("VHOTSEAT_GUARD", "1") == "0":
+        log.warning("vhotseat_guard: disabled by VHOTSEAT_GUARD=0")
         return False
     try:
         import execution
         original = execution.PromptExecutor.execute_async
     except (ImportError, AttributeError) as e:
-        log.error("gpu_workload_guard: OFF, ComfyUI internals changed (%s); "
-                  "jobs are NOT guarded. See gpu-workload/docs/comfyui-updates.md", e)
+        log.error("vhotseat_guard: OFF, ComfyUI internals changed (%s); "
+                  "jobs are NOT guarded. See vhotseat's docs/comfyui-updates.md", e)
         return False
-    if getattr(original, MARKER, False):
+    if getattr(original, MARKER, False) or getattr(original, "_gpu_workload_guard", False):
+        # Already wrapped (this module loaded twice, or the old gpu_workload_guard still
+        # installed next to it): wrapping again would switch the GPU twice per job.
         return True
 
     @functools.wraps(original)
@@ -99,7 +103,7 @@ def install() -> bool:
         try:
             take_gpu()
         except GpuBusy as e:
-            log.warning("gpu_workload_guard: job %s not run: %s", prompt_id, e)
+            log.warning("vhotseat_guard: job %s not run: %s", prompt_id, e)
             # execute_async normally sets this; add_message uses it to reach the submitting tab.
             self.server.client_id = extra_data.get("client_id")
             _fail_job(self, prompt_id, prompt, str(e))
@@ -108,7 +112,7 @@ def install() -> bool:
 
     setattr(guarded, MARKER, True)
     execution.PromptExecutor.execute_async = guarded
-    log.info("gpu_workload_guard: on (%s, wait %ss)", BIN, WAIT_S)
+    log.info("vhotseat_guard: on (%s, wait %ss)", BIN, WAIT_S)
     return True
 
 

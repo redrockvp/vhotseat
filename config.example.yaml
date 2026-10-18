@@ -24,27 +24,36 @@ workloads:
       ok_when: [{status: 200, path: status, in: [unloaded, not loaded]}]
     confirm: {vram_at_most: 0}    # released once its VRAM is down to this
     load: {post: /load, timeout: 300}   # `switch strata` leaves it loaded
+    model: {get: /health, path: model}  # which model it serves (set by strata-model);
+                                        # picks the admission below
     gate:
       kind: hook       # Strata runs `vhotseat gate strata` before every load
       config: ~/Strata/strata-active.json   # checked by doctor
       timeout: 90      # Strata's before_load_timeout_s: the hook must fit in it
     admission:
       # RAM the machine must be able to give Strata before it may load: its
-      # experts plus working memory, with some headroom. Measured 2026-10-17:
-      # loading IQ3_XXS took 44.5 GiB of available RAM (42.5 GiB resident
-      # after, 56 GiB at the peak of the load); IQ2_XS about 38 GiB. Change it
-      # with the model (strata-model). Compared with *available* RAM
-      # (MemAvailable), which counts page cache the kernel can drop on demand;
-      # *free* RAM is always small on a busy machine. When other workloads
-      # still hold too much after releasing their models, idle ones with
-      # allow_restart are restarted; if that still isn't enough, the load is
-      # refused and the event log says RAM was short.
+      # experts plus working memory, with some headroom. Compared with
+      # *available* RAM (MemAvailable), which counts page cache the kernel can
+      # drop on demand; *free* RAM is always small on a busy machine. When
+      # other workloads still hold too much after releasing their models, idle
+      # ones with allow_restart are restarted; if that still isn't enough, the
+      # load is refused and the event log says RAM was short.
+      # This default is for a model not listed under by_model (or when Strata
+      # doesn't say which it serves): the largest one, to stay safe.
       min_available_ram_mib: 46000
       # VRAM that must be free on the card before Strata may load. Other
       # workloads always release the GPU first, whatever this says; this
       # catches what vhotseat doesn't manage (the desktop, a game, a release
       # that left VRAM behind).
       min_free_vram_mib: 14000
+      # Per model, as /health reports it. Measured 2026-10-17, loading from idle:
+      #   IQ3_XXS took 44.5 GiB of available RAM (42.5 GiB resident, 56 GiB at the peak)
+      #   IQ2_XS  took 38.2 GiB (35.6 GiB resident, 47 GiB at the peak)
+      # Both use ~14.7 GB of VRAM. A new size: load it (`vhotseat switch strata`
+      # from idle), note how much MemAvailable dropped, add ~1.5 GiB.
+      by_model:
+        qwen3.8-flash-next-iq3_xxs: {min_available_ram_mib: 46000}
+        qwen3.8-flash-next-iq2_xs: {min_available_ram_mib: 40000}
     allow_restart: true
 
   comfy:

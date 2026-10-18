@@ -36,7 +36,7 @@ COMMON = {"driver", "label", "url", "service", "vram", "idle_vram_mib", "gate", 
           "allow_restart", "restart_timeout_s"}
 GATE_KEYS = {"kind", "timeout", "config", "custom_nodes"}
 DRIVER_KEYS = {
-    "http": {"resident", "busy", "release", "confirm", "load"},
+    "http": {"resident", "busy", "release", "confirm", "load", "model"},
     "comfyui": {"restart_above_ram_mib", "history_settle_s"},
 }
 
@@ -111,10 +111,22 @@ def validate(raw) -> dict:
                "needs a `service:` to restart")
         adm = w.get("admission") or {}
         _check(isinstance(adm, dict), f"{where}.admission", "expected a mapping")
-        unknown = set(adm) - {"min_available_ram_mib", "min_free_vram_mib"}
+        limits = {"min_available_ram_mib", "min_free_vram_mib"}
+        unknown = set(adm) - limits - {"by_model"}
         _check(not unknown, f"{where}.admission", f"unknown key(s): {', '.join(sorted(unknown))}")
-        for k in adm:
+        for k in limits & set(adm):
             _int(adm, k, f"{where}.admission")
+        per = adm.get("by_model")
+        if per is not None:
+            _check(isinstance(per, dict) and per, f"{where}.admission.by_model",
+                   "expected a mapping of model name to {min_available_ram_mib, min_free_vram_mib}")
+            _check(driver == "http" and "model" in w, f"{where}.admission.by_model",
+                   "needs `model:`, the request that says which model it serves")
+            for m, lim in per.items():
+                _check(isinstance(lim, dict) and set(lim) <= limits and lim,
+                       f"{where}.admission.by_model.{m}", f"expected some of {', '.join(sorted(limits))}")
+                for k in lim:
+                    _int(lim, k, f"{where}.admission.by_model.{m}")
         gate = w.get("gate")
         _check(isinstance(gate, dict) and gate.get("kind") in GATE_KINDS, f"{where}.gate",
                f"expected {{kind: {' | '.join(GATE_KINDS)}}}: how this workload asks for the GPU")
@@ -132,6 +144,8 @@ def validate(raw) -> dict:
                     _rules(rel[k], f"{where}.release.{k}")
             if "load" in w:
                 _request(w["load"], f"{where}.load")
+            if "model" in w:
+                _request(w["model"], f"{where}.model", needs_path=True)
             conf = w.get("confirm") or {}
             _check(isinstance(conf, dict), f"{where}.confirm", "expected a mapping")
             _int(conf, "vram_at_most", f"{where}.confirm")

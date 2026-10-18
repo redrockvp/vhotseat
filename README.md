@@ -99,14 +99,13 @@ about 30 s per handover (Strata reload, then ComfyUI reloads its model).
 
 ## ComfyUI guard node
 
-`comfyui/gpu_workload_guard` is installed as a symlink:
-`~/ComfyUI/custom_nodes/gpu_workload_guard`. ComfyUI must be restarted
+`comfyui/vhotseat_guard` is installed as a symlink:
+`~/ComfyUI/custom_nodes/vhotseat_guard`. ComfyUI must be restarted
 after installing or changing it.
 
 - **How it hooks in:** it wraps `execution.PromptExecutor.execute_async`, which
   ComfyUI's prompt worker thread calls once per job, and runs
-  `vhotseat switch comfy --wait $GPU_WORKLOAD_GUARD_WAIT_S` (default 300; falls
-  back to `gpu-workload`, which takes the same arguments)
+  `vhotseat switch comfy --wait $VHOTSEAT_GUARD_WAIT_S` (default 300)
   first. The worker thread may block, so the web server stays responsive.
 - **On failure:** the job is **not run** and fails visibly, with an
   `execution_error` "GPU busy, job not run: <reason>" in the UI and in
@@ -120,9 +119,9 @@ after installing or changing it.
   upstream is planned in
   [docs/plans/2026-10-16-upstream-indextts-unload-fix.md](docs/plans/2026-10-16-upstream-indextts-unload-fix.md).
 - **Env:**
-  - `GPU_WORKLOAD_GUARD=0` disables it;
-  - `GPU_WORKLOAD_GUARD_WAIT_S` sets how long it waits;
-  - `GPU_WORKLOAD_BIN` points it at the CLI.
+  - `VHOTSEAT_GUARD=0` disables it;
+  - `VHOTSEAT_GUARD_WAIT_S` sets how long it waits;
+  - `VHOTSEAT_BIN` points it at the CLI.
 
 Measured 2026-10-13:
 

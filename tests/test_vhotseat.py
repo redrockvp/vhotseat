@@ -170,7 +170,7 @@ def test_admission_refuses_when_restart_isnt_enough(vh):
     assert vh.strata.request() == 503
     assert vh.host.restarts == ["comfyui"]
     e = [e for e in vh.events() if e["event"] == "strata-load"][-1]
-    assert not e["allowed"] and "Strata needs 46000 MiB of available RAM, 20000 MiB is available" in e["reason"]
+    assert not e["allowed"] and "Strata (qwen3.8-flash-next-iq3_xxs) needs 46000 MiB of available RAM, 20000 MiB is available" in e["reason"]
 
 
 def test_admission_vram(vh):
@@ -262,8 +262,8 @@ def test_doctor_checks_gates(vh, tmp_path):
     strata_cfg.write_text(json.dumps({"before_load": [missing, "gate", "strata"], "before_load_strict": True,
                                       "before_load_timeout_s": 90}))
     nodes = tmp_path / "custom_nodes"
-    (nodes / "gpu_workload_guard").mkdir(parents=True)
-    (nodes / "gpu_workload_guard/__init__.py").write_text("")
+    (nodes / "vhotseat_guard").mkdir(parents=True)
+    (nodes / "vhotseat_guard/__init__.py").write_text("")
     vh.arb.workloads["strata"].gate["config"] = str(strata_cfg)
     vh.arb.workloads["comfy"].gate["custom_nodes"] = str(nodes)
     results = {c: (s, d) for s, c, d in doctor.checks(vh.arb, vh.cfg)}
@@ -276,8 +276,52 @@ def test_doctor_checks_gates(vh, tmp_path):
     assert results["strata: gate"][0] == "ok"
 
     strata_cfg.write_text(json.dumps({"before_load": ["/bin/true"]}))
-    (nodes / "gpu_workload_guard/__init__.py").unlink()
+    (nodes / "vhotseat_guard/__init__.py").unlink()
     found = [(s, c, d) for s, c, d in doctor.checks(vh.arb, vh.cfg) if "gate" in c]
     assert any(s == "fail" and "loads aren't guarded" in d for s, c, d in found)
     assert any(s == "fail" and "before_load_strict isn't true" in d for s, c, d in found)
     assert any(s == "fail" and "guard node not installed" in d for s, c, d in found)
+
+
+# --- admission per model -------------------------------------------------------------
+
+
+def test_admission_follows_the_model(vh):
+    """IQ2 needs less RAM than IQ3: 43 GB available is enough for one, not the other."""
+    vh.host.available_mib = 43000
+    vh.strata.model = "qwen3.8-flash-next-iq2_xs"
+    assert vh.strata.request() == 200
+    vh.strata.loaded = False
+    vh.strata.model = "qwen3.8-flash-next-iq3_xxs"
+    assert vh.strata.request() == 503
+    e = [e for e in vh.events() if e["event"] == "strata-load"][-1]
+    assert "Strata (qwen3.8-flash-next-iq3_xxs) needs 46000 MiB of available RAM" in e["reason"]
+
+
+def test_unlisted_model_gets_the_default(vh):
+    vh.host.available_mib = 43000
+    vh.strata.model = "qwen3.8-flash-next-q4"
+    assert vh.strata.request() == 503
+    assert "(qwen3.8-flash-next-q4) needs 46000 MiB" in [e for e in vh.events() if e["event"] == "strata-load"][-1]["reason"]
+
+
+def test_by_model_keeps_the_default_vram(vh):
+    adm, model = vh.arb.workloads["strata"].admission_for()
+    assert model == "qwen3.8-flash-next-iq3_xxs"
+    assert adm == {"min_available_ram_mib": 46000, "min_free_vram_mib": 14000}
+
+
+def test_by_model_needs_a_model_request():
+    raw = config.parse((ROOT / "config.example.yaml").read_text())
+    del raw["workloads"]["strata"]["model"]
+    with pytest.raises(config.ConfigError, match="admission.by_model: needs `model:`"):
+        config.validate(raw)
+
+
+def test_doctor_names_the_models_admission(vh):
+    results = {c: (s, d) for s, c, d in doctor.checks(vh.arb, vh.cfg) if c == "strata: admission"}
+    assert results["strata: admission"][0] == "ok"
+    assert "qwen3.8-flash-next-iq3_xxs" in results["strata: admission"][1]
+    vh.strata.model = "something-new"
+    found = [(s, d) for s, c, d in doctor.checks(vh.arb, vh.cfg) if c == "strata: admission"]
+    assert found == [("warn", "serves something-new, which isn't in by_model; using the defaults")]
