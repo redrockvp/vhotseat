@@ -23,7 +23,7 @@ This document covers:
 - how often the GPU changes hands, what each handover costs, and the
   best-effort measures that keep that number down.
 
-Commands, flags and config are in the [README](../README.md); writing support
+Commands, flags and config are in [reference.md](reference.md); writing support
 for another server is in [guides/driver-authoring.md](guides/driver-authoring.md).
 ComfyUI maintenance is in [comfyui-updates.md](comfyui-updates.md).
 
