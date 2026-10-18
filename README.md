@@ -9,6 +9,8 @@ vhotseat makes [Strata](https://github.com/Niko1221/Strata) and
 RAM, so an agent session can hand work to ComfyUI and come back for the
 results safely.
 
+![vhotseat: one GPU, local agentic GenAI. pi drives, ComfyUI renders, Strata reviews and composites.](https://raw.githubusercontent.com/wandermyz/vhotseat/a619e2e66e284521f3a8f66e2892790a562403df/branding/social-preview.png)
+
 **Tested on:**
 
 | Part | Tested with |
@@ -183,6 +185,8 @@ Every chart marks each event with a dashed line: hover it to see the event,
 click it to open it in the table. Ranges run from 15 minutes to the whole
 retention window. A button in the header switches the theme (system, light or
 dark; kept in the browser). It only reads; it never switches anything.
+
+![The dashboard on an RTX 5070 Ti: Strata hands the GPU to ComfyUI at 01:04, and a render is running.](https://raw.githubusercontent.com/wandermyz/vhotseat/24999a8e62e3a6342e9af6c3bc70042e77765c60/web-dashboard/desktop.png)
 
 **History doesn't need the page open.** Every vhotseat command records into
 `~/.local/state/vhotseat/telemetry.db` (SQLite) as it runs: each status probe
