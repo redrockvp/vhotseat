@@ -104,7 +104,7 @@ def test_patch_still_applied_after_upstream_fix(tmp_path):
 
 def test_patches_config_is_validated():
     raw = config.parse((ROOT / "config.example.yaml").read_text())
-    raw["patches"][0].pop("marker")
+    raw["patches"] = [{"name": "x", "file": "/tmp/x"}]
     import pytest
     with pytest.raises(config.ConfigError, match=r"patches\[0\].marker"):
         config.validate(raw)
