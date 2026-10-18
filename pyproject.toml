@@ -1,13 +1,13 @@
 [project]
 name = "vhotseat"
 version = "0.1.0"
-description = "Take turns on one GPU: hand it between workloads without interrupting work."
+description = "Take turns on one GPU: hand it between a local LLM (e.g. Strata, driven by an agent like pi), ComfyUI and any other workload, never interrupting running work."
 requires-python = ">=3.10"
-readme = "README.md"
+dynamic = ["readme"]
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "wandermyz" }]
-keywords = ["gpu", "vram", "comfyui", "llm", "scheduler"]
+keywords = ["gpu", "vram", "comfyui", "llm", "local-llm", "strata", "minimax-h3", "pi-agent", "scheduler"]
 classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
@@ -34,8 +34,20 @@ comfy-render = "vhotseat.kit.comfy_render:main"
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-fancy-pypi-readme"]
 build-backend = "hatchling.build"
+
+# PyPI shows the README as the project page, where relative links don't resolve:
+# point them at the GitHub copy of the same file instead.
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\(((?!https?://|#)[^)\s]+)\)'
+replacement = '](https://github.com/wandermyz/vhotseat/blob/main/\1)'
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vhotseat"]
