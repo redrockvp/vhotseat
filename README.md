@@ -1,3 +1,5 @@
+![vhotseat: one GPU, local agentic GenAI. pi drives, ComfyUI renders, Strata reviews and composites.](https://raw.githubusercontent.com/wandermyz/vhotseat/a619e2e66e284521f3a8f66e2892790a562403df/branding/social-preview.png)
+
 # vhotseat
 
 **Want your local LLM agent to drive ComfyUI on the same consumer graphics
