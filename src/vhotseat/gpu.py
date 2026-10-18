@@ -60,6 +60,20 @@ class NvidiaSmi:
             capture_output=True, text=True, timeout=10, check=True,
         ).stdout
 
+    def health(self) -> dict:
+        try:
+            line = self._query("gpu=name,utilization.gpu,temperature.gpu,power.draw,power.limit").splitlines()[0]
+        except (OSError, subprocess.SubprocessError, IndexError) as e:
+            return {"error": f"nvidia-smi failed: {e}"}
+        name, *values = (x.strip() for x in line.split(","))
+
+        def num(v):
+            try:
+                return round(float(v), 1)
+            except ValueError:
+                return None  # "[N/A]"
+        return dict(zip(HEALTH_KEYS, [name, *map(num, values)], strict=False))
+
     def read(self) -> tuple[int, int, list]:
         try:
             total, free = (int(x) for x in self._query("gpu=memory.total,memory.free").splitlines()[0].split(","))
@@ -72,6 +86,14 @@ class NvidiaSmi:
             if len(parts) == 3 and parts[0].isdigit():
                 procs.append((int(parts[0]), int(parts[2]) if parts[2].isdigit() else None, parts[1]))
         return total, free, procs
+
+
+# What health() reports, each None when the card can't say.
+HEALTH_KEYS = ("name", "util_pct", "temp_c", "power_w", "power_limit_w")
+
+
+class _Utilization(ctypes.Structure):
+    _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
 
 
 class _Memory(ctypes.Structure):
@@ -121,6 +143,28 @@ class Nvml:
         self.lib.nvmlSystemGetDriverVersion(buf, 80)
         return buf.value.decode()
 
+    def health(self) -> dict:
+        """The card's model, load (%), temperature (°C), power draw and limit (W)."""
+        def call(fn, *args) -> bool:
+            f = getattr(self.lib, fn, None)
+            return f is not None and f(self.handle, *args) == 0
+
+        out = dict.fromkeys(HEALTH_KEYS)
+        buf = ctypes.create_string_buffer(96)
+        if call("nvmlDeviceGetName", buf, 96):
+            out["name"] = buf.value.decode(errors="replace")
+        util = _Utilization()
+        if call("nvmlDeviceGetUtilizationRates", ctypes.byref(util)):
+            out["util_pct"] = util.gpu
+        v = ctypes.c_uint()
+        if call("nvmlDeviceGetTemperature", 0, ctypes.byref(v)):  # 0: the GPU die
+            out["temp_c"] = v.value
+        if call("nvmlDeviceGetPowerUsage", ctypes.byref(v)):     # mW
+            out["power_w"] = round(v.value / 1000, 1)
+        if call("nvmlDeviceGetEnforcedPowerLimit", ctypes.byref(v)):
+            out["power_limit_w"] = round(v.value / 1000, 1)
+        return out
+
     def read(self) -> tuple[int, int, list]:
         mem = _Memory()
         self._check(self.lib.nvmlDeviceGetMemoryInfo(self.handle, ctypes.byref(mem)), "memory info")
@@ -152,6 +196,13 @@ class Backend:
             return {"total_mib": None, "free_mib": None, **{f"{n}_mib": 0 for n in selectors},
                     "other_mib": 0, "error": str(e)}
         return attribute(total, free, procs, selectors, self.procinfo)
+
+    def health(self) -> dict:
+        """Model, load, temperature and power, for the dashboard; {} if the backend can't say."""
+        try:
+            return self.reader.health() if hasattr(self.reader, "health") else {}
+        except Exception as e:  # noqa: BLE001 - only ever shown, never decided on
+            return {"error": str(e)}
 
 
 def open_backend(kind: str = "auto", index: int = 0) -> Backend:

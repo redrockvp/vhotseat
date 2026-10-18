@@ -6,9 +6,11 @@ from pathlib import Path
 
 
 class EventLog:
-    def __init__(self, path: Path, keep: int = 500):
+    def __init__(self, path: Path, keep: int = 500, telemetry=None):
         self.path = path
         self.keep = keep
+        # Gets a copy of every event, kept for its retention window rather than `keep` lines.
+        self.telemetry = telemetry
 
     def record(self, kind: str, **fields) -> None:
         """Append one event; the log is trimmed to the last `keep` lines."""
@@ -20,6 +22,8 @@ class EventLog:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text("\n".join(lines) + "\n")
         tmp.replace(self.path)
+        if self.telemetry is not None:
+            self.telemetry.event(event)
 
     def last(self) -> dict | None:
         if not self.path.exists():

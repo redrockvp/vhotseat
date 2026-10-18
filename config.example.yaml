@@ -91,3 +91,11 @@ patches: []
 
 events:
   keep: 500            # ~/.local/state/vhotseat/events.jsonl
+
+# RAM and VRAM over time, events and log lines, for `vhotseat web`. Every
+# vhotseat command records as it runs (~/.local/state/vhotseat/telemetry.db);
+# `vhotseat record` (or `vhotseat web`) samples between commands too.
+telemetry:
+  # enabled: true
+  retention_hours: 24  # ~6 MiB on disk with two workloads; ~0.8 MiB a day more per further workload
+  interval_s: 5        # between samples while something samples continuously

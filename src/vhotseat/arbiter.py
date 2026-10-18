@@ -33,7 +33,7 @@ HOLD_ENV = "VHOTSEAT_HOLD"
 class Arbiter:
     def __init__(self, workloads: list[Workload], gpu, lock: GpuLock, events: EventLog, *,
                  gate_release_timeout_s: float = 20, release_timeout_s: float = 60,
-                 machine_ram=host.machine_ram):
+                 machine_ram=host.machine_ram, telemetry=None):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
         self.lock = lock
@@ -43,9 +43,15 @@ class Arbiter:
         self.gate_release_timeout_s = gate_release_timeout_s
         self.release_timeout_s = release_timeout_s
         self.machine_ram = machine_ram
+        # Every probe is kept as a sample, for `vhotseat web`'s history.
+        self.telemetry = telemetry
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
+
+    def gpu_health(self) -> dict:
+        """The card's model, load, temperature and power; not part of `status`."""
+        return self.gpu.health() if hasattr(self.gpu, "health") else {}
 
     def _others(self, name: str | None) -> list[Workload]:
         return [w for n, w in self.workloads.items() if n != name]
@@ -59,7 +65,10 @@ class Arbiter:
         mode = "conflict" if len(active) > 1 else active[0] if active else NONE
         ram = self.machine_ram()
         ram.update({n: w.memory() for n, w in self.workloads.items()})
-        return {"mode": mode, **states, "gpu": gpu, "ram": ram, "last_event": self.events.last()}
+        status = {"mode": mode, **states, "gpu": gpu, "ram": ram, "last_event": self.events.last()}
+        if self.telemetry is not None:
+            self.telemetry.sample(status, self.gpu_health)
+        return status
 
     def describe(self, s: dict) -> str:
         g = s["gpu"]

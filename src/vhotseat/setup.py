@@ -12,6 +12,7 @@ from .drivers.base import Context
 from .events import EventLog
 from .gpu import open_backend
 from .lock import GpuLock
+from .telemetry import Telemetry
 
 
 def migrate_state(new: Path, env=os.environ) -> None:
@@ -31,6 +32,10 @@ def build(cfg: dict, *, env=os.environ, gpu=None, machine_ram=None, **arbiter_ar
     migrate_state(state, env)
     g = cfg.get("gpu") or {}
     index = g.get("index", 0)
+    tel = cfg.get("telemetry") or {}
+    telemetry = None if tel.get("enabled", True) is False else Telemetry(
+        state / "telemetry.db", retention_hours=tel.get("retention_hours", 24), interval_s=tel.get("interval_s", 5),
+        seed_events=state / "events.jsonl")
     arbiter = None
     ctx = Context(gpu=lambda: arbiter.snapshot())
     workloads = cfgmod.workloads(cfg, ctx)
@@ -39,7 +44,7 @@ def build(cfg: dict, *, env=os.environ, gpu=None, machine_ram=None, **arbiter_ar
         # GPU 0 keeps gpu-workload's lock name, so a rollback to gpu-workload
         # shares the lock with anything still on vhotseat.
         GpuLock(state / ("switch.lock" if index == 0 else f"gpu{index}.lock")),
-        EventLog(state / "events.jsonl", keep=(cfg.get("events") or {}).get("keep", 500)),
-        machine_ram=machine_ram or host.machine_ram, **arbiter_args,
+        EventLog(state / "events.jsonl", keep=(cfg.get("events") or {}).get("keep", 500), telemetry=telemetry),
+        machine_ram=machine_ram or host.machine_ram, telemetry=telemetry, **arbiter_args,
     )
     return arbiter
