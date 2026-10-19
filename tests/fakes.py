@@ -164,6 +164,8 @@ class FakeComfy(_Server):
         self.guard = None
         self.lose_history = False
         self.models_dir = "/comfy/models/checkpoints"
+        self.custom_nodes_dir = "/comfy/custom_nodes"
+        self.extra_model_dirs: list[str] = []   # extra_model_paths.yaml: other drives, listed first
         self.sockets: dict[str, list] = {}      # client_id -> [socket]
         self._work = threading.Event()
         super().__init__()
@@ -258,7 +260,9 @@ class FakeComfy(_Server):
         if path == "/_vram":
             return h.send_json(200, {"vram": self.vram})
         if path == "/internal/folder_paths":
-            return h.send_json(200, {"checkpoints": [self.models_dir, "/comfy/output/checkpoints"]})
+            return h.send_json(200, {"checkpoints": self.extra_model_dirs
+                                     + [self.models_dir, "/comfy/output/checkpoints"],
+                                     "custom_nodes": [self.custom_nodes_dir]})
         if path == "/queue":
             if self.down:
                 return h.send_json(500, {"error": "down"})

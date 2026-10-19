@@ -151,12 +151,39 @@ def test_json_output(cr, tmp_path, capsys):
 def test_comfy_dir_from_comfyui(cr, tmp_path, capsys):
     """No --comfy-dir: ComfyUI's own model folder says where it lives."""
     cr.fake.models_dir = "/srv/ComfyUI/models/checkpoints"
+    cr.fake.custom_nodes_dir = "/srv/ComfyUI/custom_nodes"
     assert cr.main([write(tmp_path, save())]) == 0
     assert f"job 1/1 ok: {out_dir('/srv/ComfyUI')}" in capsys.readouterr().out
 
 
+def test_comfy_dir_ignores_model_folders_on_other_drives(cr, tmp_path, capsys):
+    """extra_model_paths.yaml lists another drive's collection ahead of ComfyUI's own
+    models, which is where the e2e test found this going wrong: the saved files still
+    print under the install folder, the one that holds its custom_nodes."""
+    cr.fake.extra_model_dirs = ["/mnt/media/models/checkpoints"]
+    cr.fake.models_dir = "/srv/ComfyUI/models/checkpoints"
+    cr.fake.custom_nodes_dir = "/srv/ComfyUI/custom_nodes"
+    assert cr.main([write(tmp_path, save())]) == 0
+    out = capsys.readouterr().out
+    assert f"job 1/1 ok: {out_dir('/srv/ComfyUI')}" in out
+    assert "/mnt/media" not in out
+
+
+def test_comfy_dir_from_folder_paths_body(cr):
+    install = {"checkpoints": ["/mnt/media/models/checkpoints", "/srv/ComfyUI/models/checkpoints",
+                               "/srv/ComfyUI/output/checkpoints"],
+               "custom_nodes": ["/srv/ComfyUI/custom_nodes"]}
+    assert cr._comfy_dir_from(200, install) == PurePath("/srv/ComfyUI")
+    # custom_nodes missing (an older ComfyUI): the model-folder guess still works
+    assert cr._comfy_dir_from(200, {"checkpoints": ["/srv/ComfyUI/models/checkpoints"]}) == PurePath("/srv/ComfyUI")
+    # a collection on another drive, and nothing that says where ComfyUI lives
+    assert cr._comfy_dir_from(200, {"checkpoints": ["/mnt/media/checkpoints"]}) is None
+    assert cr._comfy_dir_from(500, {}) is None
+
+
 def test_comfy_dir_unknown_gives_relative_paths(cr, tmp_path, capsys):
     cr.fake.models_dir = "/somewhere/else"
+    cr.fake.custom_nodes_dir = "/somewhere/else/nodes"   # not the shape <install>/custom_nodes
     assert cr.main([write(tmp_path, save())]) == 0
     assert f"job 1/1 ok: output{os.sep}" in capsys.readouterr().out
 

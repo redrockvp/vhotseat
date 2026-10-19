@@ -171,9 +171,10 @@ cancelled some job (wins over `1` and `3`: ask them why before re-running). On
 a timeout the unfinished jobs are left in ComfyUI's queue.
 
 - `--url`, else `$COMFY_URL`, else `http://127.0.0.1:8188`.
-- `--comfy-dir`, else `$COMFY_DIR`, else the folder ComfyUI reports for its
-  models: used to print saved files as absolute paths. Without it, paths are
-  relative to ComfyUI's folder (`output/…`).
+- `--comfy-dir`, else `$COMFY_DIR`, else ComfyUI's own folder, read from its
+  `custom_nodes` path (a model folder alone can be an `extra_model_paths.yaml`
+  collection on another drive): used to print saved files as absolute paths.
+  Without it, paths are relative to ComfyUI's folder (`output/…`).
 - `--hold [NAME]` runs the batch under `vhotseat hold NAME` (default `comfy`),
   so even unrelated traffic, another conversation say, can't take the GPU back
   between two jobs. `--hold-wait` is how long to wait for the current owner's
