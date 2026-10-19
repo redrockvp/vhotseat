@@ -4,6 +4,8 @@ import datetime
 import json
 from pathlib import Path
 
+from . import util
+
 
 class EventLog:
     def __init__(self, path: Path, keep: int = 500, telemetry=None):
@@ -17,18 +19,18 @@ class EventLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         event = {"time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
                  "event": kind, **fields}
-        lines = self.path.read_text().splitlines() if self.path.exists() else []
+        lines = self.path.read_text(encoding="utf-8").splitlines() if self.path.exists() else []
         lines = [*lines[-(self.keep - 1):], json.dumps(event)]
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text("\n".join(lines) + "\n")
-        tmp.replace(self.path)
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        util.replace(tmp, self.path)
         if self.telemetry is not None:
             self.telemetry.event(event)
 
     def last(self) -> dict | None:
         if not self.path.exists():
             return None
-        lines = self.path.read_text().splitlines()
+        lines = self.path.read_text(encoding="utf-8").splitlines()
         try:
             return json.loads(lines[-1]) if lines else None
         except json.JSONDecodeError:

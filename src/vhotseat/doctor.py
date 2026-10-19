@@ -28,12 +28,13 @@ def _gate_hook(w, gate: dict) -> list:
         return [(WARN, f"{w.name}: gate", "no gate.config set, so the hook can't be checked")]
     p = Path(path).expanduser()
     try:
-        cfg = json.loads(p.read_text())
+        cfg = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         return [(FAIL, f"{w.name}: gate", f"can't read {p}: {e}")]
     cmd = cfg.get("before_load")
     cmd = cmd.split() if isinstance(cmd, str) else cmd or []
-    calls_us = len(cmd) >= 3 and Path(cmd[0]).name == "vhotseat" and cmd[1:3] == ["gate", w.name]
+    calls_us = (len(cmd) >= 3 and Path(cmd[0]).name.lower() in ("vhotseat", "vhotseat.exe")
+                and cmd[1:3] == ["gate", w.name])
     if not calls_us:
         out.append((FAIL, f"{w.name}: gate", f"{p} before_load is {cmd or 'unset'}: "
                     f"loads aren't guarded; set it to [\"vhotseat\", \"gate\", \"{w.name}\"]"))
@@ -82,7 +83,7 @@ def _version_tuple(v: str) -> tuple:
 def _installed_version(path: Path) -> str | None:
     """`version = "X.Y.Z"` (pyproject.toml and the like), or None."""
     try:
-        m = re.search(r"""^\s*version\s*=\s*["']([^"']+)["']""", path.read_text(), re.MULTILINE)
+        m = re.search(r"""^\s*version\s*=\s*["']([^"']+)["']""", path.read_text(encoding="utf-8"), re.MULTILINE)
     except OSError:
         return None
     return m.group(1) if m else None
@@ -98,7 +99,7 @@ def check_patches(cfg: dict | None) -> list:
         where = f"patch: {p['name']}"
         f = Path(p["file"]).expanduser()
         try:
-            present = p["marker"] in f.read_text()
+            present = p["marker"] in f.read_text(encoding="utf-8")
         except OSError as e:
             out.append((FAIL, where, f"can't read {f}: {e.strerror}"))
             continue

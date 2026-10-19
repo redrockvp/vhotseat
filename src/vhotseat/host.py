@@ -1,6 +1,8 @@
 """Service backends: start, check and restart the process behind a workload,
 and read its memory. Plus the machine's RAM."""
 
+import ctypes
+import os
 import subprocess
 from pathlib import Path
 
@@ -81,9 +83,39 @@ def service(kind: str | None, unit: str | None):
     return NoService()
 
 
+class _MemoryStatusEx(ctypes.Structure):
+    _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong),
+                ("total_phys", ctypes.c_ulonglong), ("avail_phys", ctypes.c_ulonglong),
+                ("total_page_file", ctypes.c_ulonglong), ("avail_page_file", ctypes.c_ulonglong),
+                ("total_virtual", ctypes.c_ulonglong), ("avail_virtual", ctypes.c_ulonglong),
+                ("avail_extended_virtual", ctypes.c_ulonglong)]
+
+
+def _machine_ram_windows() -> dict:
+    """Windows: GlobalMemoryStatusEx. `available_mib` counts the standby list (cache
+    Windows hands out on demand), like MemAvailable. There's no swap as such: the
+    page file is the commit limit above physical RAM, and what's used of it is
+    the commit charge that RAM doesn't cover."""
+    out = {"total_mib": None, "available_mib": None, "swap_total_mib": None, "swap_used_mib": None}
+    st = _MemoryStatusEx()
+    st.length = ctypes.sizeof(st)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+        out["error"] = f"GlobalMemoryStatusEx failed (error {ctypes.GetLastError()})"
+        return out
+    mib = 2**20
+    committed = st.total_page_file - st.avail_page_file
+    in_ram = st.total_phys - st.avail_phys
+    out.update(total_mib=st.total_phys // mib, available_mib=st.avail_phys // mib,
+               swap_total_mib=max(0, st.total_page_file - st.total_phys) // mib,
+               swap_used_mib=max(0, committed - in_ram) // mib)
+    return out
+
+
 def machine_ram() -> dict:
     """Machine RAM and swap (MiB) from /proc/meminfo. `available_mib` counts page
     cache the kernel can drop, so it's what a new process can actually get."""
+    if os.name == "nt":
+        return _machine_ram_windows()
     out = {"total_mib": None, "available_mib": None, "swap_total_mib": None, "swap_used_mib": None}
     try:
         info = {k: int(v.split()[0]) // 1024 for k, v in

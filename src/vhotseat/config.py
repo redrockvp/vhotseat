@@ -196,7 +196,7 @@ def parse(text: str) -> dict:
 
 def load(path: Path) -> dict:
     try:
-        return parse(path.read_text())
+        return parse(path.read_text(encoding="utf-8"))
     except OSError as e:
         raise ConfigError(f"{path}: {e.strerror}") from None
     except ConfigError as e:

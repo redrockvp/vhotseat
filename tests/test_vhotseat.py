@@ -2,6 +2,7 @@
 `vhotseat` CLI, GPU attribution and doctor."""
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -249,7 +250,11 @@ def test_nvml_matches_nvidia_smi():
     t1, _, p1 = nvml.read()
     t2, _, p2 = gpu.NvidiaSmi().read()
     assert t1 == t2
-    assert {p for p, _, _ in p1} == {p for p, _, _ in p2}
+    if os.name == "nt":
+        # WDDM: NVML also lists the compositor and the like, which nvidia-smi leaves out.
+        assert {p for p, _, _ in p2} <= {p for p, _, _ in p1}
+    else:
+        assert {p for p, _, _ in p1} == {p for p, _, _ in p2}
 
 
 # --- doctor ---------------------------------------------------------------------------------
@@ -257,7 +262,7 @@ def test_nvml_matches_nvidia_smi():
 
 def test_doctor_checks_gates(vh, tmp_path):
     strata_cfg = tmp_path / "strata.json"
-    missing = str(tmp_path / "bin/vhotseat")
+    missing = str(tmp_path / "bin" / ("vhotseat.exe" if os.name == "nt" else "vhotseat"))
     strata_cfg.write_text(json.dumps({"before_load": [missing, "gate", "strata"], "before_load_strict": True,
                                       "before_load_timeout_s": 90}))
     nodes = tmp_path / "custom_nodes"

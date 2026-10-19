@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import pytest
+from conftest import cli_bin
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -202,8 +203,11 @@ def test_race_job_after_hook_allowed(rig):
     """§3.1, second half: a job queued after Strata loaded waits (--wait) for
     Strata's answer, then unloads it, then runs."""
     t = rig.strata.request_async(0.3)
-    time.sleep(0.1)
-    assert rig.strata.loaded
+    # The gated load takes ~0.15 s on Windows (its first HTTPS-capable opener, slower file writes).
+    deadline = time.monotonic() + 2
+    while not rig.strata.loaded and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert rig.strata.loaded and t.is_alive()
     assert rig.cli("switch", "comfy", "--wait", "5") == 0
     t.join()
     assert t.result == 200 and not rig.strata.loaded
@@ -375,7 +379,7 @@ def _guard(rig, monkeypatch):
     """The real guard node's take_gpu(), running vhotseat as a subprocess
     (tests/run_cli.py: the real CLI with GPU and services read from the fakes)."""
     sys.path.insert(0, str(ROOT / "integrations" / "comfyui"))
-    monkeypatch.setenv("VHOTSEAT_BIN", str(ROOT / "tests" / "run_cli.py"))
+    monkeypatch.setenv("VHOTSEAT_BIN", cli_bin(rig.state.parent))
     monkeypatch.setenv("STRATA_URL", rig.strata.url)
     monkeypatch.setenv("COMFY_URL", rig.comfy.url)
     monkeypatch.setenv("XDG_STATE_HOME", str(rig.state.parent))

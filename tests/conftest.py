@@ -1,4 +1,6 @@
 import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -7,6 +9,18 @@ from fakes import FakeComfy, FakeGpu, FakeHost, FakeStrata
 from vhotseat import cli, config, setup, util
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def cli_bin(where: Path) -> str:
+    """tests/run_cli.py as a command a subprocess can run. Windows can't run a .py
+    file directly, so there it's a .cmd file in `where` that runs it with this Python."""
+    script = ROOT / "tests" / "run_cli.py"
+    if os.name != "nt":
+        return str(script)
+    where.mkdir(parents=True, exist_ok=True)
+    cmd = where / "run_cli.cmd"
+    cmd.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+    return str(cmd)
 
 
 @pytest.fixture(autouse=True)

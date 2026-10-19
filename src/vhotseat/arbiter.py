@@ -358,8 +358,15 @@ class Arbiter:
                 util.log(f"could not run {command[0]}: {e}")
                 return 1
             # Pass termination on, so the lock is never released under a running render.
-            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-                signal.signal(sig, lambda signum, _frame: proc.send_signal(signum))
+            if os.name == "nt":
+                # The console sends Ctrl+C / Ctrl+Break to the command too: just wait for it.
+                # A SIGTERM can only be passed on as TerminateProcess.
+                for sig in (signal.SIGINT, signal.SIGBREAK):
+                    signal.signal(sig, lambda _signum, _frame: None)
+                signal.signal(signal.SIGTERM, lambda _signum, _frame: proc.terminate())
+            else:
+                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                    signal.signal(sig, lambda signum, _frame: proc.send_signal(signum))
             code = proc.wait()
             self.events.record("hold-end", mode=name, exit=code)
             return code

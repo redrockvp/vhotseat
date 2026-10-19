@@ -19,7 +19,7 @@ method is missing, the guard logs an error and stays off rather than
 breaking ComfyUI.
 
 Env:
-  VHOTSEAT_BIN            default: vhotseat on PATH, else ~/.local/bin/vhotseat
+  VHOTSEAT_BIN            default: vhotseat on PATH, else ~/.local/bin/vhotseat (.exe on Windows)
   VHOTSEAT_GUARD_WAIT_S   how long to wait for running work elsewhere to finish (default 300)
   VHOTSEAT_GUARD          set to 0 to disable
 """
@@ -37,8 +37,10 @@ NODE_DISPLAY_NAME_MAPPINGS: dict = {}
 
 WAIT_S = int(os.environ.get("VHOTSEAT_GUARD_WAIT_S", "300"))
 BIN = os.environ.get("VHOTSEAT_BIN") or shutil.which("vhotseat") or os.path.expanduser(
-    "~/.local/bin/vhotseat"
+    "~/.local/bin/vhotseat.exe" if os.name == "nt" else "~/.local/bin/vhotseat"
 )
+# Windows: no console window flashing up per job when ComfyUI runs without one.
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 MARKER = "_vhotseat_guard"
 
 
@@ -51,7 +53,7 @@ def take_gpu() -> None:
     try:
         r = subprocess.run(
             [BIN, "switch", "comfy", "--wait", str(WAIT_S)],
-            capture_output=True, text=True, timeout=WAIT_S + 120,
+            capture_output=True, text=True, timeout=WAIT_S + 120, **NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         raise GpuBusy(f"vhotseat switch comfy could not run: {e}") from e

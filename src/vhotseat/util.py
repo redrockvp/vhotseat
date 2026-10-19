@@ -26,6 +26,19 @@ def sleep(seconds: float) -> None:
     time.sleep(seconds * SCALE)
 
 
+def replace(tmp, path, tries: int = 20) -> None:
+    """tmp.replace(path), atomically. On Windows that fails while another process
+    has `path` open for its brief read, so it's retried for up to a second."""
+    for attempt in range(tries):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(0.05)
+
+
 def http(method: str, url: str, body: dict | None = None, timeout: float = 5.0):
     """Return (status, parsed JSON or text), or (None, error string) if unreachable."""
     data = json.dumps(body).encode() if body is not None else None

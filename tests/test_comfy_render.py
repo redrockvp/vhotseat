@@ -2,11 +2,19 @@
 
 import importlib
 import json
+import os
 import threading
 import time
+from pathlib import PurePath
 
 import pytest
+from conftest import cli_bin
 from fakes import FakeComfy
+
+
+def out_dir(comfy: str) -> str:
+    """<comfy>/output/ as comfy-render prints it here (backslashes on Windows)."""
+    return str(PurePath(comfy) / "output") + os.sep
 
 
 @pytest.fixture
@@ -70,7 +78,7 @@ def test_batch_ok(cr, tmp_path, capsys):
     assert cr.main([write(tmp_path, [save(1), save(2)])]) == 0
     out = capsys.readouterr().out
     assert "queued 2/2 job(s)" in out
-    assert "job 1/2 ok: /comfy/output/" in out and "job 2/2 ok: /comfy/output/" in out
+    assert f"job 1/2 ok: {out_dir('/comfy')}" in out and f"job 2/2 ok: {out_dir('/comfy')}" in out
     assert out.rstrip().endswith("2/2 job(s) succeeded, 2 file(s)")
 
 
@@ -137,27 +145,27 @@ def test_json_output(cr, tmp_path, capsys):
     assert cr.main([write(tmp_path, save()), "--json"]) == 0
     out = capsys.readouterr().out
     results = json.loads(out[out.index("["):])
-    assert results[0]["status"] == "done" and results[0]["files"][0].startswith("/comfy/output/")
+    assert results[0]["status"] == "done" and results[0]["files"][0].startswith(out_dir("/comfy"))
 
 
 def test_comfy_dir_from_comfyui(cr, tmp_path, capsys):
     """No --comfy-dir: ComfyUI's own model folder says where it lives."""
     cr.fake.models_dir = "/srv/ComfyUI/models/checkpoints"
     assert cr.main([write(tmp_path, save())]) == 0
-    assert "job 1/1 ok: /srv/ComfyUI/output/" in capsys.readouterr().out
+    assert f"job 1/1 ok: {out_dir('/srv/ComfyUI')}" in capsys.readouterr().out
 
 
 def test_comfy_dir_unknown_gives_relative_paths(cr, tmp_path, capsys):
     cr.fake.models_dir = "/somewhere/else"
     assert cr.main([write(tmp_path, save())]) == 0
-    assert "job 1/1 ok: output/" in capsys.readouterr().out
+    assert f"job 1/1 ok: output{os.sep}" in capsys.readouterr().out
 
 
 def test_comfy_dir_and_url_flags(cr, tmp_path, capsys, monkeypatch):
     url = cr.fake.url
     monkeypatch.setattr(cr, "COMFY_URL", "http://127.0.0.1:9")
     assert cr.main([write(tmp_path, save()), "--url", url, "--comfy-dir", "/opt/comfy"]) == 0
-    assert "job 1/1 ok: /opt/comfy/output/" in capsys.readouterr().out
+    assert f"job 1/1 ok: {out_dir('/opt/comfy')}" in capsys.readouterr().out
 
 
 def test_result_survives_lost_history(cr, tmp_path, capsys):
@@ -167,7 +175,7 @@ def test_result_survives_lost_history(cr, tmp_path, capsys):
     cr.fake.lose_history = True
     assert cr.main([write(tmp_path, [save(1), save(2)])]) == 0
     out = capsys.readouterr().out
-    assert "job 1/2 ok: /comfy/output/" in out and "job 2/2 ok: /comfy/output/" in out
+    assert f"job 1/2 ok: {out_dir('/comfy')}" in out and f"job 2/2 ok: {out_dir('/comfy')}" in out
     assert "cancelled" not in out
 
 
@@ -175,9 +183,7 @@ def test_hold_keeps_the_gpu_for_the_whole_batch(rig, tmp_path, capsys, monkeypat
     """--hold reruns the batch under `vhotseat hold comfy`: the LLM is unloaded
     first, and a request to it while the batch runs is refused (503) instead of
     taking the GPU back between two jobs."""
-    from pathlib import Path
-    root = Path(__file__).resolve().parent.parent
-    monkeypatch.setenv("VHOTSEAT_BIN", str(root / "tests" / "run_cli.py"))
+    monkeypatch.setenv("VHOTSEAT_BIN", cli_bin(tmp_path))
     monkeypatch.setenv("STRATA_URL", rig.strata.url)
     monkeypatch.setenv("COMFY_URL", rig.comfy.url)
     monkeypatch.setenv("XDG_STATE_HOME", str(rig.state.parent))

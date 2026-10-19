@@ -89,7 +89,7 @@ class Telemetry:
 
     def _seed(self):
         try:
-            lines = self.seed_events.read_text().splitlines()
+            lines = self.seed_events.read_text(encoding="utf-8").splitlines()
         except OSError:
             return
         oldest = time.time() - self.retention_s
