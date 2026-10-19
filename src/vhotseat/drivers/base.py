@@ -87,7 +87,8 @@ class Workload:
         if not st["service"]:
             return "service stopped"
         if not st["reachable"]:
-            return "service up, API not answering"
+            # Without a service there's no telling whether it runs at all.
+            return "service up, API not answering" if self.service.unit else "API not answering (not running?)"
         return ""
 
     def busy(self) -> str | None:
