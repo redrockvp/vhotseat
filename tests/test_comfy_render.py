@@ -207,6 +207,22 @@ def test_hold_keeps_the_gpu_for_the_whole_batch(rig, tmp_path, capsys, monkeypat
     assert [e["event"] for e in rig.events() if e["event"].startswith("hold")] == ["hold", "hold-end"]
 
 
+def test_hold_before_the_jobs_file(cr, tmp_path, monkeypatch):
+    """`comfy-render --hold jobs/x.json`, as the comfyui-batching skill writes it:
+    --hold's optional NAME took the file and the jobs went missing (exit 2)."""
+    seen = {}
+    monkeypatch.setattr(cr, "rerun_under_hold", lambda name, wait, argv: seen.update(name=name, argv=argv) or 0)
+    path = write(tmp_path, save())
+    assert cr.main(["--hold", path]) == 0
+    assert seen == {"name": "comfy", "argv": ["--hold", path]}
+
+
+def test_missing_jobs_is_a_usage_error(cr, capsys):
+    with pytest.raises(SystemExit) as e:
+        cr.main(["--hold"])
+    assert e.value.code == 2 and "required: jobs" in capsys.readouterr().err
+
+
 def test_hold_without_vhotseat_is_a_usage_error(cr, tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("VHOTSEAT_BIN", raising=False)
     monkeypatch.setattr("shutil.which", lambda *a, **k: None)

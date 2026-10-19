@@ -527,7 +527,7 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
     p = argparse.ArgumentParser(prog="comfy-render", description=__doc__.split("\n\n")[0])
-    p.add_argument("jobs", help="JSON file: a workflow, a list of them, or {base, jobs}")
+    p.add_argument("jobs", nargs="?", help="JSON file: a workflow, a list of them, or {base, jobs}")
     p.add_argument("--url", help="ComfyUI's address (default: $COMFY_URL, else http://127.0.0.1:8188)")
     p.add_argument("--comfy-dir", type=Path, metavar="DIR",
                    help="ComfyUI's folder, for absolute output paths (default: $COMFY_DIR, else asked of ComfyUI)")
@@ -541,6 +541,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--hold-wait", type=float, default=600, metavar="SECONDS",
                    help="with --hold: how long to wait for the GPU's current work to finish (default 600)")
     args = p.parse_args(argv)
+    if args.jobs is None:
+        # `--hold jobs/x.json` (as the skill writes it): --hold's optional NAME took the file.
+        if args.hold and (args.hold.lower().endswith(".json") or Path(args.hold).is_file()):
+            args.jobs, args.hold = args.hold, "comfy"
+        else:
+            p.error("the following arguments are required: jobs")
     if args.hold and os.environ.get(HOLD_ENV) != args.hold:
         return rerun_under_hold(args.hold, args.hold_wait, sys.argv[1:] if argv is None else argv)
     global COMFY_URL, COMFY_DIR

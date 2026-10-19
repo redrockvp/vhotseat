@@ -268,6 +268,19 @@ def test_hold_takes_options_before_the_command(rig):
     assert rig.cli("hold", "--wait", "5", "comfy", "--", sys.executable, "-c", "raise SystemExit(7)") == 7
 
 
+def test_hold_waits_for_strata_answering(rig):
+    """`hold comfy --wait N` while Strata answers: waits for the answer, then holds.
+    The command's REMAINDER argument used to swallow `--wait N` after NAME, so the
+    hold failed at once with "Strata is answering" (seen 2026-10-19, comfy-render --hold)."""
+    rig.strata.loaded = True
+    t = rig.strata.request_async(1.0)
+    time.sleep(0.1)
+    assert rig.cli("hold", "comfy", "--wait", "30", "--", sys.executable, "-c", "pass") == 0
+    t.join()
+    assert t.result == 200 and not rig.strata.loaded
+    assert [e["event"] for e in rig.events() if e["event"].startswith("hold")] == ["hold", "hold-end"]
+
+
 def test_hold_exit_code_is_the_commands(rig):
     assert rig.cli("hold", "comfy", "--", sys.executable, "-c", "raise SystemExit(7)") == 7
 

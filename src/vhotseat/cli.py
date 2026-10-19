@@ -44,7 +44,9 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp.add_argument("name")
     sp.add_argument("--wait", type=float, default=0, metavar="SECONDS",
                     help="wait this long for running work to finish instead of failing")
-    sp.add_argument("command", nargs=argparse.REMAINDER, metavar="-- COMMAND...")
+    # Not REMAINDER: that swallows `--wait 600` after NAME even once the command is
+    # split off below, and the wait silently becomes 0.
+    sp.add_argument("command", nargs="*", metavar="-- COMMAND...")
     sp = sub.add_parser("gate", help="a workload's pre-load hook: exit 0 to let it load, 1 to refuse")
     sp.add_argument("name")
     sp = sub.add_parser("doctor", help="check the config, the GPU, and every workload and gate")
