@@ -522,6 +522,10 @@ def summarize(results: list[dict]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Never crash on printing a node's message: a Windows pipe is cp1252.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     p = argparse.ArgumentParser(prog="comfy-render", description=__doc__.split("\n\n")[0])
     p.add_argument("jobs", help="JSON file: a workflow, a list of them, or {base, jobs}")
     p.add_argument("--url", help="ComfyUI's address (default: $COMFY_URL, else http://127.0.0.1:8188)")

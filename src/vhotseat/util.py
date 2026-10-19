@@ -22,6 +22,14 @@ def log(msg: str) -> None:
         LOG_SINK(msg)
 
 
+def safe_output() -> None:
+    """Never crash on printing: a Windows pipe is cp1252, which has no → or ≤.
+    Characters the output can't encode come out as ?."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+
+
 def sleep(seconds: float) -> None:
     time.sleep(seconds * SCALE)
 

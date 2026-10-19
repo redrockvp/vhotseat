@@ -29,6 +29,7 @@ EXIT_OK, EXIT_FAIL, EXIT_USAGE = 0, 1, 2
 
 def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dict | None = None) -> int:
     util.LOG_PREFIX = "vhotseat"
+    util.safe_output()
     p = argparse.ArgumentParser(prog="vhotseat", description="Take turns on one GPU.",
                                 epilog=f"config: {cfgmod.default_path()} (or $VHOTSEAT_CONFIG)")
     sub = p.add_subparsers(dest="cmd", required=True)
