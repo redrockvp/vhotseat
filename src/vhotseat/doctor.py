@@ -145,8 +145,26 @@ def checks(arbiter, cfg: dict | None) -> list:
             if not active:
                 continue
         code, _ = util.http("GET", w.url + w.health_path)
-        out.append((OK if code == 200 else FAIL, f"{w.name}: api",
-                    f"{w.url}{w.health_path} answered {code}" if code else f"{w.url} not answering"))
+        held = w.vram_mib()
+        # Can the GPU counters attribute this workload at all? That is what makes an
+        # unanswerable API safe to read as stopped instead of busy, so ask the config,
+        # not the driver (the driver keeps its own parsed subset).
+        selector = (((cfg or {}).get("workloads") or {}).get(w.name) or {}).get("vram", {}).get("process")
+        blind = not getattr(w.service, "can_start", True) and not selector
+        if code == 200:
+            out.append((OK, f"{w.name}: api", f"{w.url}{w.health_path} answered 200"))
+        elif held <= w.idle_vram_mib and not blind:
+            # Off the card and not answering: it is switched off, which is a normal way
+            # to leave the GPU free, not a fault - nothing here can start it back up.
+            out.append((WARN, f"{w.name}: api", f"{w.url} not answering and it holds nothing on the GPU: "
+                        "treated as stopped"))
+        else:
+            out.append((FAIL, f"{w.name}: api",
+                        f"{w.url} not answering" + (f"; it still holds {held} MiB on the GPU" if held > w.idle_vram_mib else "")))
+        if blind:
+            out.append((WARN, f"{w.name}: vram", "no service and no vram.process: vhotseat can neither ask it "
+                        "nor see it on the GPU, so an API that isn't answering counts as busy and can block a "
+                        "handover"))
         kind = w.gate.get("kind")
         if kind == "hook":
             out += _gate_hook(w, w.gate)

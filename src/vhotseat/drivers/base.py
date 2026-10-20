@@ -99,11 +99,25 @@ class Workload:
 
     # --- actions ---
 
+    def reachable(self) -> bool:
+        """Whether its API answers at all right now. A short timeout: this asks "is anyone
+        home", not "is it busy", and on Windows a dead port costs seconds per attempt."""
+        return util.http("GET", self.url + self.health_path, timeout=2.0)[0] == 200
+
     def ensure_running(self, timeout: float = 60.0) -> None:
-        """Start its service if it's stopped, and wait until its API answers."""
+        """Start its service if it's stopped, and wait until its API answers.
+
+        Nothing to start and nothing answering is a dead end rather than a slow
+        start, so name the fix at once instead of waiting the whole timeout on a
+        port nobody owns."""
         if not self.service_active():
             util.log(f"starting {self.service.unit}")
             self.service.start()
+        if self.reachable():
+            return
+        if not getattr(self.service, "can_start", True):
+            raise SwitchError(f"{self.label}'s API is not answering and it has no service configured, so "
+                              "vhotseat cannot start it: start it yourself")
         url = self.url + self.health_path
         util.wait_until(lambda: util.http("GET", url)[0] == 200, timeout, f"{self.label} to answer {url}")
 

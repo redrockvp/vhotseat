@@ -98,6 +98,72 @@ def test_switch_comfy_refused_while_strata_answers(rig, capsys):
     t.join()
 
 
+def test_switch_closed_workload_does_not_block_the_other(rig):
+    """A workload that is simply switched off - API dead, nothing on the card, and no
+    service vhotseat could start - must not stall or refuse the other one's handover.
+    Closing it by hand is a normal way to free the GPU (seen 2026-10-19: a ComfyUI job
+    refused because switching to comfy waited 60s on a dead Strata port)."""
+    rig.strata.close()
+    started = time.monotonic()
+    assert rig.cli("switch", "comfy", "--wait", "5") == 0
+    assert time.monotonic() - started < 30, "stalled on a port nobody owns (a dead probe costs ~2s here)"
+    w = rig.arb.workloads["strata"]
+    assert w.busy() is None                       # off the card: idle, not "unknown"
+    assert w.release(0, 5) == []                  # nothing to release, nothing to wait for
+    # ComfyUI is lazy: with its models not loaded yet the mode stays "none"; the
+    # handover is done once nothing else is holding the card.
+    assert rig.arb.probe()["mode"] == "none"
+
+
+def test_switch_closed_but_still_on_the_card_is_refused(rig):
+    """Unanswerable is only safe when the GPU counters can see it holding nothing. A
+    process that keeps its VRAM after its API dies still blocks, and says what to do."""
+    rig.strata.loaded = True
+    rig.strata.close()
+    assert rig.cli("switch", "comfy", "--wait", "5") == 1
+    assert "still holds" in last(rig, "switch")["error"] and "MiB on the GPU" in last(rig, "switch")["error"]
+
+
+def test_switch_no_service_and_dead_api_fails_fast(rig, capsys):
+    """With no service to start it, a dead API is a dead end, not a slow boot: name the
+    fix at once instead of waiting out the timeout."""
+    from vhotseat import host
+    rig.strata.close()
+    rig.arb.workloads["strata"].service = host.NoService()
+    started = time.monotonic()
+    assert rig.cli("switch", "strata", "--json") == 1
+    assert time.monotonic() - started < 30, "stalled instead of naming the fix"
+    assert "no service configured" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_doctor_treats_a_switched_off_workload_as_stopped(rig):
+    """doctor: off the card and not answering is a warn with the reason, not a fail."""
+    from vhotseat import doctor, host
+    rig.strata.close()
+    found = [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: api"]
+    assert found and found[0][0] == "warn" and "treated as stopped" in found[0][2]
+    assert not [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: vram"]
+    rig.strata.loaded = True                               # now it is a stuck process
+    found = [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: api"]
+    assert found and found[0][0] == "fail" and "still holds" in found[0][2]
+
+
+def test_doctor_blind_workload_stays_busy(rig):
+    """No service and no vram.process: vhotseat can neither ask it nor see it, so an
+    unanswerable API must stay busy, and doctor says which blind spot caused it."""
+    from vhotseat import doctor, host
+    rig.strata.close()
+    rig.arb.workloads["strata"].service = host.NoService()
+    rig.cfg["workloads"]["strata"].pop("vram", None)
+    found = [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: vram"]
+    assert found and found[0][0] == "warn" and "can block a handover" in found[0][2]
+    found = [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: api"]
+    assert found and found[0][0] == "fail"
+    rig.cfg["workloads"]["strata"]["vram"] = {"process": "strata.exe"}   # now it is attributable
+    assert not [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: vram"]
+    assert [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: api"][0][0] == "warn"
+
+
 def test_switch_comfy_waits_for_strata_answer(rig):
     """An answer is never interrupted: --wait lets it finish, then unloads."""
     rig.strata.loaded = True

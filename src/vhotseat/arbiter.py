@@ -133,7 +133,10 @@ class Arbiter:
         for y in others:
             try:
                 if y.service_active():
-                    if ensure:
+                    # Don't wait on an API that isn't answering just to release it:
+                    # release() judges from the GPU counters whether there is anything
+                    # to release, which is what lets a closed workload stop blocking.
+                    if ensure and y.reachable():
                         y.ensure_running()
                     try:
                         done += y.release(wait, timeout)

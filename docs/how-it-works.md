@@ -273,6 +273,26 @@ about it. The LLM's `admission.min_free_vram_mib` is the last line of defence:
 it won't load into a GPU that lacks room. A job whose model doesn't fit fails
 with ComfyUI's own out-of-memory error.
 
+### 3.6 A workload was closed by hand
+
+Closing a workload's own program is a normal way to free the GPU for long stretches
+of other use - a gaming session, a reboot that doesn't bring the services back. An
+API that isn't answering is treated as **stopped** rather than busy, provided the GPU
+counters can attribute it (`vram.process`) and show it holding nothing on the card.
+`switch` then releases nothing, logs `nothing to release`, and the other workload
+takes the GPU without waiting on a dead port.
+
+Where that assumption doesn't hold, the old caution does:
+
+- its API died but it still holds VRAM (a stuck process): `switch` refuses, names the
+  MiB, and says to start it or kill it by hand;
+- no `vram.process` and no `service:` means vhotseat can neither ask it nor see it on
+  the card, so it counts as busy and `doctor` warns about the blind spot.
+
+A workload with no `service:` block is never started or restarted by vhotseat, so
+`ensure_running` fails at once with the fix instead of waiting out its timeout on a
+port nobody owns.
+
 ## 4. Deadlocks
 
 Three locks are in play:

@@ -15,6 +15,8 @@ class Systemd:
     """A systemd unit (`systemctl --user` when user=True). Its memory comes from
     the unit's cgroup."""
 
+    can_start = True        # vhotseat can start and restart this one itself
+
     def __init__(self, unit: str, user: bool = True):
         self.name = unit.removesuffix(".service")
         self.unit = f"{self.name}.service"
@@ -61,6 +63,7 @@ class NoService:
 
     name = None
     unit = None
+    can_start = False       # it runs some other way: vhotseat must not try to start it
 
     def is_active(self) -> bool:
         return True

@@ -104,18 +104,39 @@ class HttpWorkload(Workload):
         value = lookup(body, spec["path"]) if code == 200 else MISSING
         return value if isinstance(value, str) and value else None
 
+    def _vram_limit(self) -> int:
+        """The VRAM at or below which this workload counts as holding nothing on the card."""
+        return self.spec.get("confirm", {}).get("vram_at_most", self.idle_vram_mib)
+
     def busy(self) -> str | None:
         spec = self.spec.get("busy")
         if not spec or not self.service_active():
             return None
         code, body = self._call(spec)
         if code != 200:
-            return f"{self.label}'s API isn't answering, so whether it's busy is unknown"
+            # Unknown counts as busy, unless it plainly holds nothing: an API that isn't
+            # answering is a workload that isn't running, provided the GPU counters can
+            # attribute it (vram.process) and show it off the card.
+            if (held := self.vram_mib()) > self._vram_limit():
+                return (f"{self.label}'s API isn't answering and it holds {held} MiB on the GPU, "
+                        "so whether it's busy is unknown")
+            return None
         value = lookup(body, spec["path"])
         return f"{self.label} is busy" if value not in (MISSING, False, 0, None) else None
 
     def release(self, wait: float, timeout: float) -> list[str]:
         spec = self.spec["release"]
+        if not self.reachable():
+            # Its API is down. With no service to start it there is nothing to release
+            # and nothing to wait for, and stalling on a dead port would leave every
+            # other workload unable to take the GPU - closing the program would be
+            # punished for a minute. Safe only while the GPU counters can see it: if it
+            # is still on the card something is stuck, so name that instead of guessing.
+            if (held := self.vram_mib()) > self._vram_limit():
+                raise SwitchError(f"{self.label} is not answering and still holds {held} MiB on the GPU; "
+                                  "start it so vhotseat can release it, or kill the process")
+            util.log(f"{self.label} is not answering and holds nothing on the GPU: nothing to release")
+            return []
         if pre := spec.get("pre"):
             # e.g. a proxy: stop forwarding new requests, let running ones finish (up to wait).
             code, body = self._call(pre, timeout=wait + 30, wait=int(wait))
@@ -130,8 +151,7 @@ class HttpWorkload(Workload):
         if not any(matches(r, code, body) for r in ok):
             raise SwitchError(f"{self.label} {_request(spec)[1].split('?')[0]} failed: {code} {body}")
         confirm = self.spec.get("confirm", {})
-        limit = confirm.get("vram_at_most", self.idle_vram_mib)
-        util.wait_until(lambda: self.vram_mib() <= limit, confirm.get("timeout", 30),
+        util.wait_until(lambda: self.vram_mib() <= self._vram_limit(), confirm.get("timeout", 30),
                         f"{self.label}'s engine to leave the GPU")
         return []
 

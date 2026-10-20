@@ -335,6 +335,8 @@ class FakeGpu:
 
 
 class _FakeService:
+    can_start = True
+
     def __init__(self, host, name):
         self.host, self.name, self.unit = host, name, f"{name}.service"
 
