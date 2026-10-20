@@ -36,7 +36,7 @@ COMMON = {"driver", "label", "url", "service", "vram", "idle_vram_mib", "gate", 
           "allow_restart", "restart_timeout_s"}
 GATE_KEYS = {"kind", "timeout", "config", "custom_nodes", "status"}
 DRIVER_KEYS = {
-    "http": {"resident", "busy", "release", "confirm", "load", "model"},
+    "http": {"resident", "busy", "release", "confirm", "load", "model", "headers", "body"},
     "comfyui": {"restart_above_ram_mib", "history_settle_s"},
 }
 
@@ -190,6 +190,17 @@ def validate(raw) -> dict:
             _check(isinstance(gate["status"], str) and gate["status"].startswith(("http://", "https://")),
                    f"{where}.gate.status", "expected the proxy's http://…/_vhotseat/status URL")
         if driver == "http":
+            hdr = w.get("headers") or {}
+            _check(isinstance(hdr, dict) and all(isinstance(k, str) and isinstance(v, str) and k and v
+                                                for k, v in hdr.items()),
+                   f"{where}.headers", "expected names and values as strings, "
+                                       'e.g. {Authorization: "Bearer ${SOME_KEY}"}')
+            for k, v in hdr.items():
+                _check(not any(n in v for n in ("\r", "\n")), f"{where}.headers.{k}",
+                       "a header value can't contain a newline")
+            body = w.get("body")
+            _check(body is None or isinstance(body, dict), f"{where}.body",
+                   "expected a mapping of field to value (strings may use {model} or {wait})")
             _request(w.get("resident"), f"{where}.resident", needs_path=True)
             if "busy" in w:
                 _request(w["busy"], f"{where}.busy", needs_path=True)

@@ -29,6 +29,15 @@ workloads:
     confirm: {vram_at_most: 0}    # released once its VRAM is down to this
     load: {post: /load, timeout: 300}   # `switch strata` leaves it loaded
     model: {get: /health, path: model}  # which model it serves; picks the admission below
+    # headers: {Authorization: "Bearer ${SOME_KEY}"}   # sent with every request vhotseat makes
+    #                                       # to this workload. $NAME reads the environment:
+    #                                       # a key doesn't belong in a file that gets pasted
+    #                                       # around. Ask for one and get a 401, and status
+    #                                       # says "asks for a key it isn't being sent" rather
+    #                                       # than pretending the server is down.
+    # body: {model_path: "{model}"}        # JSON body for a POST: {model} is what `model:`
+    #                                       # says is served, {wait} the release's wait. For
+    #                                       # servers that release one model at a time by id.
     gate:
       kind: hook       # Strata runs `vhotseat gate strata` before every load
       config: ~/Strata/strata.json   # its config file, checked by doctor

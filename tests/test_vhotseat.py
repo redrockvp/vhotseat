@@ -361,6 +361,60 @@ def test_gate_doesnt_count_a_loaded_workloads_own_memory(vh):
     assert vh.host.restarts == []
 
 
+def test_a_workload_that_needs_a_key_says_so_rather_than_looking_down(vh, monkeypatch):
+    """A 401 is not "the server is down": it is answering and refusing. Blurred together,
+    a key that rotated sends every handover off hunting for a dead port."""
+    w = vh.arb.workloads["strata"]
+    w.spec["headers"] = {"Authorization": "Bearer ${VH_TEST_KEY}"}
+    vh.strata.want_header = "Bearer sekrit"
+    monkeypatch.delenv("VH_TEST_KEY", raising=False)
+    said = w.describe(vh.arb.probe()["strata"])
+    assert "isn't being sent" in said and "VH_TEST_KEY" in said
+    monkeypatch.setenv("VH_TEST_KEY", "sekrit")
+    st = vh.arb.probe()["strata"]
+    assert st["reachable"] is True and st["loaded"] is False
+    assert vh.strata.last_headers.get("authorization") == "Bearer sekrit"
+    # doctor must say the same thing rather than calling it down.
+    from vhotseat import doctor
+    monkeypatch.delenv("VH_TEST_KEY", raising=False)
+    said = [d for lvl, key, d in doctor.checks(vh.arb, vh.cfg) if key == "strata: api"]
+    assert said and "wants a key" in said[0] and "VH_TEST_KEY" in said[0]
+
+
+def test_a_release_can_name_the_model_it_is_unloading(vh):
+    """Some servers unload one model at a time, by name. {model} comes from `model:`, so
+    the release says which model it means instead of guessing."""
+    w = vh.arb.workloads["strata"]
+    w.spec["release"]["body"] = {"model_path": "{model}"}
+    assert vh.arb.switch("comfy", 0)["ok"] is True
+    assert vh.strata.last_body == {"model_path": vh.strata.model}
+
+
+def test_an_id_naming_release_is_skipped_when_nothing_is_loaded(vh):
+    """Servers that unload one model by id (Unsloth does) make an empty id either an error
+    or a lie that nothing happened. With nothing loaded, the ask is skipped instead, so a
+    handover through that workload doesn't die on a 422."""
+    w = vh.arb.workloads["strata"]
+    w.spec["model"] = {"get": "/health", "path": "model"}
+    w.spec["release"]["body"] = {"model_path": "{model}"}
+    vh.strata.loaded, vh.strata.model = False, ""
+    assert vh.arb.switch("comfy", 0)["ok"] is True
+    assert "POST /unload" not in vh.strata.calls
+
+
+def test_header_values_are_validated(vh):
+    """A header that isn't a string, or carries a newline, would break every request that
+    workload makes - and fail as a confusing HTTP error rather than a config error."""
+    import pytest as _pt
+    raw = config.parse((ROOT / "config.example.yaml").read_text())
+    raw["workloads"]["strata"]["headers"] = {"Authorization": 42}
+    with _pt.raises(config.ConfigError, match=r"headers"):
+        config.validate(raw)
+    raw["workloads"]["strata"]["headers"] = {"Authorization": "Bearer a\r\nX-Injected: 1"}
+    with _pt.raises(config.ConfigError, match=r"newline"):
+        config.validate(raw)
+
+
 def test_cli_why_reads_the_handover_decision(vh, capsys):
     """`vhotseat why` is the dry run for when a job won't start: the same preconditions
     `switch` checks, read off the machine, releasing nothing."""

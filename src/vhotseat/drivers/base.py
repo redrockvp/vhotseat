@@ -99,10 +99,15 @@ class Workload:
 
     # --- actions ---
 
+    def health_call(self, timeout: float = 5.0):
+        """The request that says whether this workload's API is home at all. A driver
+        overrides it when that request needs headers or a body of its own."""
+        return util.http("GET", self.url + self.health_path, timeout=timeout)
+
     def reachable(self) -> bool:
         """Whether its API answers at all right now. A short timeout: this asks "is anyone
         home", not "is it busy", and on Windows a dead port costs seconds per attempt."""
-        return util.http("GET", self.url + self.health_path, timeout=2.0)[0] == 200
+        return self.health_call(timeout=2.0)[0] == 200
 
     def ensure_running(self, timeout: float = 60.0) -> None:
         """Start its service if it's stopped, and wait until its API answers.

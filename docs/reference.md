@@ -98,6 +98,42 @@ A ComfyUI restart wipes its `/history`, so it only happens with an empty queue,
 and once the latest result is at least 10 s old (`history_settle_s`), so
 clients reading results have had time to.
 
+## Talking to a server that isn't a plain server
+
+Two things a URL doesn't cover:
+
+- **A key.** `headers:` are sent with every request vhotseat makes to that workload:
+
+  ```yaml
+  headers: {Authorization: "Bearer ${UNSLOTH_KEY}"}
+  ```
+
+  `$NAME` and `${NAME}` read the environment, because a key doesn't belong in a config file
+  that gets pasted into terminals and committed. If the name isn't in the environment,
+  nothing is invented for it: `status` says *asks for a key it isn't being sent (401)* and
+  `doctor` fails naming the variable. A 401 is reported as **answering and refusing**, never
+  as *not answering*: blurred together, a key that rotated looks like a server that's down,
+  and every handover starts looking for a dead port.
+- **A named unload.** Some servers release one model at a time and want its id in a body.
+  `body:` provides it, with `{model}` filled from what `model:` says is served and `{wait}`
+  from the release's wait:
+
+  ```yaml
+  release:
+    post: /api/inference/unload
+    body: {model_path: "{model}"}
+  ```
+
+  With nothing loaded there's no id to send, and an empty one is either a 422 or a success
+  that did nothing: the ask is skipped and logged (`no model loaded: nothing to release`).
+  If the workload says something *is* loaded and `model:` can't name it, the release fails
+  and names the key to fix, rather than reporting success over a model that stayed on the
+  card.
+
+A workload with nothing inside it that can ask for the GPU - no hook, no plugin - is
+declared `gate: {kind: hold}`: it is guarded only while it runs under `vhotseat hold`, so
+the habit is to take the card for it (`vhotseat switch NAME`) before loading anything there.
+
 ## The ComfyUI guard
 
 [integrations/comfyui/vhotseat_guard](../integrations/comfyui/vhotseat_guard)

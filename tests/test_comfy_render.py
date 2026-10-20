@@ -104,12 +104,16 @@ def test_guard_refusal_is_reported(cr, tmp_path, capsys):
     assert "GPU busy, job not run: Strata is answering or loading" in capsys.readouterr().out
 
 
-def test_job_deleted_from_queue_is_cancelled_exit_4(cr, tmp_path, capsys):
+def test_job_deleted_from_queue_is_cancelled_exit_4(cr, tmp_path, capsys, monkeypatch):
+    # The poll interval must be well inside the slow node's runtime: at the default 2 s poll
+    # against a 1 s node, a loaded machine can let the second job run before anything looks
+    # at the queue, and the deletion is simply never seen.
+    monkeypatch.setattr(cr, "POLL_S", 0.05)
     cr.fake.slow_s = 1.0
     jobs = [{"1": {"class_type": "Slow", "inputs": {}}, "2": {"class_type": "SaveImage", "inputs": {}}}, save()]
 
     def cancel_second():
-        while len(cr.fake.pending) < 1:
+        while not cr.fake.running:        # job 1 is on the fake's executor: job 2 is still queued
             time.sleep(0.01)
         cr.fake.pending.clear()  # someone deleted it from ComfyUI's queue
 

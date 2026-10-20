@@ -61,12 +61,15 @@ def replace(tmp, path, tries: int = 20) -> None:
             time.sleep(0.05)
 
 
-def http(method: str, url: str, body: dict | None = None, timeout: float = 5.0):
+def http(method: str, url: str, body: dict | None = None, timeout: float = 5.0,
+         headers: dict | None = None):
     """Return (status, parsed JSON or text), or (None, error string) if unreachable."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     if data is not None:
         req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status, raw = resp.status, resp.read()

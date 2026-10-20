@@ -147,7 +147,7 @@ def checks(arbiter, cfg: dict | None) -> list:
                         f"{w.service.unit} {'active' if active else 'stopped (started on demand)'}"))
             if not active:
                 continue
-        code, _ = util.http("GET", w.url + w.health_path)
+        code, _ = w.health_call()
         held = w.vram_mib()
         # Can the GPU counters attribute this workload at all? That is what makes an
         # unanswerable API safe to read as stopped instead of busy, so ask the config,
@@ -156,6 +156,14 @@ def checks(arbiter, cfg: dict | None) -> list:
         blind = not getattr(w.service, "can_start", True) and not selector
         if code == 200:
             out.append((OK, f"{w.name}: api", f"{w.url}{w.health_path} answered 200"))
+        elif code in (401, 403):
+            # Answering and refusing is a different fault from being down, and the fix is
+            # the key rather than the server.
+            miss = getattr(w, "headers_missing", [])
+            out.append((FAIL, f"{w.name}: api",
+                        f"{w.url}{w.health_path} answered {code}: it wants a key vhotseat isn't "
+                        f"sending - fix `headers:`"
+                        + (f" (${' , $'.join(miss)} not in the environment)" if miss else "")))
         elif held <= w.idle_vram_mib and not blind:
             # Off the card and not answering: it is switched off, which is a normal way
             # to leave the GPU free, not a fault - nothing here can start it back up.

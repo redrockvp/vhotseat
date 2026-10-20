@@ -46,10 +46,13 @@ class _Server:
                 self.wfile.write(raw)
 
             def do_GET(self):
+                outer.last_headers = {k.lower(): v for k, v in self.headers.items()}
                 outer.route(self, "GET", self._url(), None)
 
             def do_POST(self):
-                outer.route(self, "POST", self._url(), self._body())
+                outer.last_headers = {k.lower(): v for k, v in self.headers.items()}
+                outer.last_body = self._body()
+                outer.route(self, "POST", self._url(), outer.last_body)
 
             def _url(self):
                 u = urlsplit(self.path)
@@ -59,6 +62,9 @@ class _Server:
         self.httpd.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         self.calls: list[str] = []
+        self.last_headers: dict[str, str] = {}     # what the last request sent, and
+        self.last_body = None                      # what it carried, for auth/body tests
+        self.want_header: str | None = None        # answer 401 unless this arrives
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
     def close(self):
@@ -120,6 +126,8 @@ class FakeStrata(_Server):
         path, q = url
         self.calls.append(f"{method} {path}")
         if path == "/health":
+            if self.want_header and self.last_headers.get("authorization") != self.want_header:
+                return h.send_json(401, {"error": "unauthorized"})
             return h.send_json(200, {"status": "ok", "loaded": self.loaded, "model": self.model})
         if path == "/_vram":  # for a gpu-workload running in a subprocess (tests/run_cli.py)
             return h.send_json(200, {"vram": self.vram})
