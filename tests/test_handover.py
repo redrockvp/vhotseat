@@ -13,6 +13,9 @@ from pathlib import Path
 
 import pytest
 from conftest import cli_bin
+from fakes import COMFY_CONTEXT_VRAM
+
+from vhotseat import claims, host
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -37,7 +40,7 @@ def test_status_json_shape_is_unchanged(rig, capsys):
     """A dashboard reads these keys: they are the --json contract."""
     assert rig.cli("status", "--json") == 0
     s = json.loads(capsys.readouterr().out)
-    assert set(s) == {"mode", "strata", "comfy", "gpu", "holders", "ram", "last_event"}
+    assert set(s) == {"mode", "strata", "comfy", "gpu", "holders", "claims", "ram", "last_event"}
     assert set(s["strata"]) == {"service", "reachable", "loaded"}
     assert set(s["comfy"]) == {"service", "reachable", "running", "pending", "holds_models"}
     assert set(s["gpu"]) == {"total_mib", "free_mib", "strata_mib", "comfy_mib", "other_mib"}
@@ -251,6 +254,86 @@ def test_why_shows_the_admission_arithmetic_and_blames_the_right_memory(rig):
     assert why["strata"]["would"] == "blocked"
     assert any("only loads with 14000 MiB free" in n for n in why["strata"]["notes"])
     assert any("processes vhotseat doesn't manage" in n for n in why["strata"]["notes"])
+
+
+def test_a_claim_refuses_a_load_nobody_chose(rig, monkeypatch, capsys):
+    """While a game owns the card, a model may not be loaded on top of it. The gate is
+    what decides that, so the agent's request comes back as "GPU busy" rather than
+    running the game off the machine."""
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: [
+        {"pid": 4242, "name": "game.exe", "exe": None, "note": "a Steam game", "by": "game.exe"}])
+    assert rig.arb.gate("strata") is False
+    assert "claimed by game.exe (a Steam game)" in capsys.readouterr().err
+    assert last(rig, "strata-load")["allowed"] is False
+
+
+def test_a_requested_switch_is_refused_while_a_game_runs(rig, monkeypatch):
+    """ComfyUI's guard asks for the card on the queue's behalf: a claim refuses it, so
+    a job never loads a 20 GB model over somebody's game."""
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: [
+        {"pid": 4242, "name": "game.exe", "exe": None, "note": "a Steam game", "by": "game.exe"}])
+    r = rig.arb.switch("comfy", 0, request=True)
+    assert r["ok"] is False and "claimed by game.exe" in r["error"]
+    assert rig.comfy.vram == COMFY_CONTEXT_VRAM       # nothing loaded, just its CUDA context
+
+
+def test_a_switch_somebody_typed_is_still_an_order(rig, monkeypatch):
+    """The claim rule is about loads nobody chose. `vhotseat switch comfy` at a terminal
+    is a decision, and vhotseat doesn't second-guess it."""
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: [
+        {"pid": 4242, "name": "game.exe", "exe": None, "note": "a Steam game", "by": "game.exe"}])
+    assert rig.arb.switch("comfy", 0)["ok"] is True
+    assert rig.comfy.vram > 0
+
+
+def test_a_requested_switch_that_would_load_nothing_is_not_refused(rig, monkeypatch):
+    """A batch mid-flight keeps its next job: the model is already on the card, so the
+    next prompt loads nothing, and "never interrupt" outranks a game that started
+    between clips. The job that would have *loaded* the model is still refused."""
+    game = [{"pid": 4242, "name": "game.exe", "exe": None, "note": "a Steam game", "by": "game.exe"}]
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: game)
+    # ComfyUI is lazy: with no model loaded, its first job is a load, so it's refused.
+    assert rig.arb.switch("comfy", 0, request=True)["ok"] is False
+    rig.arb.switch("comfy", 0)                       # a person's order: card and model
+    rig.comfy.vram = 7000                            # model resident, queue empty between clips
+    assert rig.arb.switch("comfy", 0, request=True)["ok"] is True
+
+
+def test_why_blames_the_claim(rig, monkeypatch):
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: [
+        {"pid": 4242, "name": "game.exe", "exe": None, "note": "a Steam game", "by": "game.exe"}])
+    why = rig.arb.why_all()
+    assert why["comfy"]["would"] == "blocked"
+    assert any("claimed by game.exe (a Steam game)" in n for n in why["comfy"]["notes"])
+
+
+def test_status_says_who_owns_the_card_by_right(rig, monkeypatch):
+    """The whole path, not a patched answer: a rule, a process table, and the line a
+    person reads in `status`. Twenty pids of one game come out as one grouped line."""
+    monkeypatch.setattr(rig.arb, "claim_rules",
+                        claims.rules([{"name": "game.exe", "note": "a Steam game"}], builtin=False))
+    monkeypatch.setattr(host, "processes", lambda: {
+        n: {"pid": n, "ppid": 1, "name": "game.exe", "exe": None} for n in (1, 2, 3)})
+    s = rig.arb.probe()
+    assert len(s["claims"]) == 3
+    assert "claims:" in rig.arb.describe(s)
+    assert "game.exe x3 (a Steam game)" in rig.arb.describe(s)
+
+
+def test_cli_claims_lists_what_matches_and_the_rules(rig, monkeypatch, capsys):
+    monkeypatch.setattr(rig.arb, "claim_rules",
+                        claims.rules([{"name": "game.exe", "note": "the game I play"}], builtin=False))
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: [
+        {"pid": 4242, "name": "game.exe", "exe": r"D:\Games\game.exe", "note": "the game I play",
+         "by": "game.exe (D:\\Games\\game.exe)"}])
+    assert rig.cli("claims", "--json") == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["hits"][0]["name"] == "game.exe"
+    assert out["rules"] == [{"name": "game.exe", "note": "the game I play"}]
+    assert rig.cli("claims") == 0
+    text = capsys.readouterr().out
+    assert "the card is claimed by game.exe (the game I play)" in text
+    assert "- name game.exe  (the game I play)" in text      # what's in force, and why
 
 
 def test_hook_allows_when_comfy_idle(rig):

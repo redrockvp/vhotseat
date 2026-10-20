@@ -100,6 +100,7 @@ tr.hl td { background: var(--wash); }
 .notice code, td code { font-size: 12px; background: var(--wash); padding: 1px 5px; border-radius: 4px; }
 .workloads { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-bottom: 14px; }
 .holders { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px 18px; margin-top: 4px; }
+.who.claim { color: var(--critical); }
 .whys { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px 18px; }
 .why { font-size: 13px; }
 .why .whyhead { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
@@ -688,8 +689,21 @@ function renderOwner() {
 
 function renderHolders() {
   const s = state.status, g = s.gpu || {}, box = $("holders"), rows = s.holders || [];
-  $("holdersNote").textContent = g.error ? "" :
-    `${gib(g.other_mib)} GiB held by processes vhotseat doesn't manage`;
+  const claims = s.claims || [];
+  const groups = {};
+  for (const c of claims) {
+    const g = groups[c.name + "\u0000" + c.note] || (groups[c.name + "\u0000" + c.note] = { name: c.name, note: c.note, n: 0 });
+    g.n++;
+  }
+  const named = Object.values(groups).map((g) => g.name + (g.n > 1 ? ` x${g.n}` : "") + ` (${g.note})`);
+  $("holdersNote").textContent = claims.length
+    ? `the card is claimed by ${named.slice(0, 3).join(", ")}` +
+      (named.length > 3 ? ` and ${named.length - 3} more` : "") + ": nothing new loads while it runs"
+    : (g.error ? "" : `${gib(g.other_mib)} GiB held by processes vhotseat doesn't manage`);
+  $("holdersNote").textContent = claims.length
+    ? `${claims.map((c) => `${c.name} (${c.note})`).join(", ")} ` +
+      `${claims.length > 1 ? "own" : "owns"} the card: nothing new loads while they run`
+    : (g.error ? "" : `${gib(g.other_mib)} GiB held by processes vhotseat doesn't manage`);
   if (g.error) {
     box.replaceChildren(el("p", { class: "notice" }, `can't read the card: ${g.error}`));
     return;
@@ -707,7 +721,10 @@ function renderHolders() {
     const bar = el("div", { class: "bar" }), fill = el("i");
     fill.style.width = `${Math.min(100, Math.round(100 * r.mib / used))}%`;
     fill.style.background = r.workload ? colorOf(r.workload) : "var(--muted)";
-    row.append(top, bar, el("div", { class: "who" }, r.workload ? labelOf(r.workload) : "unmanaged"));
+    const c = (s.claims || []).find((x) => x.pid === r.pid);
+    row.append(top, bar, el("div", { class: c ? "who claim" : "who" },
+                            c ? `owns the card: ${c.note}`
+                              : (r.workload ? labelOf(r.workload) : "unmanaged")));
     return row;
   }));
 }

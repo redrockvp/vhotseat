@@ -109,3 +109,27 @@ power:
   price_per_kwh: 4.11    # eThekwini (Durban) home tariff 2026/27, incl VAT, from 1 July 2026
   currency: "R"
   note: "eThekwini home 2026/27: 357.47 c/kWh ex VAT, no fixed charge"
+
+# What owns the card by right rather than by arrangement: a game, or anything else you
+# name. While something matches, nothing *new* loads: the LLM's gate refuses a load that
+# a request would wake, and ComfyUI's guard - which asks with `switch comfy --request`,
+# the queue asking on somebody's behalf - is refused too. A `switch` you type yourself is
+# an order and isn't refused; neither is a requested switch that would load nothing, so a
+# batch mid-flight carries on. Nothing loaded is interrupted, and no claimed process is
+# ever touched: vhotseat doesn't kill games, it declines to load 20 GB on top of one. The
+# check runs inside every decision, so nothing resident is needed for it to hold;
+# `vhotseat watch` only records it. See docs/how-it-works.md §3.7.
+#
+# The built-in rules know the usual installations: Steam (anything under
+# steamapps\common), Epic Games, Riot Games, anything under a \Games\ folder, Roblox, and
+# a few named exes. Launchers (Steam, Epic, EA, Riot, Battle.net, Ubisoft) and their
+# helper processes never claim the card: they run all day. Add what's missing:
+#
+# claims:
+#   - path: '*\World of Warcraft\*'    # matched against the process's image path
+#     note: World of Warcraft          # how a refusal describes it
+#   - name: rocketleague.exe           # or by exe name: works when the path can't be
+#                                      # read, e.g. the game runs elevated
+#   - parent: mylauncher.exe           # or by any ancestor's exe name; it matches that
+#                                      # launcher's helpers too, so prefer path or name
+# claims_builtin: true                 # false leaves only the rules you wrote

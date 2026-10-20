@@ -52,7 +52,12 @@ def take_gpu() -> None:
     """Switch the GPU to ComfyUI, or raise GpuBusy with vhotseat's reason."""
     try:
         r = subprocess.run(
-            [BIN, "switch", "comfy", "--wait", str(WAIT_S)],
+            # --request: the queue is asking on somebody's behalf, not a person typing
+            # `vhotseat switch comfy`. A claimed process (a game) refuses this one, so a
+            # job never loads a model on top of the card someone is playing on; it doesn't
+            # refuse the typed command, and it doesn't refuse a job at all once ComfyUI
+            # already holds the card, so a batch in flight carries on.
+            [BIN, "switch", "comfy", "--request", "--wait", str(WAIT_S)],
             capture_output=True, text=True, timeout=WAIT_S + 120, **NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired) as e:

@@ -35,6 +35,10 @@ def example_config(strata_url: str, comfy_url: str) -> dict:
     raw = config.parse((ROOT / "config.example.yaml").read_text())
     raw["workloads"]["strata"]["url"] = strata_url
     raw["workloads"]["comfy"]["url"] = comfy_url
+    # Claims are matched against what is really running on this machine, so leave them
+    # off here: a game on whoever runs the suite must not change what a gate or switch
+    # test sees. tests/test_claims.py tests the rules against a process table instead.
+    raw["claims"], raw["claims_builtin"] = [], False
     return config.validate(raw)
 
 

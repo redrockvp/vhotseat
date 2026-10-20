@@ -10,7 +10,7 @@ import urllib.request
 
 import pytest
 
-from vhotseat import config, telemetry, util, web
+from vhotseat import claims, config, host, telemetry, util, web
 from vhotseat.telemetry import Telemetry
 
 
@@ -133,6 +133,41 @@ def test_web_serves_the_page_and_history_recorded_before_it_started(rig, server)
     assert get(f"{server}/api/nope")[0] == 404
     code, icon = get(server + "/favicon.svg")
     assert code == 200 and icon.startswith(b"<svg") and b'href="/favicon.svg"' in page
+
+
+def test_the_dashboard_is_the_claim_recorder_wherever_it_runs(rig, server, monkeypatch):
+    """A box that runs `vhotseat web` already has something probing the machine every few
+    seconds. It should record the claims itself rather than needing a second process."""
+    monkeypatch.setattr(rig.arb, "claim_rules",
+                        claims.rules([{"name": "game.exe", "note": "a Steam game"}], builtin=False))
+    monkeypatch.setattr(host, "processes", lambda: {1: {"pid": 1, "ppid": 1, "name": "game.exe", "exe": None}})
+    get(f"{server}/api/status")
+    monkeypatch.setattr(host, "processes", lambda: {})
+    time.sleep(1.1)                       # the status cache's second
+    get(f"{server}/api/status")
+    rows = [e for e in rig.events() if e["event"] in ("claim", "claim-end")]
+    assert [(e["event"], e["name"], e["source"]) for e in rows] == [
+        ("claim", "game.exe", "watch"), ("claim-end", "game.exe", "watch")]
+
+
+def test_watch_records_one_claim_row_per_kind_of_process(rig, monkeypatch):
+    """One game is twenty processes, and a browser or an anti-cheat helper is more. The
+    log should say the card was claimed - once - and when it came back."""
+    polls = {"n": 0}
+
+    def hits():
+        polls["n"] += 1
+        if polls["n"] > 2:
+            return []                                  # the game closed
+        return [{"pid": n, "name": "game.exe", "exe": None, "note": "a Steam game",
+                 "by": "game.exe"} for n in (11, 12)]
+
+    monkeypatch.setattr(rig.arb, "claim_hits", hits)
+    monkeypatch.setattr(rig.arb.telemetry, "interval_s", 0.02)
+    assert web.watch(rig.arb, polls=3) == 0
+    rows = [e for e in rig.events() if e["event"] in ("claim", "claim-end")]
+    assert [(e["event"], e["name"], e.get("processes")) for e in rows] == [
+        ("claim", "game.exe", 2), ("claim-end", "game.exe", 2)]
 
 
 def test_sampler_samples_in_the_background(rig, monkeypatch):

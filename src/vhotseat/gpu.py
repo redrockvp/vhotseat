@@ -17,6 +17,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from . import host
+
 
 class GpuError(Exception):
     pass
@@ -50,36 +52,14 @@ def _read_proc_windows(pid: int) -> tuple[str, str]:
         k32.CloseHandle(h)
 
 
-class _ProcEntry(ctypes.Structure):
-    _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong),
-                ("th32ProcessID", ctypes.c_ulong), ("th32DefaultHeapID", ctypes.c_void_p),
-                ("th32ModuleID", ctypes.c_ulong), ("th32Threads", ctypes.c_ulong),
-                ("th32ParentProcessID", ctypes.c_ulong), ("pcPriClassBase", ctypes.c_long),
-                ("dwFlags", ctypes.c_ulong), ("szExeFile", ctypes.c_wchar * 260)]
-
-
 def process_names() -> dict[int, str]:
     """Windows: pid -> exe name for every process, from a Toolhelp snapshot.
 
     Unlike OpenProcess, a snapshot needs no handle, so it still names processes this
     process cannot open - an elevated workload, for example, whose path and command
-    line are unreadable and whose VRAM would otherwise be unattributable."""
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
-    snap = ctypes.c_void_p(k32.CreateToolhelp32Snapshot(0x2, 0))   # TH32CS_SNAPPROCESS
-    if not snap or ctypes.cast(snap, ctypes.c_void_p).value in (None, -1):
-        return {}
-    entry = _ProcEntry()
-    entry.dwSize = ctypes.sizeof(_ProcEntry)
-    out: dict[int, str] = {}
-    try:
-        rc = k32.Process32FirstW(snap, ctypes.byref(entry))
-        while rc:
-            out[entry.th32ProcessID] = entry.szExeFile
-            rc = k32.Process32NextW(snap, ctypes.byref(entry))
-    finally:
-        k32.CloseHandle(snap)
-    return out
+    line are unreadable and whose VRAM would otherwise be unattributable. host.processes()
+    is the same snapshot with parents and image paths, for claims and for `status`."""
+    return {pid: p["name"] for pid, p in host.processes().items() if p["name"]}
 
 
 class _PdhItem(ctypes.Structure):  # PDH_FMT_COUNTERVALUE_ITEM_W with a LONGLONG value

@@ -11,6 +11,8 @@
   vhotseat autostart ACTION                 install|status|remove: keep web (or record) up from logon
   vhotseat cost [--since 24h]               what the card's power has cost (needs power.price_per_kwh)
   vhotseat why [NAME]                       why a workload can or can't take the GPU right now
+  vhotseat claims                           what owns the card by right (a game), and what matches now
+  vhotseat watch                            note when a claim starts and ends, and sample, until stopped
 
 Exit codes: 0 ok · 1 failed / refused · 2 usage or bad config. `hold` exits with
 CMD's own exit code once CMD has started. `autostart status` exits 1 when nothing
@@ -23,6 +25,7 @@ import json
 import sys
 import time
 
+from . import claims
 from . import config as cfgmod
 from . import util
 from .arbiter import NONE, Arbiter
@@ -44,6 +47,9 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp.add_argument("name")
     sp.add_argument("--wait", type=float, default=0, metavar="SECONDS",
                     help="wait this long for running work to finish instead of failing")
+    sp.add_argument("--request", action="store_true",
+                    help="this switch is a workload asking for someone else (ComfyUI's guard): a "
+                         "claimed process refuses it, a switch you typed yourself does not")
     sp.add_argument("--json", action="store_true")
     sp = sub.add_parser("hold", help="give the GPU to a workload and keep it until COMMAND exits")
     sp.add_argument("name")
@@ -64,10 +70,14 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
     sp.add_argument("--port", type=int, default=8765, help="port (default 8765)")
     sub.add_parser("record", help="sample RAM and VRAM into the telemetry until stopped (for a service)")
+    sub.add_parser("watch", help="record when a claim (a game) starts and ends, and sample, until stopped")
+    sp = sub.add_parser("claims", help="what owns the card by right, and what matches right now")
+    sp.add_argument("--json", action="store_true")
     sp = sub.add_parser("autostart", help="keep the dashboard and sampling up from logon")
     sp.add_argument("action", choices=("install", "status", "remove"))
-    sp.add_argument("--command", choices=("web", "record"), default="web",
-                    help="what starts at logon: web (the dashboard, which also samples) or record")
+    sp.add_argument("--command", choices=("web", "record", "watch"), default="web",
+                    help="what starts at logon: web (the dashboard, which also samples), "
+                         "record (sampling only) or watch (sampling plus claim events)")
     sp = sub.add_parser("cost", help="what the card's power has cost over a window")
     sp.add_argument("--since", default="24h", metavar="WINDOW",
                     help="how far back: 90m, 24h, 7d or seconds (default 24h)")
@@ -131,9 +141,11 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
         if args.exercise:
             return exercise(arbiter, args.exercise, args.wait, json_out)
         return run(arbiter, cfg, json_out)
-    if args.cmd in ("web", "record"):
+    if args.cmd in ("web", "record", "watch"):
         from . import web
-        return web.serve(arbiter, args.host, args.port) if args.cmd == "web" else web.record(arbiter)
+        if args.cmd == "web":
+            return web.serve(arbiter, args.host, args.port)
+        return web.record(arbiter) if args.cmd == "record" else web.watch(arbiter)
     if args.cmd == "autostart":
         from . import autostart
         if args.action == "install":
@@ -141,6 +153,27 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
         if args.action == "remove":
             return autostart.remove()
         return autostart.status()
+    if args.cmd == "claims":
+        hits = arbiter.claim_hits()
+        if json_out:
+            print(json.dumps({"hits": hits,
+                              "rules": [{k: v for k, v in vars(r).items() if v} for r in arbiter.claim_rules]}))
+        else:
+            if hits:
+                print(f"the card is claimed by {claims.describe(hits)}: nothing new loads while it runs")
+                for h in hits[:8]:
+                    print(f"{'':<12}- pid {h['pid']}: {h['by']}")
+                    if h["exe"]:
+                        print(f"{'':<12}  {h['exe']}")
+                if len(hits) > 8:
+                    print(f"{'':<12}- and {len(hits) - 8} more processes")
+            else:
+                print("nothing claims the card right now")
+            print(f"rules ({len(arbiter.claim_rules)}):")
+            for r in arbiter.claim_rules:
+                where, what = next((w, getattr(r, w)) for w in ("name", "path", "parent") if getattr(r, w))
+                print(f"{'':<12}- {where} {what}" + (f"  ({r.note})" if r.note else ""))
+        return EXIT_OK
     if args.cmd == "why":
         why = arbiter.why_all()
         if args.name:
@@ -198,7 +231,7 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
     # A switch may wait minutes for running work to finish (the ComfyUI guard waits up
     # to 300 s): sample meanwhile.
     with Sampler(arbiter) if args.wait else contextlib.nullcontext():
-        result = arbiter.switch(name, args.wait)
+        result = arbiter.switch(name, args.wait, request=args.request)
     result.pop("exception", None)
     if result.pop("inside_hold", None):
         return EXIT_FAIL

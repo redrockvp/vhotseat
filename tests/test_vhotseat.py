@@ -20,6 +20,7 @@ def config_for(strata_url, comfy_url, **strata_extra):
     raw["workloads"]["strata"]["url"] = strata_url
     raw["workloads"]["comfy"]["url"] = comfy_url
     raw["workloads"]["strata"].update(strata_extra)
+    raw["claims"], raw["claims_builtin"] = [], False      # see conftest.example_config
     return config.validate(raw)
 
 

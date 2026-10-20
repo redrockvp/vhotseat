@@ -293,6 +293,37 @@ A workload with no `service:` block is never started or restarted by vhotseat, s
 `ensure_running` fails at once with the fix instead of waiting out its timeout on a
 port nobody owns.
 
+### 3.7 A game starts while a model is loaded
+
+A game isn't a workload: it has no API to ask, and killing it isn't vhotseat's call.
+What vhotseat can still do is stop putting anything *on top of* it. A `claims:` rule -
+or a built-in one for the usual installations - names the processes that own the card
+by being the thing a person is using. While one of them runs:
+
+- the gate refuses a load nobody chose: a request that would wake Strata comes back 503
+  "GPU busy" as any other refusal does (§2), and the agent is told who has the card;
+- a **requested** switch is refused. ComfyUI's guard node asks with
+  `switch comfy --request`, because the queue is asking on somebody's behalf. A switch
+  a person typed at a terminal is an order, and isn't refused;
+- nothing already loaded is touched. A render in flight keeps the card and finishes,
+  and the next prompt of that batch goes ahead, because the card is already ComfyUI's
+  and nothing new would load. The game waits out that clip exactly as a `switch` does.
+
+The check happens at the moment of the decision - a machine-wide process snapshot costs
+tens of milliseconds - so the rule holds with nothing resident: no daemon has to notice
+the game for the refusal to happen. Recording it is a separate, smaller job: `claim` and
+`claim-end` rows in the event log, grouped per process name. Whatever probes often
+enough is the recorder - `vhotseat watch` on a headless box, or `vhotseat web` where the
+dashboard already runs - which is what lets the dashboard show when the card was somebody
+else's.
+
+What counts as a claim is deliberately narrow, because a wrong rule is worse than no
+rule: the game process itself, by its directory or its exe name, and never the launcher.
+Steam, Epic, EA, Riot and Battle.net run all day, and their helpers live inside the same
+directories the game rules point at, so launchers and helpers are excluded by name. When
+a title is missed, `vhotseat claims` shows what the rules can see, and one `path:` line
+adds it.
+
 ## 4. Deadlocks
 
 Three locks are in play:

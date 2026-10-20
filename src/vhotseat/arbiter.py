@@ -18,7 +18,7 @@ import signal
 import subprocess
 import time
 
-from . import host, util
+from . import claims, host, util
 from .drivers.base import Workload
 from .errors import Busy, ReleaseFailed, SwitchError
 from .events import EventLog
@@ -33,7 +33,8 @@ HOLD_ENV = "VHOTSEAT_HOLD"
 class Arbiter:
     def __init__(self, workloads: list[Workload], gpu, lock: GpuLock, events: EventLog, *,
                  gate_release_timeout_s: float = 20, release_timeout_s: float = 60,
-                 machine_ram=host.machine_ram, telemetry=None, power: dict | None = None):
+                 machine_ram=host.machine_ram, telemetry=None, power: dict | None = None,
+                 claim_rules: list | None = None):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
         self.lock = lock
@@ -47,6 +48,8 @@ class Arbiter:
         self.telemetry = telemetry
         # What a unit of electricity costs where this machine is (config `power:`).
         self.power = power or {}
+        # What owns the card by right rather than by arrangement (a game): see claims.py.
+        self.claim_rules = claim_rules if claim_rules is not None else claims.rules([])
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
@@ -79,8 +82,8 @@ class Arbiter:
         mode = "conflict" if len(active) > 1 else active[0] if active else NONE
         ram = self.machine_ram()
         ram.update({n: w.memory() for n, w in self.workloads.items()})
-        status = {"mode": mode, **states, "gpu": gpu, "holders": held, "ram": ram,
-                  "last_event": self.events.last()}
+        status = {"mode": mode, **states, "gpu": gpu, "holders": held, "claims": self._claims_in(held),
+                  "ram": ram, "last_event": self.events.last()}
         if self.telemetry is not None:
             self.telemetry.sample(status, self.gpu_health)
         return status
@@ -97,6 +100,9 @@ class Arbiter:
             shown = "  ".join(f"{r['name'] or r['pid']} {r['mib']}" + (f" ({r['workload']})" if r["workload"] else "")
                               for r in rows[:5])
             lines.append(f"{'holds:':<{width}}{shown}")
+        if hits := s.get("claims"):
+            lines.append(f"{'claims:':<{width}}the card is claimed by {claims.describe(hits)}: nothing new "
+                         "loads while it runs")
         lines.append(f"{'ram:':<{width}}" + self._describe_ram(s["ram"]))
         if ev := s.get("last_event"):
             detail = ", ".join(f"{k}={v}" for k, v in ev.items() if k not in ("time", "event"))
@@ -222,6 +228,18 @@ class Arbiter:
             raise SwitchError(f"{what}, but the mode is {mode}, not {name}; run `vhotseat status`")
         return done
 
+    def _claims_in(self, held: list[dict]) -> list[dict]:
+        owned = {r["pid"] for r in held if r["workload"]}
+        return claims.matching(self.claim_rules, host.processes(), owned)
+
+    def claim_hits(self) -> list[dict]:
+        """Processes that own the card right now - a game, or whatever a `claims:` rule
+        matches. Never a pid already credited to a workload: the thing holding the card
+        for vhotseat is not also the thing that owns it. Cheap enough to ask at every
+        decision (a machine-wide scan is tens of milliseconds), which is what keeps
+        vhotseat stateless: no daemon has to notice a game for the rule to hold."""
+        return self._claims_in(self.snapshot_all()[1])
+
     def why_all(self) -> dict:
         """For each workload: could it take the card right now, and what stands in the
         way. It reads the same state `switch` would act on and touches nothing - no
@@ -229,6 +247,7 @@ class Arbiter:
         otherwise answer: not who holds the card, but why the next job can't have it."""
         s = self.probe()
         gpu, ram = s["gpu"], s["ram"]
+        hits = self.claim_hits()
         out = {}
         for name, x in self.workloads.items():
             notes: list[str] = []
@@ -262,6 +281,14 @@ class Arbiter:
                     notes.append(f"{y.label} holds {held} MiB and would be asked to release it")
             adm, model = x.admission_for()
             who = f"{x.label} ({model})" if model else x.label
+            if hits:
+                if resident:
+                    notes.append(f"the card is claimed by {claims.describe(hits)}: it keeps what it has, "
+                                 "but reloading it would be refused")
+                else:
+                    would, why = "blocked", (f"the card is claimed by {claims.describe(hits)}: "
+                                             "nothing new loads while it runs")
+                    notes.insert(0, why)
             if (need := (adm or {}).get("min_free_vram_mib")) and not resident:
                 free = gpu.get("free_mib") or 0
                 have = free + freed
@@ -317,7 +344,11 @@ class Arbiter:
         deadline = time.monotonic() + x.gate["timeout"] * util.SCALE if x.gate.get("timeout") else None
         with got:
             gpu = self.snapshot()
-            reason = gpu.get("error") or next((r for y in others if (r := y.busy())), None)
+            hits = self.claim_hits()
+            reason = (gpu.get("error")
+                      or (f"the card is claimed by {claims.describe(hits)}: nothing new loads while it runs"
+                          if hits else None)
+                      or next((r for y in others if (r := y.busy())), None))
             if not reason:
                 # Already loaded (a hook fired again, or `vhotseat gate` run by hand):
                 # its own memory isn't a shortfall, so don't restart anyone for it.
@@ -364,14 +395,22 @@ class Arbiter:
         unless = (lambda h: h == f"hold {name}") if skip_if_held else None
         return self.lock.take(f"switch {name}", unless=unless, on_wait=waiting)
 
-    def switch(self, name: str, wait: float, load: bool = True) -> dict:
+    def switch(self, name: str, wait: float, load: bool = True, request: bool = False) -> dict:
         """Move the GPU to `name` (or free it, for "none") under the lock. Returns
         {"ok": …} plus "held" or "error"; the caller prints status.
 
         While a `hold name` owns the lock, the GPU is already `name`'s and stays
         so: return at once. That's how a ComfyUI job queued by a held script gets
         past its guard; before, the guard waited on the hold, which was waiting
-        on the job."""
+        on the job.
+
+        `request` marks a switch a workload asked for on somebody's behalf - ComfyUI's
+        guard node - rather than one a person typed. A claimed process refuses the
+        request and not the typed command: "don't load on top of the game" is a rule
+        about loads nobody chose, and someone who types `vhotseat switch` has already
+        decided. A request that changes nothing (the workload already holds the card,
+        so nothing new would load) is not refused either: a batch mid-flight carries on,
+        which is the same promise the guard makes to a render in flight."""
         held = os.environ.get(HOLD_ENV)
         if held:
             # Inside `hold`: our parent owns the lock, so taking it would deadlock.
@@ -379,6 +418,11 @@ class Arbiter:
                 util.log(f"can't switch to {name} inside `hold {held}`")
                 return {"ok": False, "error": f"inside hold {held}", "inside_hold": held}
             return {"ok": True, "held": held}
+        if request and (hits := self.claim_hits()) and self.probe()["mode"] != name:
+            why = f"the card is claimed by {claims.describe(hits)}: nothing new loads while it runs"
+            self.events.record("switch", to=name, ok=False, error=why)
+            util.log(f"switch to {name} refused: {why}")
+            return {"ok": False, "error": why}
         # Wait for the others' running work *without* the lock: a ComfyUI job's guard
         # needs the lock to start, so holding it while waiting for ComfyUI's queue
         # to drain would stop the queue (it did, until 2026-10-17: the batch stalled

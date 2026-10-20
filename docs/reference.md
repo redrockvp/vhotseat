@@ -20,11 +20,14 @@ vhotseat autostart install [--command web|record]  keep the dashboard (or the re
 vhotseat autostart status | remove              is it registered? · take it back out
 vhotseat cost [--since 24h] [--json]            what the card's power has cost (needs power.price_per_kwh)
 vhotseat why [NAME] [--json]                    why a workload can or can't take the GPU now: a dry run of the handover
+vhotseat claims [--json]                        what owns the card by right (a game), and what matches now
+vhotseat watch                                  log when a claim starts and ends, and sample, until stopped
 ```
 
 Exit codes: `0` ok · `1` switch failed, gate refused, or `autostart status` with
 nothing registered · `2` usage or bad config. `hold` exits with COMMAND's own
-exit code once COMMAND has started.
+exit code once COMMAND has started. `why` and `claims` are reports: they exit `0`
+whatever they find, including a card somebody else owns.
 
 **Modes.** `status` reports the owner, derived live from each workload's API
 and the GPU's per-process memory; there is no state file to drift. The mode is
@@ -279,6 +282,35 @@ nothing and restarts nothing; it exits 0 even when the answer is `blocked`, beca
 it is a report and not a gate. `--json` gives the same per workload
 (`{would, holder, free_mib, resident, notes[]}`); the dashboard shows it as the
 **Next handover** card.
+
+**Claims: a game owns the card.** `vhotseat claims` prints what the rules match right
+now and the rules themselves; the same scan runs inside every gate and guard decision,
+so nothing resident is needed for the rule to hold (docs/how-it-works.md §3.7).
+
+```yaml
+claims_builtin: true        # the built-in rules for the usual installations (default true)
+claims:
+  - path: '*\World of Warcraft\*'      # matched against the process's image path
+    note: World of Warcraft            # how it's described in a refusal
+  - name: rocketleague.exe             # or by exe name: works when the path can't be read
+  - parent: mylauncher.exe             # or by any ancestor's exe name (its helpers too)
+```
+
+While something matches, nothing **new** loads: the gate refuses a load a request would
+wake, and `switch --request` - what ComfyUI's guard node uses, because the queue is
+asking on somebody's behalf - is refused too. A `switch` you type yourself is an order
+and is not refused; neither is a requested switch that would load nothing, so a batch
+mid-flight carries on. Nothing loaded is interrupted, and no claimed process is touched.
+Built-ins know Steam (`*\steamapps\common\*`), Epic, Riot, anything under a `Games`
+folder, and a handful of exes; launchers and their helpers never claim the card, because
+they run all day. `claims_builtin: false` leaves only your rules.
+
+**`vhotseat watch`** adds the record, not the rule: `claim` and `claim-end` rows in the
+event log, one per kind of process rather than one per pid (a game is twenty), plus the
+telemetry sampling. It's the cheapest thing to keep up from logon:
+`vhotseat autostart install --command watch`. Where the dashboard already runs, it is the
+recorder itself: `vhotseat web` probes the machine often enough to notice a claim start
+and end, so a box with the dashboard up needs nothing else.
 
 **Disk:** about 6 MiB per day of retention with two workloads at the default
 5 s interval (~305 bytes a sample, 17,280 a day, plus events and logs), so
