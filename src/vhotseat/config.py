@@ -71,7 +71,7 @@ def _rules(rules, where: str):
 
 def validate(raw) -> dict:
     _check(isinstance(raw, dict), "config", "expected a mapping at the top level")
-    unknown = set(raw) - {"gpu", "workloads", "events", "telemetry", "patches"}
+    unknown = set(raw) - {"gpu", "workloads", "events", "telemetry", "power", "patches"}
     _check(not unknown, "config", f"unknown key(s): {', '.join(sorted(unknown))}")
     gpu = raw.get("gpu") or {}
     _check(isinstance(gpu, dict), "gpu", "expected a mapping")
@@ -91,6 +91,18 @@ def validate(raw) -> dict:
             v = tel[k]
             _check(isinstance(v, (int, float)) and not isinstance(v, bool) and v >= minimum,
                    f"telemetry.{k}", f"expected a number ≥ {minimum:g}, got {v!r}")
+
+    power = raw.get("power") or {}
+    _check(isinstance(power, dict), "power", "expected a mapping")
+    unknown = set(power) - {"price_per_kwh", "currency", "note"}
+    _check(not unknown, "power", f"unknown key(s): {', '.join(sorted(unknown))}")
+    if "price_per_kwh" in power:
+        v = power["price_per_kwh"]
+        _check(isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0,
+               "power.price_per_kwh", f"expected a number > 0 (what one kWh costs you), got {v!r}")
+    for k in ("currency", "note"):
+        if k in power:
+            _check(isinstance(power[k], str), f"power.{k}", "expected text")
 
     patches = raw.get("patches") or []
     _check(isinstance(patches, list), "patches", "expected a list of {name, file, marker}")

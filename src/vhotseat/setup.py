@@ -45,6 +45,7 @@ def build(cfg: dict, *, env=os.environ, gpu=None, machine_ram=None, **arbiter_ar
         # shares the lock with anything still on vhotseat.
         GpuLock(state / ("switch.lock" if index == 0 else f"gpu{index}.lock")),
         EventLog(state / "events.jsonl", keep=(cfg.get("events") or {}).get("keep", 500), telemetry=telemetry),
-        machine_ram=machine_ram or host.machine_ram, telemetry=telemetry, **arbiter_args,
+        machine_ram=machine_ram or host.machine_ram, telemetry=telemetry, power=cfg.get("power") or {},
+        **arbiter_args,
     )
     return arbiter

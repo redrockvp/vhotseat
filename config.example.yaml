@@ -100,3 +100,12 @@ telemetry:
   # enabled: true
   retention_hours: 24  # ~6 MiB on disk with two workloads; ~0.8 MiB a day more per further workload
   interval_s: 5        # between samples while something samples continuously
+
+power:
+  # What a unit costs where this machine is, so `vhotseat cost` and the dashboard can
+  # price the card's draw. It is the card's own watts as the driver reports them: the
+  # rest of the machine, and what the PSU burns getting them there, aren't in it, so
+  # read the number as a floor rather than the line on your bill.
+  price_per_kwh: 4.11    # eThekwini (Durban) home tariff 2026/27, incl VAT, from 1 July 2026
+  currency: "R"
+  note: "eThekwini home 2026/27: 357.47 c/kWh ex VAT, no fixed charge"

@@ -168,6 +168,57 @@ def test_gpu_load_temperature_and_power_are_recorded_and_served(rig, server):
     assert "gpu_health" not in rig.arb.probe()
 
 
+def test_cost_integrates_the_cards_wattage_per_holder():
+    """kWh and cost over the sampled gaps, charged to whoever held the card at the gap's
+    start. A stretch with no samples - or no wattage - is no data, not a card that drew
+    nothing, so it is skipped rather than counted as free."""
+    samples = [{"t": 0, "mode": "strata", "gpu_power_w": 200},
+               {"t": 60, "mode": "strata", "gpu_power_w": 200},
+               {"t": 120, "mode": "strata", "gpu_power_w": 200},
+               {"t": 180, "mode": "comfy"},                              # the driver didn't say
+               {"t": 1260, "mode": "comfy", "gpu_power_w": 400},         # a 18-minute hole
+               {"t": 1320, "mode": "comfy", "gpu_power_w": 400}]
+    out = telemetry.cost(samples, 4.0)
+    assert out["kwh"] == 0.013 and out["cost"] == 0.05 and out["w_now"] == 400
+    assert out["by_mode"]["strata"] == {"kwh": 0.007, "cost": 0.03, "hours": 0.03}
+    assert out["by_mode"]["comfy"] == {"kwh": 0.007, "cost": 0.03, "hours": 0.02}
+
+
+def test_cost_reports_what_the_price_buys(rig, capsys):
+    """Without a price it says what's missing; with one, it prices the history per holder."""
+    rig.gpu.health = lambda: {"power_w": 300.0}
+    rig.arb.power = {}
+    assert rig.cli("cost", "--since", "1h") == 2
+    assert "price_per_kwh" in capsys.readouterr().err
+    rig.arb.power = {"price_per_kwh": 4.0, "currency": "R"}
+    rig.strata.loaded = True                                              # charge the watts to Strata
+    rig.cli("status")
+    time.sleep(1.1)                                                       # one sample a second
+    rig.cli("status")
+    capsys.readouterr()
+    assert rig.cli("cost", "--since", "1h", "--json") == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["price"] == 4.0 and out["w_now"] == 300.0 and "strata" in out["by_mode"]
+    assert rig.cli("cost", "--since", "yesterday") == 2
+
+
+def test_web_serves_the_power_cost(rig, server):
+    """The page's Power cost card reads /api/cost; no price is a 404 the page turns into
+    a note, not a broken panel."""
+    rig.gpu.health = lambda: {"power_w": 250.0}
+    rig.arb.power = {}
+    rig.cli("status")
+    time.sleep(1.1)
+    rig.cli("status")
+    code, body = get(server + "/api/cost")
+    assert code == 404 and "price_per_kwh" in json.loads(body)["error"]
+    rig.arb.power = {"price_per_kwh": 4.0, "currency": "R", "note": "home tariff"}
+    code, body = get(server + "/api/cost?since=0&until=99999999999")
+    out = json.loads(body)
+    assert code == 200 and out["currency"] == "R" and out["note"] == "home tariff"
+    assert out["w_now"] == 250.0 and out["by_mode"]
+
+
 def test_a_backend_without_health_still_records(rig):
     rig.cli("status")
     s = rig.arb.telemetry.samples(0, time.time() + 1)[-1]

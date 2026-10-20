@@ -183,6 +183,12 @@ td.nw { color: var(--ink); }
     <div class="chart" id="gpuChart"></div>
   </section>
 
+  <section class="card" id="cost-card" hidden>
+    <div class="head"><h2>Power cost</h2><span class="right" id="costNote"></span></div>
+    <div class="tiles" id="costTiles"></div>
+    <p class="notice" id="costCaveat" style="margin-top:10px"></p>
+  </section>
+
   <section class="card" id="vram">
     <div class="head"><h2>VRAM</h2><span class="right" id="vramNote"></span></div>
     <div class="tiles" id="vramTiles"></div>
@@ -286,12 +292,13 @@ async function refresh() {
     const until = Date.now() / 1000, since = until - state.range;
     const width = document.querySelector("main").clientWidth || 1000;
     const q = `since=${since}&until=${until}`;
-    const [samples, events, logs] = await Promise.all([
+    const [samples, events, logs, cost] = await Promise.all([
       getJSON(`/api/history?${q}&points=${Math.max(120, Math.round(width / 2))}`),
       getJSON(`/api/events?${q}&limit=2000`),
       getJSON(`/api/logs?${q}&limit=2000`),
+      getJSON(`/api/cost?${q}`).catch(() => ({ error: "no power.price_per_kwh in the config" })),
     ]);
-    Object.assign(state, { samples, events, logs, since, until, error: null });
+    Object.assign(state, { samples, events, logs, cost, since, until, error: null });
   } catch (e) {
     state.error = String(e.message || e);
   }
@@ -711,6 +718,32 @@ function renderGpu() {
   lineChart("gpuChart", m);
 }
 
+function renderCost() {
+  const c = state.cost, card = $("cost-card");
+  if (!c || c.error) { card.hidden = true; return; }
+  card.hidden = false;
+  const unit = c.currency || "";
+  const money = (v) => `${unit}${(v == null ? 0 : v).toFixed(2)}`;
+  $("costNote").textContent = c.note || `${money(c.price)} a kWh`;
+  const tiles = [
+    tile("Cost in range", money(c.cost), "", `${(c.kwh || 0).toFixed(2)} kWh at ${money(c.price)} a kWh`),
+    tile("Card now", num(c.w_now), "W",
+         c.w_now == null ? "" : `${money(c.w_now / 1000 * c.price)} an hour`),
+    tile("In the range", (c.window_s / 3600).toFixed(1), "h", `${(c.hours || 0).toFixed(1)} h sampled`),
+  ];
+  for (const [mode, cell] of Object.entries(c.by_mode || {}).sort((a, b) => b[1].kwh - a[1].kwh)) {
+    const free = mode === "none";
+    tiles.push(tile(free ? "Free" : labelOf(mode), money(cell.cost), "",
+                    `${cell.kwh} kWh · ${cell.hours} h`, free ? null : colorOf(mode)));
+  }
+  $("costTiles").replaceChildren(...tiles);
+  const sparse = c.hours != null && c.hours < c.window_s / 3600 * 0.9;
+  $("costCaveat").textContent =
+    (sparse ? `only ${(c.hours || 0).toFixed(1)} h of this range has power samples in it, so this is a floor: `
+            : "") +
+    "the card's own draw - the rest of the machine, and what the PSU burns getting it there, aren't in it";
+}
+
 function renderVram() {
   const s = state.status, g = s.gpu, ws = s.workloads;
   $("vramNote").textContent = g.error || `${gib(g.free_mib)} of ${gib(g.total_mib)} GiB free`;
@@ -742,6 +775,7 @@ function renderCharts() {
   renderOwner();
   renderHolders();
   renderGpu();
+  renderCost();
   renderVram();
   renderRam();
 

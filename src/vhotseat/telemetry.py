@@ -58,6 +58,37 @@ def compact(status: dict, health: dict | None = None) -> dict:
     return out
 
 
+def cost(samples: list[dict], price_per_kwh: float, step_s: float | None = None) -> dict:
+    """What the card's sampled wattage cost over a window, and who was holding it.
+
+    Each gap between two samples that both carry a wattage is integrated (their mean
+    over that gap) and charged to whoever held the card at the start of it. What counts
+    as a hole is measured from the samples themselves - their median spacing, the pace
+    this window was actually sampled at - because a stretch with no samples is no data,
+    not a card that drew nothing; gaps over six steps are skipped. Pass `step_s` to
+    override that. What this counts is the card's own draw as the driver reports it:
+    the rest of the machine, and the PSU burning some of it on the way in, are not in
+    the number - so treat it as a floor, not the line on your bill."""
+    out: dict[str, dict] = {}
+    total = 0.0
+    gaps = sorted(g for g in (b["t"] - a["t"] for a, b in zip(samples, samples[1:])) if g > 0)
+    limit = 6 * max(step_s or (gaps[len(gaps) // 2] if gaps else 1.0), 1.0)
+    for a, b in zip(samples, samples[1:]):
+        w1, w2, dt = a.get("gpu_power_w"), b.get("gpu_power_w"), b["t"] - a["t"]
+        if w1 is None or w2 is None or dt <= 0 or dt > limit:
+            continue
+        kwh = (w1 + w2) / 2 * dt / 3_600_000      # W x s -> kWh
+        cell = out.setdefault(a.get("mode") or "none", {"kwh": 0.0, "hours": 0.0})
+        cell["kwh"] += kwh
+        cell["hours"] += dt / 3600
+        total += kwh
+    return {"kwh": round(total, 3), "cost": round(total * price_per_kwh, 2),
+            "hours": round(sum(c["hours"] for c in out.values()), 2),
+            "w_now": (samples[-1].get("gpu_power_w") if samples else None),
+            "by_mode": {m: {"kwh": round(c["kwh"], 3), "cost": round(c["kwh"] * price_per_kwh, 2),
+                            "hours": round(c["hours"], 2)} for m, c in out.items()}}
+
+
 class Telemetry:
     def __init__(self, path: Path, retention_hours: float = 24, interval_s: float = 5,
                  seed_events: Path | None = None):

@@ -33,7 +33,7 @@ HOLD_ENV = "VHOTSEAT_HOLD"
 class Arbiter:
     def __init__(self, workloads: list[Workload], gpu, lock: GpuLock, events: EventLog, *,
                  gate_release_timeout_s: float = 20, release_timeout_s: float = 60,
-                 machine_ram=host.machine_ram, telemetry=None):
+                 machine_ram=host.machine_ram, telemetry=None, power: dict | None = None):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
         self.lock = lock
@@ -45,6 +45,8 @@ class Arbiter:
         self.machine_ram = machine_ram
         # Every probe is kept as a sample, for `vhotseat web`'s history.
         self.telemetry = telemetry
+        # What a unit of electricity costs where this machine is (config `power:`).
+        self.power = power or {}
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})

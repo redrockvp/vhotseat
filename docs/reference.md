@@ -18,6 +18,7 @@ vhotseat web [--host H] [--port P]              dashboard: RAM and VRAM over tim
 vhotseat record                                 sample RAM and VRAM into the telemetry until stopped
 vhotseat autostart install [--command web|record]  keep the dashboard (or the recorder) up from logon
 vhotseat autostart status | remove              is it registered? · take it back out
+vhotseat cost [--since 24h] [--json]            what the card's power has cost (needs power.price_per_kwh)
 ```
 
 Exit codes: `0` ok · `1` switch failed, gate refused, or `autostart status` with
@@ -198,6 +199,8 @@ One page, refreshed every 5 s, that works on a phone too:
   `status --json` carries them as `holders: [{pid, mib, name, workload}]`.
 - **GPU load**: the card's model, load, temperature and power, now and over time.
 - **VRAM** and **RAM / Swap**: per workload, stacked against the totals.
+- **Power cost**: what the card's watts cost across the range you're looking at, in
+  total and per holder, plus what it's drawing right now. Needs `power.price_per_kwh`.
 - **Events / Logs**: every switch, hold and gate decision, and every line a
   vhotseat command logged, from any process (the guard's `switch comfy`,
   Strata's `gate strata`, your `hold`).
@@ -241,6 +244,24 @@ telemetry:
   interval_s: 5         # default
   # enabled: false      # record nothing; the dashboard shows the live status only
 ```
+
+```yaml
+power:
+  price_per_kwh: 4.11   # what one unit of electricity costs where this machine is
+  currency: "R"         # written in front of the numbers
+  note: "eThekwini (Durban) home 2026/27: 357.47 c/kWh ex VAT"   # shown under the tiles
+```
+
+With a price set, `vhotseat cost` and the **Power cost** card integrate the sampled
+wattage into kWh and money, per holder: each gap between two samples that both
+carry a wattage counts, charged to whoever held the card at the start of it. A
+stretch with no samples is no data rather than a card that drew nothing, so it is
+skipped, and the report says how much of the window had samples in it - with
+`vhotseat autostart install` the sampling is continuous and the number means what
+it says. What it counts is the card's draw as the driver reports it: the rest of
+the machine, and what the PSU burns getting those watts there, are not in it, so
+read it as a floor. At 300 W and R4.11 a unit that is R1.23 an hour, about R30 a
+day, about R890 a month - which is the case for unloading a model you aren't using.
 
 **Disk:** about 6 MiB per day of retention with two workloads at the default
 5 s interval (~305 bytes a sample, 17,280 a day, plus events and logs), so

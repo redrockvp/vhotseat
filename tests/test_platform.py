@@ -145,7 +145,7 @@ def _spy(fail=()):
     return calls, run
 
 
-def test_autostart_windows_logon_task(capsys):
+def test_autostart_windows_logon_task(tmp_path, capsys):
     """Windows has no systemd: Task Scheduler runs it at logon, quoting the exe path."""
     calls, run = _spy()
     exe = r"C:\Users\peter\.local\bin\vhotseat.exe"
@@ -153,7 +153,7 @@ def test_autostart_windows_logon_task(capsys):
     assert calls[0] == ["schtasks", "/Create", "/F", "/SC", "ONLOGON", "/TN", "vhotseat",
                         '/TR', f'"{exe}" web']
     assert autostart.status(at="schtasks", run=run) == 0
-    assert autostart.remove(at="schtasks", run=run) == 0
+    assert autostart.remove(at="schtasks", run=run, vbs=tmp_path / "l.vbs") == 0
     assert ["schtasks", "/Delete", "/F", "/TN", "vhotseat"] in calls
     assert ["reg", "delete", autostart.RUN_KEY, "/v", "vhotseat", "/f"] in calls
     assert "no longer starts at logon" in capsys.readouterr().out

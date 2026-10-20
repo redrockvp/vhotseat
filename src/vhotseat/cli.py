@@ -9,6 +9,7 @@
   vhotseat web [--host H] [--port P]        a dashboard: RAM and VRAM over time, handovers, events, logs
   vhotseat record                           sample RAM and VRAM into the telemetry until stopped
   vhotseat autostart ACTION                 install|status|remove: keep web (or record) up from logon
+  vhotseat cost [--since 24h]               what the card's power has cost (needs power.price_per_kwh)
 
 Exit codes: 0 ok · 1 failed / refused · 2 usage or bad config. `hold` exits with
 CMD's own exit code once CMD has started. `autostart status` exits 1 when nothing
@@ -19,6 +20,7 @@ import argparse
 import contextlib
 import json
 import sys
+import time
 
 from . import config as cfgmod
 from . import util
@@ -65,6 +67,10 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp.add_argument("action", choices=("install", "status", "remove"))
     sp.add_argument("--command", choices=("web", "record"), default="web",
                     help="what starts at logon: web (the dashboard, which also samples) or record")
+    sp = sub.add_parser("cost", help="what the card's power has cost over a window")
+    sp.add_argument("--since", default="24h", metavar="WINDOW",
+                    help="how far back: 90m, 24h, 7d or seconds (default 24h)")
+    sp.add_argument("--json", action="store_true")
     argv = sys.argv[1:] if argv is None else list(argv)
     # hold's COMMAND is everything after the first `--`, split off here: a REMAINDER
     # argument would also swallow options before it (`hold comfy --wait 600 -- CMD`).
@@ -131,6 +137,46 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
         if args.action == "remove":
             return autostart.remove()
         return autostart.status()
+    if args.cmd == "cost":
+        from .telemetry import cost
+        price = arbiter.power.get("price_per_kwh")
+        if not price:
+            util.log("no power.price_per_kwh in the config: the card's watts are known, what they cost isn't")
+            return EXIT_USAGE
+        if arbiter.telemetry is None:
+            util.log("telemetry is off in the config: there is no power history to cost out")
+            return EXIT_USAGE
+        try:
+            span = util.window(args.since)
+        except ValueError as e:
+            util.log(str(e))
+            return EXIT_USAGE
+        tel = arbiter.telemetry
+        now = time.time()
+        report = cost(tel.samples(now - span, now), price)
+        if json_out:
+            print(json.dumps({"window_s": span, "price": price, **arbiter.power, **report}))
+            return EXIT_OK
+
+        def money(v): return f"{arbiter.power.get('currency', '')}{v:,.2f}"
+        print(f"cost:   {money(report['cost'])} over the last {args.since}: {report['kwh']} kWh "
+              f"at {money(price)} a kWh, {report['hours']} h on the card")
+        if report["hours"] < span / 3600 * 0.9:
+            # Wattage only exists where something was sampling: an unsampled stretch is no
+            # data, not a card that drew nothing. Say which of the two this number is.
+            util.log(f"only {report['hours']} h of that {args.since} window has power samples in it: "
+                     "this is a floor, not the whole cost. `vhotseat autostart install` samples continuously.")
+        for mode, cell in sorted(report["by_mode"].items(), key=lambda kv: -kv[1]["kwh"]):
+            label = arbiter.workloads[mode].label if mode in arbiter.workloads else \
+                ("free" if mode == "none" else mode)
+            print(f"        {label:<12}{cell['kwh']:>7} kWh  {money(cell['cost']):>9}  {cell['hours']:>5} h")
+        if (w := report["w_now"]) is not None:
+            print(f"        card now {w} W ({money(w / 1000 * price)} an hour)")
+        if note := arbiter.power.get("note"):
+            print(f"        rate: {note}")
+        util.log("that is the card's own draw: the rest of the machine, and the PSU burning some of "
+                 "it on the way in, aren't in it")
+        return EXIT_OK
     # A switch may wait minutes for running work to finish (the ComfyUI guard waits up
     # to 300 s): sample meanwhile.
     with Sampler(arbiter) if args.wait else contextlib.nullcontext():

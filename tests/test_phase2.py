@@ -113,7 +113,22 @@ def test_patches_config_is_validated():
 def test_example_config_parses_with_every_section():
     """The live config is a copy of this: it must always validate."""
     cfg = config.parse((ROOT / "config.example.yaml").read_text())
-    assert {"gpu", "workloads", "patches", "events"} <= set(cfg)
+    assert {"gpu", "workloads", "patches", "events", "power"} <= set(cfg)
+
+
+def test_power_block_is_validated():
+    """A price is a number, and only the documented keys are allowed: a typo in a rate
+    would otherwise turn into a wrong bill."""
+    import pytest
+    raw = config.parse((ROOT / "config.example.yaml").read_text())
+    assert raw["power"]["price_per_kwh"] > 0
+    config.validate(raw)
+    raw["power"]["price_per_kwh"] = "four point one one"
+    with pytest.raises(config.ConfigError, match=r"power\.price_per_kwh"):
+        config.validate(raw)
+    raw["power"] = {"price_per_khw": 4.11}
+    with pytest.raises(config.ConfigError, match=r"power: unknown key"):
+        config.validate(raw)
 
 
 def test_proxy_guide_config_validates():

@@ -30,6 +30,20 @@ def safe_output() -> None:
             stream.reconfigure(errors="replace")
 
 
+def window(text) -> float:
+    """`7d`, `24h`, `90m`, `30s` or bare seconds, as seconds."""
+    t = str(text).strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    num, mult = (t[:-1], units[t[-1]]) if t[-1:] in units else (t, 1)
+    try:
+        value = float(num)
+    except ValueError:
+        raise ValueError(f"not a length of time: {text!r} (try 90m, 24h, 7d, or seconds)") from None
+    if value <= 0:
+        raise ValueError(f"not a length of time: {text!r} (needs a positive one)")
+    return value * mult
+
+
 def sleep(seconds: float) -> None:
     time.sleep(seconds * SCALE)
 

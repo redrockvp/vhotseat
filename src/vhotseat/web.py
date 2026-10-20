@@ -22,7 +22,7 @@ from importlib import resources
 from urllib.parse import parse_qs, urlparse
 
 from . import util
-from .telemetry import Sampler
+from .telemetry import Sampler, cost
 
 # Probing calls every workload's API; several open tabs share one probe a second.
 STATUS_TTL_S = 1.0
@@ -92,6 +92,13 @@ class Dashboard:
             limit = max(1, min(10000, int(query.get("limit", [1000])[0])))
         except ValueError:
             return 400, {"error": "since, until, points and limit are numbers"}
+        if path == "/api/cost":
+            price = self.arbiter.power.get("price_per_kwh")
+            if not price:
+                return 404, {"error": "no power.price_per_kwh in the config"}
+            report = cost(self.telemetry.samples(since, until), price)
+            extra = {k: v for k, v in self.arbiter.power.items() if k != "price_per_kwh"}
+            return 200, {"price": price, "window_s": until - since, **extra, **report}
         if path == "/api/history":
             return 200, bucket(self.telemetry.samples(since, until), points)
         if path == "/api/events":
