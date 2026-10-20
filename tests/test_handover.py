@@ -148,6 +148,20 @@ def test_doctor_treats_a_switched_off_workload_as_stopped(rig):
     assert found and found[0][0] == "fail" and "still holds" in found[0][2]
 
 
+def test_doctor_spots_attribution_that_stopped_working(rig):
+    """When a workload's vram selector stops matching its process, its VRAM lands in
+    `other` where nothing can act on it; doctor says so instead of staying silent."""
+    from vhotseat import doctor
+    rig.gpu.strata_as_other = True
+    rig.gpu.other = 4000
+    rig.strata.loaded = True
+    found = [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: vram"
+             and "attributes it nothing" in c[2]]
+    assert found and found[0][0] == "warn"
+    rig.gpu.strata_as_other = False
+    assert not [c for c in doctor.checks(rig.arb, rig.cfg) if "attributes it nothing" in c[2]]
+
+
 def test_doctor_blind_workload_stays_busy(rig):
     """No service and no vram.process: vhotseat can neither ask it nor see it, so an
     unanswerable API must stay busy, and doctor says which blind spot caused it."""

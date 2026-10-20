@@ -77,6 +77,14 @@ def test_wddm_fills_in_missing_vram():
     assert reader.name == "fake" and reader.health() == {"name": "fake"}
 
 
+def test_wddm_fills_in_missing_names():
+    """NVML names no process on Windows; a process snapshot does, and unlike a handle it
+    also names one we can't open (an elevated workload), so its VRAM can be attributed."""
+    reader = gpu.WddmVram(_Reader([(1, None, ""), (2, 300, "known")]),
+                          per_pid=lambda: {1: 20000}, names=lambda: {1: "strata.exe"})
+    assert reader.read()[2] == [(1, 20000, "strata.exe"), (2, 300, "known")]
+
+
 def test_wddm_skips_the_counters_when_nothing_is_missing():
     def boom():
         raise AssertionError("counters read")

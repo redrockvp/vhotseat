@@ -50,6 +50,38 @@ def _read_proc_windows(pid: int) -> tuple[str, str]:
         k32.CloseHandle(h)
 
 
+class _ProcEntry(ctypes.Structure):
+    _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong),
+                ("th32ProcessID", ctypes.c_ulong), ("th32DefaultHeapID", ctypes.c_void_p),
+                ("th32ModuleID", ctypes.c_ulong), ("th32Threads", ctypes.c_ulong),
+                ("th32ParentProcessID", ctypes.c_ulong), ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", ctypes.c_ulong), ("szExeFile", ctypes.c_wchar * 260)]
+
+
+def process_names() -> dict[int, str]:
+    """Windows: pid -> exe name for every process, from a Toolhelp snapshot.
+
+    Unlike OpenProcess, a snapshot needs no handle, so it still names processes this
+    process cannot open - an elevated workload, for example, whose path and command
+    line are unreadable and whose VRAM would otherwise be unattributable."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    snap = ctypes.c_void_p(k32.CreateToolhelp32Snapshot(0x2, 0))   # TH32CS_SNAPPROCESS
+    if not snap or ctypes.cast(snap, ctypes.c_void_p).value in (None, -1):
+        return {}
+    entry = _ProcEntry()
+    entry.dwSize = ctypes.sizeof(_ProcEntry)
+    out: dict[int, str] = {}
+    try:
+        rc = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while rc:
+            out[entry.th32ProcessID] = entry.szExeFile
+            rc = k32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    return out
+
+
 class _PdhItem(ctypes.Structure):  # PDH_FMT_COUNTERVALUE_ITEM_W with a LONGLONG value
     _fields_ = [("name", ctypes.c_wchar_p), ("status", ctypes.c_ulong), ("value", ctypes.c_longlong)]
 
@@ -111,7 +143,7 @@ def attribute(total: int, free: int, procs: list[tuple[int, int | None, str]],
     """Snapshot keyed "<workload>_mib", plus total_mib, free_mib, other_mib.
 
     selectors: workload -> ("unit", "comfyui.service") or ("process", "ComfyUI/main.py").
-    procs: (pid, MiB or None if the driver can't say, name nvidia-smi reports)."""
+    procs: (pid, MiB or None if the driver can't say, name the GPU reader reports)."""
     out = {"total_mib": total, "free_mib": free, **{f"{n}_mib": 0 for n in selectors}, "other_mib": 0}
     for pid, mib, name in procs:
         if mib is None:
@@ -262,22 +294,28 @@ class Nvml:
 
 class WddmVram:
     """Wraps a reader on Windows: the processes it lists with no VRAM figure (all of
-    them, under WDDM) get the one from the GPU performance counters."""
+    them, under WDDM) get the one from the GPU performance counters, and the ones it
+    lists with no name (all of them, under NVML) get the one from a process snapshot."""
 
-    def __init__(self, reader, per_pid=wddm_process_vram):
+    def __init__(self, reader, per_pid=wddm_process_vram, names=process_names):
         self.reader = reader
         self.name = reader.name
         self.per_pid = per_pid
+        self.names = names
 
     def health(self) -> dict:
         return self.reader.health()
 
     def read(self) -> tuple[int, int, list]:
         total, free, procs = self.reader.read()
-        if all(mib is not None for _, mib, _ in procs):
-            return total, free, procs
-        vram = self.per_pid()
-        return total, free, [(pid, vram.get(pid) if mib is None else mib, name) for pid, mib, name in procs]
+        vram = None if all(mib is not None for _, mib, _ in procs) else self.per_pid()
+        names = self.names() if any(not name for _, _, name in procs) else {}
+        out = []
+        for pid, mib, name in procs:
+            if mib is None and vram is not None:
+                mib = vram.get(pid)
+            out.append((pid, mib, name or names.get(pid, "")))
+        return total, free, out
 
 
 class Backend:

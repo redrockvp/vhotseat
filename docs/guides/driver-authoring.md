@@ -34,7 +34,7 @@ Shared by every driver (set from the config, not code):
 | Field | Config key | Meaning |
 | --- | --- | --- |
 | `service` | `service: {systemd-user: UNIT}` or `{systemd: UNIT}` | started when stopped; restarted when `allow_restart` |
-| `vram_selector` | `vram: {unit: X.service}` or `{process: SUBSTRING}` | how its processes are found on the GPU; defaults to the service's unit |
+| `vram_selector` | `vram: {unit: X.service}` or `{process: SUBSTRING}` | how its processes are found on the GPU; defaults to the service's unit. On Windows `process` also matches the process name when its command line can't be read (an elevated process) |
 | `idle_vram_mib` | `idle_vram_mib` | VRAM it may keep and still count as released (CUDA context, caches) |
 | `release_always` | `release.always` (http) | ask it to release even when it looks unloaded: a load may be under way before any VRAM shows |
 | `allow_restart` | `allow_restart` | the arbiter may restart it, when idle, if releasing isn't enough |

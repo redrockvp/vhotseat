@@ -241,6 +241,16 @@ def test_attribution_by_unit_and_process():
     assert snap == {"total_mib": 16303, "free_mib": 1000, "comfy_mib": 7000, "strata_mib": 14000, "other_mib": 300}
 
 
+def test_attribution_falls_back_to_the_process_name():
+    """A process whose command line vhotseat may not read (it runs elevated) still gets
+    attributed by the name the GPU reader reports."""
+    procs = [(7, 20000, "strata.exe"), (8, 300, "python.exe")]
+    snap = gpu.attribute(24576, 600, procs,
+                         {"strata": ("process", "strata.exe"), "comfy": ("process", "comfy/main.py")},
+                         procinfo=lambda pid: ("", ""))
+    assert snap == {"total_mib": 24576, "free_mib": 600, "strata_mib": 20000, "comfy_mib": 0, "other_mib": 300}
+
+
 def test_nvml_matches_nvidia_smi():
     """On a machine with an NVIDIA GPU, NVML and nvidia-smi agree."""
     try:

@@ -165,6 +165,13 @@ def checks(arbiter, cfg: dict | None) -> list:
             out.append((WARN, f"{w.name}: vram", "no service and no vram.process: vhotseat can neither ask it "
                         "nor see it on the GPU, so an API that isn't answering counts as busy and can block a "
                         "handover"))
+        # A selector that stopped matching (the process moved, or now runs elevated and its
+        # path can't be read) leaves its VRAM in `other`, where nothing can act on it.
+        if w.vram_selector[1] and code == 200 and held <= w.idle_vram_mib \
+                and g.get("other_mib", 0) > OTHER_WARN_MIB and w.probe(g).get("loaded"):
+            out.append((WARN, f"{w.name}: vram", f"it says a model is loaded but the GPU attributes it nothing, "
+                        f"while {g['other_mib']} MiB is unattributed: its `vram:` selector may no longer match "
+                        "the process holding it (it moved, or now runs elevated, which hides its path)"))
         kind = w.gate.get("kind")
         if kind == "hook":
             out += _gate_hook(w, w.gate)

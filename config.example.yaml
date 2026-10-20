@@ -16,7 +16,8 @@ workloads:
     service: {systemd-user: strata}   # started when stopped; restarted when allow_restart
     # Its VRAM is found by the systemd unit its processes run in. Without
     # `vram:`, the service's unit is used; {process: SUBSTRING} matches the
-    # command line instead.
+    # command line instead - or the process name on Windows, where an elevated
+    # process hides both ({process: strata.exe}).
     resident: {get: /health, path: loaded}   # true while its model is in VRAM
     release:
       post: /unload?wait={wait}   # {wait}: seconds to let a running answer finish
