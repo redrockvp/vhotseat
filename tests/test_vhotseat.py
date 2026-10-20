@@ -358,3 +358,18 @@ def test_gate_doesnt_count_a_loaded_workloads_own_memory(vh):
     vh.host.available_mib = 14000
     assert vh.arb.gate("strata") is True
     assert vh.host.restarts == []
+
+
+def test_cli_why_reads_the_handover_decision(vh, capsys):
+    """`vhotseat why` is the dry run for when a job won't start: the same preconditions
+    `switch` checks, read off the machine, releasing nothing."""
+    vh.strata.loaded = True
+    assert vh.run("why", "comfy") == 0
+    out = capsys.readouterr().out
+    assert "ComfyUI:" in out and "could take the card now" in out
+    assert "Strata holds 14000 MiB and would be asked to release it" in out
+    assert out.count("could take the card now") == 1        # one workload, not both
+    assert vh.run("why", "--json") == 0
+    why = json.loads(capsys.readouterr().out)
+    assert why["strata"]["would"] == "ready" and why["strata"]["holder"] == "strata"
+    assert vh.run("why", "nosuch") == 2                    # still a workload name check

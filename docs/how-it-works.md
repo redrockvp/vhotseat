@@ -468,7 +468,22 @@ number and size of handovers.
 ## 6. Observing it
 
 - `vhotseat status` shows who owns the GPU, what each workload holds (VRAM,
-  RAM, swap), and the last event.
+  RAM, swap), and the last event. The `holds:` line names the processes actually
+  on the card and which workload each was attributed to, so memory that belongs
+  to nothing vhotseat manages is visible rather than mysterious (§3.5).
+- `vhotseat why [NAME]` answers the question `status` can't: not who has the
+  card, but why the next job can't. It runs the preconditions a `switch` would
+  check — release the others, then admission — as a dry run, and prints what
+  would be released, what would have to be waited for, and what would make the
+  handover fail: a workload whose API is dead while its VRAM isn't, or a model
+  that wants 14,000 MiB free on a card that has 900 after everything releasable
+  has been released, with the 15,000 that can't be freed named as processes
+  nobody manages. It releases nothing, loads nothing, restarts nothing, and
+  exits 0 even when the answer is `blocked`: it's a report, not a gate.
+- `vhotseat web` shows all of it over time: the named holders, the same dry run
+  as a **Next handover** card, and — with `power.price_per_kwh` set — what the
+  card's wattage has cost per holder. `vhotseat autostart install` keeps it
+  running from logon, which is also what keeps the sampling continuous.
 - `~/.local/state/vhotseat/events.jsonl` keeps the last 500 decisions: every
   `switch`, every `hold` / `hold-end`, and every gate decision with its `source`
   (`hook` = during a switch or hold, `request` = a request that woke the

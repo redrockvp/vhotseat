@@ -222,6 +222,69 @@ class Arbiter:
             raise SwitchError(f"{what}, but the mode is {mode}, not {name}; run `vhotseat status`")
         return done
 
+    def why_all(self) -> dict:
+        """For each workload: could it take the card right now, and what stands in the
+        way. It reads the same state `switch` would act on and touches nothing - no
+        release, no load, no restart. What it's for is the question a dashboard can't
+        otherwise answer: not who holds the card, but why the next job can't have it."""
+        s = self.probe()
+        gpu, ram = s["gpu"], s["ram"]
+        out = {}
+        for name, x in self.workloads.items():
+            notes: list[str] = []
+            would, freed = "ready", 0
+            resident = x.active(s[name], gpu)
+            if s["mode"] == name:
+                notes.append("it holds the card now")
+            if s["mode"] == "conflict":
+                notes.append("two workloads are on the card at once: asking for it will release the other")
+            for y in self._others(name):
+                held = y.vram_mib()
+                if not y.service_active():
+                    if held > y.idle_vram_mib:
+                        would, why = "blocked", f"a {y.label} process holds {held} MiB but its service is stopped"
+                        notes.append(f"{why}: kill it by hand")
+                    continue
+                if not y.reachable():
+                    if held > y.idle_vram_mib:
+                        would = "blocked"
+                        notes.append(f"{y.label} isn't answering and still holds {held} MiB: start it so "
+                                     "vhotseat can release it, or kill the process")
+                    else:
+                        notes.append(f"{y.label} isn't answering and holds nothing on the card: treated as stopped")
+                    continue
+                if busy := y.busy():
+                    if would == "ready":
+                        would = "waiting"
+                    notes.append(f"{y.label} is busy: {busy}; a handover waits for it to finish")
+                elif held > y.idle_vram_mib:
+                    freed += held
+                    notes.append(f"{y.label} holds {held} MiB and would be asked to release it")
+            adm, model = x.admission_for()
+            who = f"{x.label} ({model})" if model else x.label
+            if (need := (adm or {}).get("min_free_vram_mib")) and not resident:
+                free = gpu.get("free_mib") or 0
+                have = free + freed
+                if have < need:
+                    would = "blocked"
+                    notes.append(f"{who} only loads with {need} MiB free: releasing the others gets {have} MiB "
+                                 f"({free} free now)")
+                    if gpu.get("other_mib"):
+                        unmanaged = ", ".join(f"{r['name'] or r['pid']} {r['mib']}" for r in s["holders"]
+                                              if not r["workload"])[:160]
+                        notes.append(f"{gpu['other_mib']} MiB is held by processes vhotseat doesn't manage"
+                                     + (f" ({unmanaged})" if unmanaged else "") + ": nothing here frees it")
+            if (need := (adm or {}).get("min_available_ram_mib")) and not resident:
+                have = ram.get("available_mib")
+                if have is not None and have < need:
+                    if would == "ready":
+                        would = "waiting"
+                    notes.append(f"{who} wants {need} MiB of available RAM, {have} MiB is free; getting it back "
+                                 "from a workload means restarting it")
+            out[name] = {"target": name, "label": x.label, "would": would, "holder": s["mode"],
+                         "free_mib": gpu.get("free_mib"), "resident": resident, "notes": notes}
+        return out
+
     def gate(self, name: str) -> bool:
         """Run inside `name`'s own load (Strata's before_load): may it load?
 

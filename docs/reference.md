@@ -19,6 +19,7 @@ vhotseat record                                 sample RAM and VRAM into the tel
 vhotseat autostart install [--command web|record]  keep the dashboard (or the recorder) up from logon
 vhotseat autostart status | remove              is it registered? · take it back out
 vhotseat cost [--since 24h] [--json]            what the card's power has cost (needs power.price_per_kwh)
+vhotseat why [NAME] [--json]                    why a workload can or can't take the GPU now: a dry run of the handover
 ```
 
 Exit codes: `0` ok · `1` switch failed, gate refused, or `autostart status` with
@@ -262,6 +263,22 @@ it says. What it counts is the card's draw as the driver reports it: the rest of
 the machine, and what the PSU burns getting those watts there, are not in it, so
 read it as a floor. At 300 W and R4.11 a unit that is R1.23 an hour, about R30 a
 day, about R890 a month - which is the case for unloading a model you aren't using.
+
+**`why [NAME]`** is the handover read backwards. Where `switch` acts, `why` reports:
+for each workload it walks the same preconditions - every other workload that would
+be released, the ones that would have to be waited for, then the admission floors -
+and says which of `could take the card now`, `would have to wait` or `is blocked`
+applies and why. The blocked reasons are the ones that make a handover fail: a
+workload whose API is dead while its VRAM is still on the card (start it so there is
+something to ask, or kill the process), a process holding memory with its service
+stopped, and an admission floor the card can't reach - shown as arithmetic, since
+"needs 14,000 MiB free, 900 after everything releasable is released" is a diagnosis
+where "refused" is a mystery. The memory that can't be freed is named: the processes
+vhotseat doesn't manage and how much each holds. `why` releases nothing, loads
+nothing and restarts nothing; it exits 0 even when the answer is `blocked`, because
+it is a report and not a gate. `--json` gives the same per workload
+(`{would, holder, free_mib, resident, notes[]}`); the dashboard shows it as the
+**Next handover** card.
 
 **Disk:** about 6 MiB per day of retention with two workloads at the default
 5 s interval (~305 bytes a sample, 17,280 a day, plus events and logs), so

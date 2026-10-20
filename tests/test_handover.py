@@ -214,6 +214,45 @@ def test_stopped_strata_holding_vram_is_reported(rig):
 # --- Strata's hook (a request wakes the lazy model) ------------------------------
 
 
+def test_why_says_what_a_handover_would_have_to_do(rig):
+    """`why` is the switch decision read out loud, with nothing switched: what would be
+    released, and whether anything stands in the way."""
+    rig.strata.loaded = True
+    why = rig.arb.why_all()
+    assert why["comfy"]["would"] == "ready"
+    assert "Strata holds 14000 MiB and would be asked to release it" in why["comfy"]["notes"]
+    assert why["strata"]["would"] == "ready"
+    assert "it holds the card now" in why["strata"]["notes"]
+    assert not [c for c in rig.strata.calls if c.startswith("POST")]   # a dry run only reads
+
+
+def test_why_waits_behind_running_work(rig):
+    rig.comfy.running = ["job1"]
+    why = rig.arb.why_all()
+    assert why["strata"]["would"] == "waiting"
+    assert any(n.startswith("ComfyUI is busy") for n in why["strata"]["notes"])
+
+
+def test_why_names_the_workload_it_cannot_release(rig):
+    """A dead API with VRAM still on the card is what makes a handover fail. `why` says
+    so before anything tries, and says what to do about it."""
+    rig.strata.loaded = True
+    rig.strata.close()
+    why = rig.arb.why_all()
+    assert why["comfy"]["would"] == "blocked"
+    assert any("isn't answering and still holds 14000 MiB" in n for n in why["comfy"]["notes"])
+
+
+def test_why_shows_the_admission_arithmetic_and_blames_the_right_memory(rig):
+    """The admission floor refuses loads, and it refuses them over memory vhotseat can't
+    free. Showing the arithmetic is the difference between a mystery and a diagnosis."""
+    rig.gpu.other = 15000
+    why = rig.arb.why_all()
+    assert why["strata"]["would"] == "blocked"
+    assert any("only loads with 14000 MiB free" in n for n in why["strata"]["notes"])
+    assert any("processes vhotseat doesn't manage" in n for n in why["strata"]["notes"])
+
+
 def test_hook_allows_when_comfy_idle(rig):
     assert rig.strata.request() == 200
     e = last(rig, "strata-load")

@@ -100,6 +100,12 @@ tr.hl td { background: var(--wash); }
 .notice code, td code { font-size: 12px; background: var(--wash); padding: 1px 5px; border-radius: 4px; }
 .workloads { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-bottom: 14px; }
 .holders { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px 18px; margin-top: 4px; }
+.whys { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px 18px; }
+.why { font-size: 13px; }
+.why .whyhead { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+.chip { font-size: 11px; font-weight: 650; padding: 2px 8px; border-radius: 999px; color: #fff; }
+.why ul { margin: 0; padding-left: 18px; color: var(--ink-2); }
+.why li { margin: 3px 0; }
 .hrow { font-size: 13px; }
 .hrow .top { display: flex; justify-content: space-between; gap: 8px; color: var(--ink-2); }
 .hrow .top b { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
@@ -183,6 +189,11 @@ td.nw { color: var(--ink); }
     <div class="chart" id="gpuChart"></div>
   </section>
 
+  <section class="card" id="why-card">
+    <div class="head"><h2>Next handover</h2><span class="right" id="whyNote"></span></div>
+    <div class="whys" id="whys"></div>
+  </section>
+
   <section class="card" id="cost-card" hidden>
     <div class="head"><h2>Power cost</h2><span class="right" id="costNote"></span></div>
     <div class="tiles" id="costTiles"></div>
@@ -252,7 +263,10 @@ const el = (tag, attrs = {}, text) => {
   const ns = ["svg", "path", "line", "rect", "text", "g"].includes(tag) ? "http://www.w3.org/2000/svg" : null;
   const e = ns ? document.createElementNS(ns, tag) : document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
-  if (text !== undefined) e.textContent = text;
+  // A node passed here means a node child, not its toString(): twice now a panel has
+  // rendered "[object HTMLElement]" because a caller passed an element by mistake.
+  if (text instanceof Node) e.append(text);
+  else if (text !== undefined) e.textContent = text;
   return e;
 };
 const gib = (mib) => mib == null ? "–" : (mib / 1024).toFixed(1);
@@ -292,13 +306,14 @@ async function refresh() {
     const until = Date.now() / 1000, since = until - state.range;
     const width = document.querySelector("main").clientWidth || 1000;
     const q = `since=${since}&until=${until}`;
-    const [samples, events, logs, cost] = await Promise.all([
+    const [samples, events, logs, cost, why] = await Promise.all([
       getJSON(`/api/history?${q}&points=${Math.max(120, Math.round(width / 2))}`),
       getJSON(`/api/events?${q}&limit=2000`),
       getJSON(`/api/logs?${q}&limit=2000`),
       getJSON(`/api/cost?${q}`).catch(() => ({ error: "no power.price_per_kwh in the config" })),
+      getJSON("/api/why").catch(() => null),
     ]);
-    Object.assign(state, { samples, events, logs, cost, since, until, error: null });
+    Object.assign(state, { samples, events, logs, cost, why, since, until, error: null });
   } catch (e) {
     state.error = String(e.message || e);
   }
@@ -718,6 +733,30 @@ function renderGpu() {
   lineChart("gpuChart", m);
 }
 
+const WHY = { ready: ["could take it now", "var(--good)"], waiting: ["would have to wait", "var(--warning)"],
+              blocked: ["blocked", "var(--critical)"] };
+
+function renderWhy() {
+  const w = state.why, box = $("whys");
+  if (!w || !w.targets) {
+    box.replaceChildren(el("p", { class: "notice" }, "the dry run didn't answer"));
+    return;
+  }
+  $("whyNote").textContent = "what each workload would have to give up, and what stands in the way";
+  box.replaceChildren(...Object.values(w.targets).map((t) => {
+    const d = el("div", { class: "why" });
+    const chip = el("span", { class: "chip" }, (WHY[t.would] || WHY.ready)[0]);
+    chip.style.background = (WHY[t.would] || WHY.ready)[1];
+    const head = el("div", { class: "whyhead" });
+    head.append(el("b", {}, labelOf(t.target)), chip);
+    const ul = el("ul");
+    if (!t.notes.length) ul.append(el("li", {}, t.resident ? "nothing to do: it holds the card" : "nothing in the way"));
+    for (const n of t.notes) ul.append(el("li", {}, n));
+    d.append(head, ul);
+    return d;
+  }));
+}
+
 function renderCost() {
   const c = state.cost, card = $("cost-card");
   if (!c || c.error) { card.hidden = true; return; }
@@ -774,6 +813,7 @@ function renderCharts() {
   hovers.length = 0;
   renderOwner();
   renderHolders();
+  renderWhy();
   renderGpu();
   renderCost();
   renderVram();

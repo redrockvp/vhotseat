@@ -168,6 +168,17 @@ def test_gpu_load_temperature_and_power_are_recorded_and_served(rig, server):
     assert "gpu_health" not in rig.arb.probe()
 
 
+def test_web_serves_the_handover_dry_run(rig, server):
+    """The page's answer to "why can't this job have the card?" comes from the same dry
+    run the CLI prints, not a guess made in the page."""
+    rig.strata.loaded = True
+    code, body = get(f"{server}/api/why")
+    assert code == 200
+    why = json.loads(body)["targets"]
+    assert why["comfy"]["would"] == "ready"
+    assert "Strata holds 14000 MiB and would be asked to release it" in why["comfy"]["notes"]
+
+
 def test_cost_integrates_the_cards_wattage_per_holder():
     """kWh and cost over the sampled gaps, charged to whoever held the card at the gap's
     start. A stretch with no samples - or no wattage - is no data, not a card that drew

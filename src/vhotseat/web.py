@@ -5,6 +5,9 @@ The page (web.html) polls a small JSON API:
 
   GET /api/status                    the live status (`status --json`), plus the workloads' order and
                                      the card's model, load, temperature and power
+  GET /api/why                       for each workload: could it take the card now, and what stands in
+                                     the way (`why`'s dry run: it releases nothing)
+  GET /api/cost?since=&until=        kWh and money over that window, per holder (needs power.price)
   GET /api/history?since=&until=     samples between two Unix times, averaged into at most `points` buckets
   GET /api/events?since=&until=      events, newest first
   GET /api/logs?since=&until=        vhotseat's log lines from every process, newest first
@@ -26,6 +29,8 @@ from .telemetry import Sampler, cost
 
 # Probing calls every workload's API; several open tabs share one probe a second.
 STATUS_TTL_S = 1.0
+# `why` probes again (busy(), reachability): share it between tabs the same way.
+WHY_TTL_S = 3.0
 
 
 def bucket(samples: list[dict], points: int) -> list[dict]:
@@ -64,6 +69,8 @@ class Dashboard:
         self.telemetry = arbiter.telemetry
         self._status = (0.0, None)
         self._status_lock = threading.Lock()
+        self._why = (0.0, None)
+        self._why_lock = threading.Lock()
 
     def status(self) -> dict:
         with self._status_lock:
@@ -79,9 +86,19 @@ class Dashboard:
                 self._status = (time.monotonic(), cached)
             return cached
 
+    def why(self) -> dict:
+        with self._why_lock:
+            at, cached = self._why
+            if cached is None or time.monotonic() - at > WHY_TTL_S:
+                cached = {"now": time.time(), "targets": self.arbiter.why_all()}
+                self._why = (time.monotonic(), cached)
+            return cached
+
     def api(self, path: str, query: dict) -> tuple[int, object]:
         if path == "/api/status":
             return 200, self.status()
+        if path == "/api/why":
+            return 200, self.why()
         if self.telemetry is None:
             return 404, {"error": "telemetry is off (telemetry.enabled: false in the config)"}
         now = time.time()

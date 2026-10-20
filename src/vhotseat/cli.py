@@ -10,6 +10,7 @@
   vhotseat record                           sample RAM and VRAM into the telemetry until stopped
   vhotseat autostart ACTION                 install|status|remove: keep web (or record) up from logon
   vhotseat cost [--since 24h]               what the card's power has cost (needs power.price_per_kwh)
+  vhotseat why [NAME]                       why a workload can or can't take the GPU right now
 
 Exit codes: 0 ok · 1 failed / refused · 2 usage or bad config. `hold` exits with
 CMD's own exit code once CMD has started. `autostart status` exits 1 when nothing
@@ -70,6 +71,9 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp = sub.add_parser("cost", help="what the card's power has cost over a window")
     sp.add_argument("--since", default="24h", metavar="WINDOW",
                     help="how far back: 90m, 24h, 7d or seconds (default 24h)")
+    sp.add_argument("--json", action="store_true")
+    sp = sub.add_parser("why", help="why a workload can or can't take the GPU right now (reads only)")
+    sp.add_argument("name", nargs="?", help="one workload; default: every one")
     sp.add_argument("--json", action="store_true")
     argv = sys.argv[1:] if argv is None else list(argv)
     # hold's COMMAND is everything after the first `--`, split off here: a REMAINDER
@@ -137,6 +141,20 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
         if args.action == "remove":
             return autostart.remove()
         return autostart.status()
+    if args.cmd == "why":
+        why = arbiter.why_all()
+        if args.name:
+            why = {args.name: why[args.name]}
+        if json_out:
+            print(json.dumps(why))
+        else:
+            word = {"ready": "could take the card now", "waiting": "would have to wait",
+                    "blocked": "is blocked"}
+            for name, w in why.items():
+                print(f"{w['label'] + ':':<12}{word[w['would']]}")
+                for note in w["notes"]:
+                    print(f"{'':<12}- {note}")
+        return EXIT_OK
     if args.cmd == "cost":
         from .telemetry import cost
         price = arbiter.power.get("price_per_kwh")
