@@ -333,6 +333,24 @@ class FakeGpu:
             used = {"strata_mib": self.strata.vram, "comfy_mib": self.comfy.vram, "other_mib": self.other}
         return {"total_mib": 16303, "free_mib": 16303 - sum(used.values()), **used}
 
+    def read_all(self, selectors: dict, limit: int = 8) -> tuple[dict, list]:
+        """The same sums, as named processes: what a workload holds, and what nothing
+        manages. Each fake server is one process here."""
+        snap = self.snapshot(selectors)
+        if "error" in snap:
+            return snap, []
+        rows = []
+        if self.strata.vram:
+            lost = getattr(self, "strata_as_other", False)
+            rows.append({"pid": 1111, "mib": self.strata.vram, "name": "strata.exe",
+                         "workload": None if lost else "strata"})
+        if self.comfy.vram:
+            rows.append({"pid": 2222, "mib": self.comfy.vram, "name": "python.exe", "workload": "comfy"})
+        if self.other:
+            rows.append({"pid": 3333, "mib": self.other, "name": "Xorg", "workload": None})
+        rows.sort(key=lambda r: -r["mib"])
+        return snap, rows[:limit]
+
 
 class _FakeService:
     can_start = True

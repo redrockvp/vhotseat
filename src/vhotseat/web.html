@@ -99,6 +99,13 @@ tr.hl td { background: var(--wash); }
 .notice { color: var(--ink-2); font-size: 13px; margin: 0 0 14px; }
 .notice code, td code { font-size: 12px; background: var(--wash); padding: 1px 5px; border-radius: 4px; }
 .workloads { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.holders { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px 18px; margin-top: 4px; }
+.hrow { font-size: 13px; }
+.hrow .top { display: flex; justify-content: space-between; gap: 8px; color: var(--ink-2); }
+.hrow .top b { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+.hrow .bar { height: 6px; border-radius: 3px; background: var(--wash); margin-top: 5px; overflow: hidden; }
+.hrow .bar i { display: block; height: 100%; border-radius: 3px; }
+.hrow .who { color: var(--muted); font-size: 12px; margin-top: 3px; }
 .owner-now { font-size: 30px; font-weight: 650; display: flex; align-items: center; gap: 10px; }
 .owner-now .key { width: 14px; height: 14px; border-radius: 3px; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -159,6 +166,11 @@ td.nw { color: var(--ink); }
     <div class="workloads" id="workloads" style="margin-top:12px"></div>
     <div class="legend" id="modeLegend"></div>
     <div class="chart" id="modeChart"></div>
+  </section>
+
+  <section class="card" id="holders-card">
+    <div class="head"><h2>Holders</h2><span class="right" id="holdersNote"></span></div>
+    <div class="holders" id="holders"></div>
   </section>
 
   <section class="card" id="gpu">
@@ -652,6 +664,32 @@ function renderOwner() {
   modeChart();
 }
 
+function renderHolders() {
+  const s = state.status, g = s.gpu || {}, box = $("holders"), rows = s.holders || [];
+  $("holdersNote").textContent = g.error ? "" :
+    `${gib(g.other_mib)} GiB held by processes vhotseat doesn't manage`;
+  if (g.error) {
+    box.replaceChildren(el("p", { class: "notice" }, `can't read the card: ${g.error}`));
+    return;
+  }
+  if (!rows.length) {
+    box.replaceChildren(el("p", { class: "notice" },
+      "this backend reports no per-process memory, so holders can't be named"));
+    return;
+  }
+  const used = Math.max(1, (g.total_mib || 0) - (g.free_mib || 0));
+  box.replaceChildren(...rows.map((r) => {
+    const row = el("div", { class: "hrow" });
+    const top = el("div", { class: "top" });
+    top.append(el("b", {}, r.name || `pid ${r.pid}`), el("span", {}, `${gib(r.mib)} GiB`));
+    const bar = el("div", { class: "bar" }), fill = el("i");
+    fill.style.width = `${Math.min(100, Math.round(100 * r.mib / used))}%`;
+    fill.style.background = r.workload ? colorOf(r.workload) : "var(--muted)";
+    row.append(top, bar, el("div", { class: "who" }, r.workload ? labelOf(r.workload) : "unmanaged"));
+    return row;
+  }));
+}
+
 function renderGpu() {
   const s = state.status, h = s.gpu_health || {}, g = s.gpu;
   $("gpuName").textContent = (h.name || "").replace(/^NVIDIA /, "") || (h.error ? `can't read the card: ${h.error}` : "");
@@ -702,6 +740,7 @@ function renderCharts() {
   if (!s) return;
   hovers.length = 0;
   renderOwner();
+  renderHolders();
   renderGpu();
   renderVram();
   renderRam();

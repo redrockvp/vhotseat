@@ -16,10 +16,13 @@ vhotseat doctor [--json]                        check the config, the GPU, every
 vhotseat doctor --exercise NAME [--wait S]      run a real cycle on NAME, timed
 vhotseat web [--host H] [--port P]              dashboard: RAM and VRAM over time, handovers, events, logs
 vhotseat record                                 sample RAM and VRAM into the telemetry until stopped
+vhotseat autostart install [--command web|record]  keep the dashboard (or the recorder) up from logon
+vhotseat autostart status | remove              is it registered? · take it back out
 ```
 
-Exit codes: `0` ok · `1` switch failed or gate refused · `2` usage or bad
-config. `hold` exits with COMMAND's own exit code once COMMAND has started.
+Exit codes: `0` ok · `1` switch failed, gate refused, or `autostart status` with
+nothing registered · `2` usage or bad config. `hold` exits with COMMAND's own
+exit code once COMMAND has started.
 
 **Modes.** `status` reports the owner, derived live from each workload's API
 and the GPU's per-process memory; there is no state file to drift. The mode is
@@ -189,6 +192,10 @@ vhotseat web                 # http://localhost:8765/ ; --host 0.0.0.0 to reach 
 One page, refreshed every 5 s, that works on a phone too:
 
 - **Owner**: who holds the GPU now, each workload's state, and the owner over time.
+- **Holders**: every process holding card memory, named, with how much, and which
+  workload it belongs to (or *unmanaged*: a desktop, a browser, a game, an app you
+  started yourself). `status` prints the five biggest on its `holds:` line, and
+  `status --json` carries them as `holders: [{pid, mib, name, workload}]`.
 - **GPU load**: the card's model, load, temperature and power, now and over time.
 - **VRAM** and **RAM / Swap**: per workload, stacked against the totals.
 - **Events / Logs**: every switch, hold and gate decision, and every line a
@@ -209,8 +216,18 @@ samples every `interval_s` while it lasts. So a dashboard started later shows
 what happened before. Between commands nothing samples, which shows as gaps;
 for an unbroken history run the recorder as a service:
 
+```sh
+vhotseat autostart install          # Task Scheduler at logon on Windows, a systemd user unit elsewhere
+vhotseat autostart status           # registered? running? (exit 1 when nothing is registered)
+vhotseat autostart remove
+```
+
+`--command record` installs the sampler without the page. It registers one thing
+only, named `vhotseat`; everything else in vhotseat stays per-command on purpose.
+The unit it writes elsewhere, if you'd rather keep it by hand:
+
 ```ini
-# ~/.config/systemd/user/vhotseat-record.service   (or run `vhotseat web` this way instead)
+# ~/.config/systemd/user/vhotseat.service   (or `vhotseat autostart install` writes this)
 [Service]
 ExecStart=%h/.local/bin/vhotseat record
 Restart=on-failure

@@ -8,9 +8,11 @@
   vhotseat doctor --exercise NAME [--wait S]   run a real cycle on NAME (take, load, release), timed
   vhotseat web [--host H] [--port P]        a dashboard: RAM and VRAM over time, handovers, events, logs
   vhotseat record                           sample RAM and VRAM into the telemetry until stopped
+  vhotseat autostart ACTION                 install|status|remove: keep web (or record) up from logon
 
 Exit codes: 0 ok · 1 failed / refused · 2 usage or bad config. `hold` exits with
-CMD's own exit code once CMD has started.
+CMD's own exit code once CMD has started. `autostart status` exits 1 when nothing
+is registered.
 """
 
 import argparse
@@ -59,6 +61,10 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
     sp.add_argument("--port", type=int, default=8765, help="port (default 8765)")
     sub.add_parser("record", help="sample RAM and VRAM into the telemetry until stopped (for a service)")
+    sp = sub.add_parser("autostart", help="keep the dashboard and sampling up from logon")
+    sp.add_argument("action", choices=("install", "status", "remove"))
+    sp.add_argument("--command", choices=("web", "record"), default="web",
+                    help="what starts at logon: web (the dashboard, which also samples) or record")
     argv = sys.argv[1:] if argv is None else list(argv)
     # hold's COMMAND is everything after the first `--`, split off here: a REMAINDER
     # argument would also swallow options before it (`hold comfy --wait 600 -- CMD`).
@@ -118,6 +124,13 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
     if args.cmd in ("web", "record"):
         from . import web
         return web.serve(arbiter, args.host, args.port) if args.cmd == "web" else web.record(arbiter)
+    if args.cmd == "autostart":
+        from . import autostart
+        if args.action == "install":
+            return autostart.install(args.command)
+        if args.action == "remove":
+            return autostart.remove()
+        return autostart.status()
     # A switch may wait minutes for running work to finish (the ComfyUI guard waits up
     # to 300 s): sample meanwhile.
     with Sampler(arbiter) if args.wait else contextlib.nullcontext():

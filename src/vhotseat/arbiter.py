@@ -49,6 +49,18 @@ class Arbiter:
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
 
+    def snapshot_all(self) -> tuple[dict, list]:
+        """One read of the card: the attribution sums and the named processes behind them.
+        A backend that can't name processes gives the sums and an empty list."""
+        sel = {n: w.vram_selector for n, w in self.workloads.items()}
+        fn = getattr(self.gpu, "read_all", None)
+        return fn(sel) if fn else (self.gpu.snapshot(sel), [])
+
+    def holders(self, limit: int = 8) -> list[dict]:
+        """Who holds the card's memory, biggest first, by name: the workloads vhotseat
+        manages and, with workload None, the ones nothing manages (a desktop, a game)."""
+        return self.snapshot_all()[1][:limit]
+
     def gpu_health(self) -> dict:
         """The card's model, load, temperature and power; not part of `status`."""
         return self.gpu.health() if hasattr(self.gpu, "health") else {}
@@ -59,13 +71,14 @@ class Arbiter:
     # --- status --------------------------------------------------------------
 
     def probe(self) -> dict:
-        gpu = self.snapshot()
+        gpu, held = self.snapshot_all()
         states = {n: w.probe(gpu) for n, w in self.workloads.items()}
         active = [n for n, w in self.workloads.items() if w.active(states[n], gpu)]
         mode = "conflict" if len(active) > 1 else active[0] if active else NONE
         ram = self.machine_ram()
         ram.update({n: w.memory() for n, w in self.workloads.items()})
-        status = {"mode": mode, **states, "gpu": gpu, "ram": ram, "last_event": self.events.last()}
+        status = {"mode": mode, **states, "gpu": gpu, "holders": held, "ram": ram,
+                  "last_event": self.events.last()}
         if self.telemetry is not None:
             self.telemetry.sample(status, self.gpu_health)
         return status
@@ -78,6 +91,10 @@ class Arbiter:
         shares = ", ".join(f"{n} {g[f'{n}_mib']}" for n in self.workloads)
         lines.append(f"{'gpu:':<{width}}" + (g["error"] if "error" in g else
                      f"{g['free_mib']} of {g['total_mib']} MiB free ({shares}, other {g['other_mib']})"))
+        if rows := s.get("holders"):
+            shown = "  ".join(f"{r['name'] or r['pid']} {r['mib']}" + (f" ({r['workload']})" if r["workload"] else "")
+                              for r in rows[:5])
+            lines.append(f"{'holds:':<{width}}{shown}")
         lines.append(f"{'ram:':<{width}}" + self._describe_ram(s["ram"]))
         if ev := s.get("last_event"):
             detail = ", ".join(f"{k}={v}" for k, v in ev.items() if k not in ("time", "event"))

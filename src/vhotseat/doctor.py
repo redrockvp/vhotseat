@@ -131,8 +131,11 @@ def checks(arbiter, cfg: dict | None) -> list:
         # hand outside its service, which no gate protects (seen 2026-10-17: a trial
         # llama-server left running outside its unit). Admission can't see it coming.
         if g["other_mib"] > OTHER_WARN_MIB:
-            out.append((WARN, "gpu: other", f"{g['other_mib']} MiB held by processes that aren't a configured "
-                        "workload; nothing gates them. `nvidia-smi` shows which."))
+            unclaimed = [r for r in arbiter.holders() if not r["workload"]][:4]
+            who = ", ".join(f"{r['name'] or r['pid']} {r['mib']}" for r in unclaimed)
+            detail = f"workload ({who}); nothing gates them" if who else \
+                "workload; nothing gates them. `nvidia-smi` shows which"
+            out.append((WARN, "gpu: other", f"{g['other_mib']} MiB held by processes that aren't a configured " + detail))
     ram = arbiter.machine_ram()
     out += check_patches(cfg)
     out.append((FAIL, "ram", ram["error"]) if "error" in ram else

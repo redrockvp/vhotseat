@@ -251,6 +251,16 @@ def test_attribution_falls_back_to_the_process_name():
     assert snap == {"total_mib": 24576, "free_mib": 600, "strata_mib": 20000, "comfy_mib": 0, "other_mib": 300}
 
 
+def test_holders_names_who_holds_the_card():
+    """The sums say `other 4200`; the answer to "what is on my card" is a name."""
+    procs = [(7, 20000, "strata.exe"), (8, 3000, "python.exe"), (9, 1200, "Xorg")]
+    sel = {"strata": ("process", "strata.exe")}
+    rows = gpu.holders(24576, 600, procs, sel, procinfo=lambda pid: ("", ""))
+    assert [(r["name"], r["mib"], r["workload"]) for r in rows] == [
+        ("strata.exe", 20000, "strata"), ("python.exe", 3000, None), ("Xorg", 1200, None)]
+    assert [r["name"] for r in gpu.holders(24576, 600, procs, sel, procinfo=lambda p: ("", ""), limit=1)] == ["strata.exe"]
+
+
 def test_nvml_matches_nvidia_smi():
     """On a machine with an NVIDIA GPU, NVML and nvidia-smi agree."""
     try:

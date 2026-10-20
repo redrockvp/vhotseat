@@ -37,10 +37,11 @@ def test_status_json_shape_is_unchanged(rig, capsys):
     """A dashboard reads these keys: they are the --json contract."""
     assert rig.cli("status", "--json") == 0
     s = json.loads(capsys.readouterr().out)
-    assert set(s) == {"mode", "strata", "comfy", "gpu", "ram", "last_event"}
+    assert set(s) == {"mode", "strata", "comfy", "gpu", "holders", "ram", "last_event"}
     assert set(s["strata"]) == {"service", "reachable", "loaded"}
     assert set(s["comfy"]) == {"service", "reachable", "running", "pending", "holds_models"}
     assert set(s["gpu"]) == {"total_mib", "free_mib", "strata_mib", "comfy_mib", "other_mib"}
+    assert set(s["holders"][0]) == {"pid", "mib", "name", "workload"}
     assert set(s["ram"]) >= {"total_mib", "available_mib", "strata", "comfy"}
 
 
@@ -52,6 +53,8 @@ def test_status_text(rig, capsys):
     assert out[1] == "strata: model loaded"
     assert out[2] == "comfy:  no models loaded, 0 running / 0 queued"
     assert out[3].startswith("gpu:    1903 of 16303 MiB free (strata 14000, comfy 400, other 0)")
+    # who actually holds it, by name: the workloads and anything nothing manages
+    assert out[4] == "holds:  strata.exe 14000 (strata)  python.exe 400 (comfy)"
 
 
 # --- switch --------------------------------------------------------------------

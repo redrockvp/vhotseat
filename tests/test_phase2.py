@@ -131,6 +131,7 @@ def test_doctor_warns_about_unattributed_vram(rig):
     rig.gpu.other = 2956
     found = [(s, d) for s, c, d in doctor.checks(rig.arb, rig.cfg) if c == "gpu: other"]
     assert found and found[0][0] == "warn" and "2956 MiB" in found[0][1]
+    assert "Xorg 2956" in found[0][1]        # it names them, not just counts them
     rig.gpu.other = 300
     assert not [c for _, c, _ in doctor.checks(rig.arb, rig.cfg) if c == "gpu: other"]
 

@@ -138,25 +138,42 @@ def read_proc(pid: int) -> tuple[str, str]:
     return cgroup, cmd
 
 
-def attribute(total: int, free: int, procs: list[tuple[int, int | None, str]],
-              selectors: dict[str, tuple[str, str] | None], procinfo=read_proc) -> dict:
-    """Snapshot keyed "<workload>_mib", plus total_mib, free_mib, other_mib.
+def classify(total: int, free: int, procs: list[tuple[int, int | None, str]],
+             selectors: dict[str, tuple[str, str] | None], procinfo=read_proc) -> tuple[dict, list]:
+    """(the attribution summary, and one row per process holding memory).
 
     selectors: workload -> ("unit", "comfyui.service") or ("process", "ComfyUI/main.py").
     procs: (pid, MiB or None if the driver can't say, name the GPU reader reports)."""
     out = {"total_mib": total, "free_mib": free, **{f"{n}_mib": 0 for n in selectors}, "other_mib": 0}
+    rows = []
     for pid, mib, name in procs:
         if mib is None:
             continue
         cgroup, cmd = procinfo(pid)
         units = cgroup.split("/")
-        key = "other_mib"
+        key, owner = "other_mib", None
         for n, sel in selectors.items():
             if sel and ((sel[0] == "unit" and sel[1] in units) or (sel[0] == "process" and sel[1] in (cmd or name))):
-                key = f"{n}_mib"
+                key, owner = f"{n}_mib", n
                 break
         out[key] += mib
-    return out
+        rows.append({"pid": pid, "mib": mib, "name": name, "workload": owner})
+    return out, rows
+
+
+def attribute(total: int, free: int, procs: list[tuple[int, int | None, str]],
+              selectors: dict[str, tuple[str, str] | None], procinfo=read_proc) -> dict:
+    """Snapshot keyed "<workload>_mib", plus total_mib, free_mib, other_mib."""
+    return classify(total, free, procs, selectors, procinfo)[0]
+
+
+def holders(total: int, free: int, procs: list[tuple[int, int | None, str]],
+            selectors: dict[str, tuple[str, str] | None], procinfo=read_proc, limit: int = 0) -> list[dict]:
+    """Who holds the card, biggest first: pid, MiB, process name, and the workload it is
+    attributed to (None for processes nothing manages - a desktop, a game, an app)."""
+    rows = classify(total, free, procs, selectors, procinfo)[1]
+    rows.sort(key=lambda r: -r["mib"])
+    return rows[:limit] if limit else rows
 
 
 class NvidiaSmi:
@@ -333,6 +350,18 @@ class Backend:
             return {"total_mib": None, "free_mib": None, **{f"{n}_mib": 0 for n in selectors},
                     "other_mib": 0, "error": str(e)}
         return attribute(total, free, procs, selectors, self.procinfo)
+
+    def read_all(self, selectors: dict, limit: int = 8) -> tuple[dict, list]:
+        """The attribution sums and the named processes behind them, from one read:
+        when `other_mib` is big, what to look at is usually a name, not a number."""
+        try:
+            total, free, procs = self.reader.read()
+        except GpuError as e:
+            return ({"total_mib": None, "free_mib": None, **{f"{n}_mib": 0 for n in selectors},
+                     "other_mib": 0, "error": str(e)}, [])
+        summary, rows = classify(total, free, procs, selectors, self.procinfo)
+        rows.sort(key=lambda r: -r["mib"])
+        return summary, rows[:limit]
 
     def health(self) -> dict:
         """Model, load, temperature and power, for the dashboard; {} if the backend can't say."""

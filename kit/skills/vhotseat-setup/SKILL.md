@@ -140,3 +140,13 @@ symlinking each folder of `kit/skills/` into the agent's skills folder:
 `~/.claude/skills/` (Claude Code), `~/.codex/skills/` (Codex),
 `~/.pi/agent/skills/` (pi). The agent that runs on the local LLM should get
 **comfyui-batching**; the coding agent gets the `vhotseat-*` skills.
+
+## 8. Keep the dashboard up
+
+History only accumulates while something samples, so ask whether to register the
+dashboard at logon: `vhotseat autostart install --command web` (Task Scheduler on
+Windows, a systemd user unit elsewhere; `vhotseat autostart status` to check, and
+`remove` to undo). On Windows a logon trigger needs elevation: without it it falls
+back to the per-user Run key through a hidden launcher, which is the same thing for
+one user and needs no console window. Then open the dashboard once and point the
+user at `http://localhost:8765/`.
