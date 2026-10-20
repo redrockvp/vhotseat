@@ -38,6 +38,15 @@ workloads:
     # body: {model_path: "{model}"}        # JSON body for a POST: {model} is what `model:`
     #                                       # says is served, {wait} the release's wait. For
     #                                       # servers that release one model at a time by id.
+    # estimate:                             # optional: ask the server what one of its models
+    #   from: {get: /settings/last-model}    # would cost on the card, at a given context.
+    #   post: /estimate-memory               #   `from:` names the fields the body needs;
+    #   body: {model_path: "{id}", n_ctx: "{ctx}"}
+    #   ctx: 32768
+    #   path: gpu_bytes                      # reported in status and `why`, never enforced:
+    #                                       # a server may fit a model by shrinking its
+    #                                       # context or spilling into RAM - that's your call,
+    #                                       # the number is what makes it an informed one.
     gate:
       kind: hook       # Strata runs `vhotseat gate strata` before every load
       config: ~/Strata/strata.json   # its config file, checked by doctor

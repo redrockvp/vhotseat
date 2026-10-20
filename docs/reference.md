@@ -79,6 +79,11 @@ and [guides/proxy-gate.md](guides/proxy-gate.md).
 Releasing the others always happens. Admission decides whether that's enough
 for the incoming workload to load safely:
 
+A floor is what a model needs *room to load into*, so it is never applied to a workload
+whose weights are already on the card: its own memory doesn't count against it. Without
+that, a second request reaching a server while the first one's weights are still streaming
+in reads that 20 GB as the blocker, and refuses the load that put it there.
+
 ```yaml
 admission:
   min_available_ram_mib: 46000   # MemAvailable: free RAM plus cache the kernel can drop
@@ -129,6 +134,25 @@ Two things a URL doesn't cover:
   If the workload says something *is* loaded and `model:` can't name it, the release fails
   and names the key to fix, rather than reporting success over a model that stayed on the
   card.
+
+- **A sizing question.** `estimate:` asks the server what one of its models would cost on
+  the card, at a context you name:
+
+  ```yaml
+  estimate:
+    from: {get: /settings/last-model}
+    post: /estimate-memory
+    body: {model_path: "{id}", gguf_variant: "{gguf_variant}", n_ctx: "{ctx}"}
+    ctx: 32768
+    path: gpu_bytes
+  ```
+
+  `from:` reads the response that names the model and its fields fill the body; a
+  placeholder with nothing behind it drops its key rather than sending the placeholder text.
+  The answer is **reported, never enforced**: `status` says *X sizes at 19865 MiB* and `why`
+  adds *more than the card's 24576 MiB: only part of it can be resident*. A server can fit a
+  model by shrinking its context or spilling into RAM, and refusing on the number would be
+  vhotseat holding an opinion about a trade its owner is making.
 
 A workload with nothing inside it that can ask for the GPU - no hook, no plugin - is
 declared `gate: {kind: hold}`: it is guarded only while it runs under `vhotseat hold`, so

@@ -381,6 +381,35 @@ def test_a_workload_that_needs_a_key_says_so_rather_than_looking_down(vh, monkey
     assert said and "wants a key" in said[0] and "VH_TEST_KEY" in said[0]
 
 
+def test_a_workload_is_never_refused_by_its_own_floor(vh):
+    """min_free_vram_mib is what a model needs room to load into. Weights already on the card
+    are not room it still has to find: asking for the card again while they land must not be
+    refused by the memory its own load put there."""
+    assert vh.arb.workloads["strata"].admission_for()[0]["min_free_vram_mib"] == 14000
+    vh.strata.loaded = True                    # someone loaded it; nobody asked first
+    result = vh.arb.switch("strata", 0)
+    assert result["ok"] is True, result.get("error")
+
+
+def test_a_workload_can_size_a_model_before_it_lands(vh):
+    """Ask the server what one of its models would cost on the card. Reported, never
+    enforced: it may still fit it by shrinking the context or spilling into RAM, and the
+    number is what makes that visible before the weights land rather than after."""
+    w = vh.arb.workloads["strata"]
+    w.spec["estimate"] = {"from": {"get": "/last-model"}, "post": "/estimate",
+                          "body": {"model_path": "{id}", "gguf_variant": "{gguf_variant}",
+                                   "n_ctx": "{ctx}"},
+                          "ctx": 32768, "path": "gpu_bytes"}
+    st = vh.arb.probe()["strata"]
+    assert st["sized"]["bytes"] == 19 * 2**30
+    assert vh.strata.last_body == {"model_path": vh.strata.model, "gguf_variant": "Q4_K_XL",
+                                   "n_ctx": 32768}          # a number, not "32768"
+    vh.arb.probe()
+    assert vh.strata.estimate_calls == 1                    # the sampler doesn't pay per probe
+    assert "sizes at 19456 MiB" in w.describe(st)
+    assert any("sizes at 19456 MiB at 32768 ctx" in n for n in vh.arb.why_all()["strata"]["notes"])
+
+
 def test_a_release_can_name_the_model_it_is_unloading(vh):
     """Some servers unload one model at a time, by name. {model} comes from `model:`, so
     the release says which model it means instead of guessing."""

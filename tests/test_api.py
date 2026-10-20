@@ -30,6 +30,18 @@ class FakeProxy:
             self.seat.acquire(self.name, wait)
 
 
+def test_a_seat_that_just_took_the_card_owns_it_while_the_weights_land(rig, seat):
+    """A server that loads on request shows nothing on the card until its weights arrive, so
+    a probe straight after acquire() says nobody holds the GPU. The seat knows better: it
+    just handed the card over, and until someone else takes it, this gate owns it."""
+    rig.cli("switch", "comfy")
+    seat.acquire("strata", wait=5)
+    assert not rig.strata.loaded            # nothing has loaded: this is that window
+    assert seat.owns("strata") is True
+    rig.cli("switch", "comfy")             # hands change: the memory goes
+    assert seat.owns("strata") is False
+
+
 def test_generation_bumps_on_every_handover(rig, seat):
     g0 = seat.generation()
     rig.cli("switch", "strata")

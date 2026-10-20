@@ -82,6 +82,7 @@ class FakeStrata(_Server):
         self.model = "qwen3.8-flash-next-iq3_xxs"
         self.answering = 0          # requests being answered
         self.load_s = 0.05
+        self.estimate_calls = 0
         self.on_load = lambda: True
         super().__init__()
 
@@ -131,6 +132,13 @@ class FakeStrata(_Server):
             return h.send_json(200, {"status": "ok", "loaded": self.loaded, "model": self.model})
         if path == "/_vram":  # for a gpu-workload running in a subprocess (tests/run_cli.py)
             return h.send_json(200, {"vram": self.vram})
+        if path == "/last-model":
+            return h.send_json(200, {"id": self.model, "gguf_variant": "Q4_K_XL"})
+        if path == "/estimate" and method == "POST":
+            # What the server says a model costs on the card, at the context it was asked for.
+            self.estimate_calls += 1
+            return h.send_json(200, {"available": True, "weights_bytes": 8 * 2**30,
+                                     "gpu_bytes": 19 * 2**30, "n_ctx": (body or {}).get("n_ctx")})
         if path == "/unload" and method == "POST":
             wait = float(q.get("wait", 0))
             deadline = time.monotonic() + wait
@@ -144,6 +152,24 @@ class FakeStrata(_Server):
             if not self._load():
                 return h.send_json(503, {"error": "before_load refused"})
             return h.send_json(200, {"status": "loaded"})
+        if path == "/v1/chat/completions" and method == "POST":
+            # A completion naming the model loads it, as it does on any OpenAI-compatible
+            # server: this is the request a gate has to treat as a load.
+            self.answering += 1
+            try:
+                if not self._load():
+                    return h.send_json(503, {"error": "before_load refused"})
+                h.send_response(200)
+                h.send_header("Content-Type", "text/event-stream")
+                h.end_headers()
+                h.wfile.write(b"data: a token\n\n")
+                h.wfile.flush()
+                h.close_connection = True
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                self.answering -= 1
+            return
         h.send_json(404, {"error": path})
 
 

@@ -36,7 +36,8 @@ COMMON = {"driver", "label", "url", "service", "vram", "idle_vram_mib", "gate", 
           "allow_restart", "restart_timeout_s"}
 GATE_KEYS = {"kind", "timeout", "config", "custom_nodes", "status"}
 DRIVER_KEYS = {
-    "http": {"resident", "busy", "release", "confirm", "load", "model", "headers", "body"},
+    "http": {"resident", "busy", "release", "confirm", "load", "model", "headers", "body",
+             "estimate"},
     "comfyui": {"restart_above_ram_mib", "history_settle_s"},
 }
 
@@ -215,6 +216,24 @@ def validate(raw) -> dict:
                 _request(w["load"], f"{where}.load")
             if "model" in w:
                 _request(w["model"], f"{where}.model", needs_path=True)
+            if "estimate" in w:
+                est = w["estimate"]
+                _check(isinstance(est, dict), f"{where}.estimate",
+                       "expected {from: …, post: /…, body: {…}, path: field}: ask the server what a model costs")
+                _check(isinstance(est.get("post"), str) and est["post"], f"{where}.estimate.post",
+                       "expected the request path that does the sizing")
+                _check(isinstance(est.get("body"), dict)
+                       and all(isinstance(k, str) and k
+                               and isinstance(v, (str, int, float, bool)) for k, v in est["body"].items()),
+                       f"{where}.estimate.body",
+                       "expected field: value, where a value may name a {placeholder} from `from:`")
+                _check(isinstance(est.get("path"), str) and est["path"], f"{where}.estimate.path",
+                       "expected the response field holding the byte count")
+                if "from" in est:
+                    _request(est["from"], f"{where}.estimate.from")
+                if "ctx" in est:
+                    _check(isinstance(est["ctx"], int) and est["ctx"] > 0, f"{where}.estimate.ctx",
+                           "expected a token count")
             conf = w.get("confirm") or {}
             _check(isinstance(conf, dict), f"{where}.confirm", "expected a mapping")
             _int(conf, "vram_at_most", f"{where}.confirm")

@@ -140,7 +140,14 @@ class Arbiter:
             if have is None or have < need:
                 return f"{who} needs {need} MiB of available RAM, {have} MiB is available"
         if (need := adm.get("min_free_vram_mib")) is not None:
-            have = self.snapshot().get("free_mib")
+            snap = self.snapshot()
+            have = snap.get("free_mib")
+            # What x already has on the card is not room it still has to find: a model that
+            # is loaded, or landing right now, has paid for itself. Without this, a second
+            # request arriving while the first one's weights stream in reads the target's own
+            # 20 GB as the blocker and refuses the very load that put it there.
+            if have is not None:
+                have += max(0, x.vram_mib() - x.idle_vram_mib)
             if have is None or have < need:
                 return f"{who} needs {need} MiB of free VRAM, {have} MiB is free"
         return None
@@ -308,6 +315,18 @@ class Arbiter:
                         would = "waiting"
                     notes.append(f"{who} wants {need} MiB of available RAM, {have} MiB is free; getting it back "
                                  "from a workload means restarting it")
+            sized = (s[name] or {}).get("sized") or {}
+            if sized.get("bytes"):
+                # Reported, not enforced: the server may still fit it by shrinking its context
+                # or spilling into RAM. The number is for seeing that before the weights land.
+                note = (f"{(sized.get('model') or x.label).rsplit('/', 1)[-1]} sizes at "
+                        f"{sized['bytes'] // 2**20} MiB")
+                if sized.get("n_ctx"):
+                    note += f" at {sized['n_ctx']} ctx"
+                card = gpu.get("total_mib")
+                if card and sized["bytes"] // 2**20 > card:
+                    note += f", more than the card's {card} MiB: only part of it can be resident"
+                notes.append(note)
             out[name] = {"target": name, "label": x.label, "would": would, "holder": s["mode"],
                          "free_mib": gpu.get("free_mib"), "resident": resident, "notes": notes}
         return out

@@ -23,6 +23,12 @@
       body: {model_path: "{model}"}                  # optional: JSON body for a POST, with
                                                       # {model} (from `model:` above) and
                                                       # {wait} substituted in its values
+      estimate:                                       # optional: ask the server what one of
+        from: {get: /settings/last-model}              # its models would cost on the card.
+        post: /estimate-memory                         #   `from:` reads the fields that name
+        body: {model_path: "{id}", n_ctx: "{ctx}"}      #   the model, {ctx} comes from ctx:
+        ctx: 32768
+        path: gpu_bytes                                # reported, never enforced
 
 Paths are dotted (`a.b.0.c`; a leading `$.` is allowed). `{wait}` in a URL is
 replaced by the seconds the release may wait for running work. A request path
@@ -33,12 +39,14 @@ of the server, say).
 from dataclasses import dataclass, field
 import os
 import re
+import time
 
 from .. import util
 from ..errors import Busy, SwitchError
 from .base import Workload
 
 MISSING = object()
+ESTIMATE_TTL_S = 60.0
 
 
 def lookup(body, path: str):
@@ -101,6 +109,8 @@ class HttpWorkload(Workload):
         self.health_path = _request(self.spec["resident"])[1]
         self.release_always = bool(self.spec["release"].get("always", False))
         self.headers_missing: list[str] = []
+        self._estimate: dict | None = None
+        self._estimate_at = 0.0
 
     def _call(self, spec: dict, timeout: float = 5.0, **fmt):
         method, path = _request(spec)
@@ -137,6 +147,8 @@ class HttpWorkload(Workload):
                 # key that rotated looks like a server that's down, and the handover
                 # starts blaming the wrong thing.
                 st["auth"] = self.headers_missing or True
+        if self.spec.get("estimate"):
+            st["sized"] = self.estimate()
         return st
 
     def active(self, st: dict, gpu: dict) -> bool:
@@ -148,7 +160,13 @@ class HttpWorkload(Workload):
             miss = st["auth"]
             return ("asks for a key it isn't being sent (401): fix `headers:`"
                     + (f" - ${', $'.join(miss)} isn't in the environment" if isinstance(miss, list) else ""))
-        return super().describe(st) or ("model loaded" if st["loaded"] else "model unloaded")
+        return (super().describe(st) or ("model loaded" if st["loaded"] else "model unloaded")) + self._sized_note(st)
+
+    def _sized_note(self, st: dict) -> str:
+        sized = st.get("sized") or {}
+        if not sized.get("bytes"):
+            return ""
+        return f"; {str(sized.get('model') or '').rsplit('/', 1)[-1]} sizes at {sized['bytes'] // 2**20} MiB"
 
     def model(self) -> str | None:
         spec = self.spec.get("model")
@@ -157,6 +175,59 @@ class HttpWorkload(Workload):
         code, body = self._call(spec)
         value = lookup(body, spec["path"]) if code == 200 else MISSING
         return value if isinstance(value, str) and value else None
+
+    def estimate(self) -> dict | None:
+        """What this workload's own API says one of its models would cost on the card, asked
+        of the server that knows it: weights, KV cache at a given context, whether the model
+        is even downloaded. Reported, never enforced: a server fits a model by shrinking its
+        context or spilling into RAM, which is a call its owner sometimes wants to make, and
+        the number is what makes that call visible before the weights land. Cached, because
+        a sampler asks every few seconds and a sizing question costs a round trip.
+        """
+        spec = self.spec.get("estimate")
+        if not spec or not self.service_active():
+            return None
+        now = time.monotonic()
+        if self._estimate is not None and now - self._estimate_at < ESTIMATE_TTL_S:
+            return self._estimate
+        self._estimate, self._estimate_at = self._ask_estimate(spec), now
+        return self._estimate
+
+    def _ask_estimate(self, spec: dict) -> dict | None:
+        """One sizing question: read the fields that name the model (`from:`), fill them into
+        the body, ask. A placeholder with nothing behind it drops its key rather than sending
+        the placeholder text as a value."""
+        fields: dict = {}
+        if spec.get("from"):
+            code, body = self._call(spec["from"])
+            if code == 200 and isinstance(body, dict):
+                fields = {k: v for k, v in body.items()
+                          if v is None or isinstance(v, (str, int, float, bool))}
+        if "ctx" in spec:
+            fields["ctx"] = spec["ctx"]
+        body = {}
+        for field_name, template in (spec.get("body") or {}).items():
+            if not isinstance(template, str):
+                body[field_name] = template
+                continue
+            names = re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", template)
+            if any(fields.get(n) in (None, "") for n in names):
+                continue
+            if template.strip() == "{%s}" % names[0] and isinstance(fields[names[0]], (int, float)):
+                body[field_name] = fields[names[0]]   # the field's own type: "32768" is not 32768
+                continue
+            body[field_name] = re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda m: str(fields[m.group(1)]), template)
+        if not body:
+            return None
+        code, out = self._call({"post": spec["post"], "body": body})
+        if code != 200 or not isinstance(out, dict):
+            return None
+        value = lookup(out, spec["path"]) if spec.get("path") else MISSING
+        return {"model": body.get("model_path") or body.get("model"),
+                "bytes": value if isinstance(value, (int, float)) else None,
+                "n_ctx": out.get("n_ctx"), "weights_bytes": out.get("weights_bytes"),
+                "gpu_bytes": out.get("gpu_bytes"), "available": out.get("available"),
+                "reason": out.get("reason")}
 
     def _vram_limit(self) -> int:
         """The VRAM at or below which this workload counts as holding nothing on the card."""
