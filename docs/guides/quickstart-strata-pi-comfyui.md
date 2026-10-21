@@ -8,7 +8,7 @@ agent that drives ComfyUI video workflows on the same consumer GPU, unattended.
 | GPU | NVIDIA RTX 5070 Ti, 16 GB VRAM |
 | RAM | 64 GB |
 | OS | Ubuntu (systemd user services) |
-| LLM server | [Strata](https://github.com/Niko1221/Strata), serving [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) at IQ3_XXS, 128K context |
+| LLM server | [Strata](https://github.com/Niko1221/Strata) 0.2.1.4 (engine 0.1.46.3), serving [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) at IQ3_XXS, 128K context |
 | Agent | [pi](https://github.com/earendil-works/pi) 1.3 (`@earendil-works/pi-coding-agent`) |
 | Image/video | [ComfyUI](https://github.com/comfyanonymous/ComfyUI) 0.39 with [MiniMax H3](https://huggingface.co/Comfy-Org/MiniMax-H3) (int8 `fl2va` and `ref2va` models) |
 
