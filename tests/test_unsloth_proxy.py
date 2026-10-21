@@ -9,6 +9,7 @@ import http.client
 import importlib.util
 import json
 import pathlib
+import socket
 import threading
 import time
 from urllib.parse import urlsplit
@@ -40,6 +41,7 @@ class FakeStudio(_Server):
         self.loaded: list[str] = []
         self.load_s = 0.0
         self.stream_s = 0.0
+        self.hold_s = 0.0          # an upgraded connection kept open this long
         self.stream_started = threading.Event()
         self.unloaded: list[str] = []
         super().__init__()
@@ -51,6 +53,17 @@ class FakeStudio(_Server):
             return h.send_json(200, {"data": [{"id": m} for m in self.loaded]})
         if path == "/echo":
             return h.send_json(200, {"path": path, "query": q, "auth": self.last_headers.get("authorization")})
+        if path == "/ws":
+            h.send_response(101)
+            h.send_header("Upgrade", "websocket")
+            h.send_header("Connection", "Upgrade")
+            h.end_headers()
+            for _ in range(int(self.hold_s * 5)):
+                h.wfile.write(b"\x81\x00")        # an empty websocket frame
+                h.wfile.flush()
+                time.sleep(0.2)
+            h.close_connection = True
+            return
         if path == "/api/inference/load" and method == "POST":
             time.sleep(self.load_s)
             self.loaded.append((body or {}).get("model_path"))
@@ -177,6 +190,51 @@ def test_a_request_is_in_flight_until_its_last_byte(studio):
         thread.join(5)
         assert p.status()["in_flight"] == 0
     finally:
+        p.stop()
+
+
+def test_a_request_waiting_on_the_card_is_already_in_flight(studio):
+    """A drain must see a request that has not forwarded yet. Counting only from the moment of
+    forwarding let a drain unload the server and hand the card on while a load was still
+    waiting for the card - which then loaded on top of whoever had just been given it."""
+    class SlowSeat(StubSeat):
+        def acquire(self, name, wait=0):
+            self.started.set()
+            time.sleep(0.5)
+            super().acquire(name, wait)
+
+    seat = SlowSeat(owner="comfy")
+    seat.started = threading.Event()
+    p = proxy.Proxy(seat, studio.url, workload="unsloth", hold=5.0).start()
+    try:
+        threading.Thread(target=lambda: call(p.url, "POST", "/api/inference/load",
+                                             {"model_path": "m"})).start()
+        seat.started.wait(5)
+        assert p.status()["in_flight"] == 1        # counted before it was forwarded
+        code, _, raw = call(p.url, "POST", "/_vhotseat/drain?wait=0.1")
+        assert code == 409, (code, raw)            # refuse, don't unload underneath it
+    finally:
+        p.stop()
+
+
+def test_an_open_websocket_does_not_hold_the_card_hostage(studio):
+    """A UI tab keeps its websocket open for as long as it is open. Counting that as in flight
+    means every drain answers 409 while somebody has a window on the screen, and the card can
+    never be taken back."""
+    studio.hold_s = 1.2
+    seat = StubSeat(owner="unsloth")
+    p = proxy.Proxy(seat, studio.url, workload="unsloth", hold=5.0).start()
+    up = urlsplit(p.url)
+    sock = socket.create_connection((up.hostname, up.port), timeout=5)
+    sock.sendall(b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+    try:
+        assert b"101" in sock.recv(200)            # spliced through to the server
+        time.sleep(0.3)
+        assert p.status()["in_flight"] == 0        # the open tab is not "work running"
+        code, _, raw = call(p.url, "POST", "/_vhotseat/drain?wait=1")
+        assert code == 200, (code, raw)
+    finally:
+        sock.close()
         p.stop()
 
 

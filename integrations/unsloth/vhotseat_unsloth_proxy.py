@@ -170,31 +170,39 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path
         self.sent = False
 
-        if self.state.snapshot()[1]:
-            # Draining: vhotseat is taking the card from this workload. Wait, then 503.
-            deadline = time.monotonic() + self.hold
-            while self.state.snapshot()[1] and time.monotonic() < deadline:
-                time.sleep(0.25)
-            if self.state.snapshot()[1]:
-                return self._busy(f"{self.workload} is giving up the GPU (waited {int(self.hold)} s)")
-
-        if loads_a_model(method, path):
-            # The fast path first: while nothing has changed hands since the last check this
-            # is a file read, no lock and no probe - and a cold check probes this workload
-            # too, which asks this same server its /_vhotseat/status question, so never do
-            # either while holding something this handler needs.
-            if not self.seat.owns(self.workload):
-                try:
-                    self.seat.acquire(self.workload, wait=self.hold)
-                except Exception as exc:              # api.Busy, api.SwitchError, …
-                    return self._busy(str(exc))
+        # Counted from before anything is decided. If the count only started once the request
+        # was already forwarded, a drain that ran while this one was still waiting on the card
+        # saw nobody in flight, unloaded the server and handed the card on - and then this
+        # request loaded its model on top of whoever had just been given the GPU.
+        self.state.enter()
         try:
-            self._forward(method, self.path, body)   # self.path, query string and all
-        except (OSError, http.client.HTTPException) as exc:
-            # Upstream gone before anything reached the client: a 502 the client can act on,
-            # not a dropped connection. Once bytes are out there is nothing left to say.
-            if not self.sent:
-                self._reply(502, {"error": f"{self.upstream} unreachable: {exc}"})
+            if self.state.snapshot()[1]:
+                # Draining: vhotseat is taking the card from this workload. Wait, then 503.
+                deadline = time.monotonic() + self.hold
+                while self.state.snapshot()[1] and time.monotonic() < deadline:
+                    time.sleep(0.25)
+                if self.state.snapshot()[1]:
+                    return self._busy(f"{self.workload} is giving up the GPU (waited {int(self.hold)} s)")
+
+            if loads_a_model(method, path):
+                # The fast path first: while nothing has changed hands since the last check this
+                # is a file read, no lock and no probe - and a cold check probes this workload
+                # too, which asks this same server its /_vhotseat/status question, so never do
+                # either while holding something this handler needs.
+                if not self.seat.owns(self.workload):
+                    try:
+                        self.seat.acquire(self.workload, wait=self.hold)
+                    except Exception as exc:          # api.Busy, api.SwitchError, …
+                        return self._busy(str(exc))
+            try:
+                self._forward(method, self.path, body)   # self.path, query string and all
+            except (OSError, http.client.HTTPException) as exc:
+                # Upstream gone before anything reached the client: a 502 the client can act on,
+                # not a dropped connection. Once bytes are out there is nothing left to say.
+                if not self.sent:
+                    self._reply(502, {"error": f"{self.upstream} unreachable: {exc}"})
+        finally:
+            self.state.leave()                          # to the last byte, whatever path it took
 
     def _read_body(self) -> bytes:
         n = int(self.headers.get("Content-Length") or 0)
@@ -206,16 +214,11 @@ class Handler(BaseHTTPRequestHandler):
     def _forward(self, method: str, path: str, body: bytes):
         up = urlsplit(self.upstream)
         conn = http.client.HTTPConnection(up.hostname, up.port, timeout=None)
-        self.state.enter()                 # counted from before it is sent, to the last byte
-        try:
-            conn.request(method, path, body=body or None,
-                         headers={k: v for k, v in self.headers.items()
-                                  if k.lower() not in ("host", "content-length",
-                                                       "connection", "transfer-encoding")})
-            resp = conn.getresponse()
-        except Exception:
-            self.state.leave()
-            raise
+        conn.request(method, path, body=body or None,
+                     headers={k: v for k, v in self.headers.items()
+                              if k.lower() not in ("host", "content-length",
+                                                   "connection", "transfer-encoding")})
+        resp = conn.getresponse()
         try:
             self.send_response(resp.status, resp.reason or "")
             length = resp.getheader("Content-Length")
@@ -252,13 +255,16 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass                                  # the client hung up mid-answer
         finally:
-            self.state.leave()                    # counted until the LAST byte has gone
-            conn.close()
+            conn.close()                            # the caller counts the request finished
 
     def _tunnel(self):
         """Raw byte splice for an upgraded connection (a websocket from a UI on this port).
         Only the handshake headers are re-sent; anything the client buffered behind them is
-        not visible here, which is fine for a handshake and not for much else."""
+        not visible here, which is fine for a handshake and not for much else.
+
+        Deliberately not counted in in_flight: a UI tab holds its websocket open for as long
+        as it is open, and counting it would make every drain answer 409 for as long as
+        somebody had a window on the screen - the card could never be taken back."""
         up = urlsplit(self.upstream)
         try:
             remote = socket.create_connection((up.hostname, up.port), timeout=10)
@@ -267,7 +273,6 @@ class Handler(BaseHTTPRequestHandler):
         head = f"{self.command} {self.path} HTTP/1.1\r\n"
         head += "".join(f"{k}: {v}\r\n" for k, v in self.headers.items())
         remote.sendall(head.encode() + b"\r\n")
-        self.state.enter()
 
         def pipe(src, dst):
             try:
@@ -291,7 +296,6 @@ class Handler(BaseHTTPRequestHandler):
             pipe(remote, client)
             up_thread.join(timeout=2)
         finally:
-            self.state.leave()
             try:
                 remote.close()
             except OSError:
