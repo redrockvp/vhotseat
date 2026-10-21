@@ -158,6 +158,19 @@ class Dashboard:
         return Handler
 
 
+def claim_watcher(arbiter, stop: threading.Event) -> None:
+    """Look for claims on `claims_poll_s`, and act on them. This is the loop the dashboard runs
+    in the background: on a box where `watch` isn't running, the dashboard is the actor, and it
+    has to notice a game whether or not somebody has a tab open. Running it in both processes is
+    safe: the release reads what is already in the event log and takes the GPU lock."""
+    every = arbiter.claim_poll_s * util.SCALE
+    while not stop.wait(every):
+        try:
+            claim_transitions(arbiter, arbiter.claim_hits())
+        except Exception as e:                              # a bad poll must not stop the watcher
+            util.log(f"claim check failed: {type(e).__name__}: {e}")
+
+
 def serve(arbiter, host: str, port: int) -> int:
     try:
         server = ThreadingHTTPServer((host, port), Dashboard(arbiter).handler())
@@ -169,12 +182,16 @@ def serve(arbiter, host: str, port: int) -> int:
     print(f"vhotseat web: http://{shown}:{server.server_address[1]}/", flush=True)
     if arbiter.telemetry is None:
         util.log("telemetry is off in the config: the dashboard shows the live status only")
+    stop = threading.Event()
+    threading.Thread(target=claim_watcher, args=(arbiter, stop), daemon=True,
+                     name="vhotseat-claims").start()
     with Sampler(arbiter):
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
         finally:
+            stop.set()
             server.server_close()
     return 0
 

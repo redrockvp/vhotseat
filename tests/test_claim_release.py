@@ -11,6 +11,7 @@ their `on_start` the way they do on a machine with a game running.
 """
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -150,6 +151,20 @@ def test_a_release_never_runs_under_someone_elses_hold(rig, monkeypatch):
     web.watch(rig.arb, polls=1)                            # the hold is over: it goes
     assert not rig.strata.loaded
 
+
+
+def test_the_dashboard_frees_the_card_with_nobody_looking(rig, monkeypatch):
+    """On a box where autostart runs `vhotseat web` and not `watch`, the dashboard is the actor -
+    and it has to notice the game whether or not somebody has the page open."""
+    claim_rule(rig, monkeypatch)
+    rig.arb.claim_poll_s = 0.02
+    rig.strata.loaded = True
+    threading.Thread(target=web.serve, args=(rig.arb, "127.0.0.1", 0), daemon=True).start()
+    deadline = time.monotonic() + 10
+    while rig.strata.loaded and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not rig.strata.loaded
+    assert rows(rig, "claim-release")
 
 def test_two_pollers_free_the_card_once(rig, monkeypatch):
     """`web` and `watch` both run claim_transitions, both on their own schedule. One release and
