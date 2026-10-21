@@ -170,6 +170,23 @@ def test_watch_records_one_claim_row_per_kind_of_process(rig, monkeypatch):
         ("claim", "game.exe", 2), ("claim-end", "game.exe", 2)]
 
 
+def test_claim_events_are_per_claim_not_per_process(rig):
+    """One game is twenty processes. When one of them exits the other nineteen still own the
+    card, so the log must not say the card is open again. And the state is read from the log,
+    not from a process's memory: `web` and `watch` recording together write the row once, and
+    `watch` restarting doesn't re-open a claim that is still running."""
+    hits = [{"pid": 10, "name": "eldenring.exe", "exe": None, "note": "a Steam game", "by": "path x"},
+            {"pid": 11, "name": "eldenring.exe", "exe": None, "note": "a Steam game", "by": "path x"}]
+    web.claim_transitions(rig.arb.events, hits)
+    web.claim_transitions(rig.arb.events, hits)        # a second recorder, same claim
+    web.claim_transitions(rig.arb.events, hits[:1])    # one of the game's processes exited
+    rows = [e for e in rig.arb.events.tail() if e["event"].startswith("claim")]
+    assert [e["event"] for e in rows] == ["claim"] and rows[0]["processes"] == 2
+    web.claim_transitions(rig.arb.events, [])          # the game is gone
+    rows = [e for e in rig.arb.events.tail() if e["event"].startswith("claim")]
+    assert [e["event"] for e in rows] == ["claim", "claim-end"]
+
+
 def test_sampler_samples_in_the_background(rig, monkeypatch):
     monkeypatch.setattr(rig.arb.telemetry, "interval_s", 1)
     with telemetry.Sampler(rig.arb):

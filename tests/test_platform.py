@@ -1,6 +1,7 @@
 """What differs by platform: the lock across processes, and on Windows the GPU
 counters, process command lines and machine RAM."""
 
+import ctypes
 import os
 import subprocess
 import sys
@@ -91,6 +92,48 @@ def test_wddm_skips_the_counters_when_nothing_is_missing():
         raise AssertionError("counters read")
     reader = gpu.WddmVram(_Reader([(1, 100, "a")]), per_pid=boom)
     assert reader.read()[2] == [(1, 100, "a")]
+
+def test_an_invalid_snapshot_handle_is_a_failed_snapshot(monkeypatch):
+    """INVALID_HANDLE_VALUE isn't spelled -1 once ctypes has had it: restype=c_void_p hands
+    back 18446744073709551615 on a 64-bit build, so the check against -1 never matched and a
+    failed process snapshot went on being read as if it had contents."""
+    reads = []
+
+    class FakeK32:
+        pass
+
+    k32 = FakeK32()
+    reads = []
+    k32.CreateToolhelp32Snapshot = lambda flags, pid: ctypes.c_void_p(-1).value
+
+    def first(snap, entry):
+        reads.append(snap)
+        return 1                                  # as if the snapshot had contents
+
+    k32.Process32FirstW = first
+    k32.Process32NextW = lambda snap, entry: 0
+    k32.CloseHandle = lambda h: None
+    monkeypatch.setattr(host, "_kernel32", lambda: k32)
+    assert host._snapshot_windows() == {}
+    assert reads == []                       # the invalid handle was never used
+
+
+@pytest.mark.skipif(os.name == "nt", reason="reads /proc")
+def test_a_process_whose_image_cant_be_read_is_still_listed(monkeypatch, tmp_path):
+    """readlink(/proc/<pid>/exe) fails for a process owned by somebody else. The table dropped
+    the process instead of keeping it with exe=None, so a claim by exe name missed it."""
+    d = tmp_path / "1234"
+    d.mkdir()
+    (d / "comm").write_text("somegame.exe" + chr(10))
+    (d / "stat").write_text("1234 (somegame.exe) S 1 1 1 0 -1" + chr(10))
+    real = os.scandir
+    monkeypatch.setattr(os, "scandir", lambda path: real(str(tmp_path)) if path == "/proc" else real(path))
+
+    def no_readlink(path):
+        raise PermissionError(path)
+
+    monkeypatch.setattr(os, "readlink", no_readlink)
+    assert host._snapshot_posix()[1234] == {"pid": 1234, "ppid": 1, "name": "somegame.exe", "exe": None}
 
 
 @windows_only

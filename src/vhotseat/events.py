@@ -27,6 +27,22 @@ class EventLog:
         if self.telemetry is not None:
             self.telemetry.event(event)
 
+    def tail(self, limit: int = 200) -> list[dict]:
+        """The last `limit` events, oldest first, skipping anything unreadable. A reader that
+        wants the state of the world as recorded - which claims are still open - reads this
+        instead of keeping its own copy of it."""
+        if not self.path.exists():
+            return []
+        out = []
+        for line in self.path.read_text(encoding="utf-8").splitlines()[-limit:]:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                out.append(row)
+        return out
+
     def last(self) -> dict | None:
         if not self.path.exists():
             return None

@@ -72,7 +72,6 @@ class Dashboard:
         self._status_lock = threading.Lock()
         self._why = (0.0, None)
         self._why_lock = threading.Lock()
-        self._claims: dict[int, dict] = {}
 
     def status(self) -> dict:
         with self._status_lock:
@@ -85,8 +84,7 @@ class Dashboard:
                     cached["retention_hours"] = self.telemetry.retention_s / 3600
                     cached["interval_s"] = self.telemetry.interval_s
                     cached["oldest"] = self.telemetry.oldest()
-                self._claims = claim_transitions(self.arbiter.events, self._claims,
-                                                cached.get("claims", []))
+                claim_transitions(self.arbiter.events, cached.get("claims", []))
                 self._status = (time.monotonic(), cached)
             return cached
 
@@ -201,34 +199,58 @@ def watch(arbiter, polls: int | None = None) -> int:
     if arbiter.telemetry is None:
         util.log("telemetry is off in the config: watch records claim events and no samples")
     interval = arbiter.telemetry.interval_s if arbiter.telemetry else 5
-    seen: dict[int, dict] = {}
     with Sampler(arbiter) if arbiter.telemetry else contextlib.nullcontext():
         while polls is None or polls > 0:
             polls = None if polls is None else polls - 1
-            seen = claim_transitions(arbiter.events, seen, arbiter.claim_hits())
+            claim_transitions(arbiter.events, arbiter.claim_hits())
             if polls is not None and polls <= 0:
                 break
             stop.wait(interval)
     return 0
 
 
-def claim_transitions(events, seen: dict[int, dict], hits: list[dict]) -> dict[int, dict]:
-    """Record a `claim` / `claim-end` row as the set of claimed processes changes, and
-    return the new set. One row per kind of process rather than per pid: one game is
-    twenty processes, and twenty rows say less than one. Shared by `watch` and by the
-    dashboard, which probes often enough to be the recorder on a box that runs it."""
-    now = {h["pid"]: h for h in hits}
-    for (name, note), group in _groups(h for pid, h in now.items() if pid not in seen).items():
-        events.record("claim", source="watch", pid=group[0]["pid"], name=name,
-                      note=note, by=group[0]["by"], processes=len(group))
+def open_claims(events, limit: int = 500) -> dict:
+    """Which claims the record already shows as open, read back from the tail of the event log.
+
+    The log is the record, so it's what says whether a claim has been written: `watch`
+    restarting does not re-open a claim that is still running, and `web` and `watch` running
+    together write the row once rather than twice. The trade is that a claim older than the
+    retained log (`events.keep` lines) is forgotten, and recording it again is honest."""
+    out: dict[tuple, dict] = {}
+    for e in events.tail(limit):
+        if e.get("event") not in ("claim", "claim-end"):
+            continue
+        key = (e.get("name"), e.get("note"))
+        if e.get("event") == "claim":
+            out[key] = e
+        else:
+            out.pop(key, None)
+    return out
+
+
+def claim_transitions(events, hits: list[dict]) -> None:
+    """Record a `claim` / `claim-end` row as the set of claims changes. What's already open comes
+    from the log (see open_claims), not from this process's memory.
+
+    A claim is a kind of process, not a pid: one game is twenty processes, and when one of them
+    exits the other nineteen still hold the card, so that is not the card opening again."""
+    now = _groups(h for h in hits)
+    was = open_claims(events)
+    for (name, note), group in now.items():
+        if (name, note) in was:
+            continue
+        events.record("claim", source="watch", pid=group[0]["pid"], name=name, note=note,
+                      by=group[0]["by"], processes=len(group))
         util.log(f"{name}" + (f" x{len(group)}" if len(group) > 1 else "") +
                  f" claims the card ({note}): nothing new loads while it runs")
-    for (name, note), group in _groups(h for pid, h in seen.items() if pid not in now).items():
-        events.record("claim-end", source="watch", pid=group[0]["pid"], name=name,
-                      note=note, processes=len(group))
-        util.log(f"{name}" + (f" x{len(group)}" if len(group) > 1 else "") +
+    for (name, note), row in was.items():
+        if (name, note) in now:
+            continue
+        n = row.get("processes") or 1
+        events.record("claim-end", source="watch", pid=row.get("pid"), name=name, note=note,
+                      processes=n)
+        util.log(f"{name}" + (f" x{n}" if n > 1 else "") +
                  " is gone: the card is open to loads again")
-    return now
 
 
 def _groups(hits):

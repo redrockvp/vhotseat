@@ -124,9 +124,12 @@ power:
   # price the card's draw. It is the card's own watts as the driver reports them: the
   # rest of the machine, and what the PSU burns getting them there, aren't in it, so
   # read the number as a floor rather than the line on your bill.
-  price_per_kwh: 4.11    # eThekwini (Durban) home tariff 2026/27, incl VAT, from 1 July 2026
-  currency: "R"
-  note: "eThekwini home 2026/27: 357.47 c/kWh ex VAT, no fixed charge"
+  # A number nobody's bill matches is worse than no number, so the example ships with it
+  # unset: put your own tariff in (whatever your utility calls kWh on your line) and the
+  # currency symbol you want to see. Uncomment and edit:
+  # price_per_kwh: 0.30      # what one kWh costs you, in the currency below
+  # currency: "USD"
+  # note: "provider + plan, so a year from now you know where the number came from"
 
 # What owns the card by right rather than by arrangement: a game, or anything else you
 # name. While something matches, nothing *new* loads: the LLM's gate refuses a load that

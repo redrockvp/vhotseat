@@ -113,7 +113,11 @@ def test_job_deleted_from_queue_is_cancelled_exit_4(cr, tmp_path, capsys, monkey
     jobs = [{"1": {"class_type": "Slow", "inputs": {}}, "2": {"class_type": "SaveImage", "inputs": {}}}, save()]
 
     def cancel_second():
-        while not cr.fake.running:        # job 1 is on the fake's executor: job 2 is still queued
+        # Job 1 is on the fake's executor and job 2 has actually been submitted and is still
+        # queued. Waiting only for "something is running" deletes the queue before render has
+        # got as far as submitting job 2, which then lands in an empty queue and runs: the
+        # deletion is never there to be seen. That's the flake this test used to have.
+        while not (cr.fake.running and cr.fake.pending):
             time.sleep(0.01)
         cr.fake.pending.clear()  # someone deleted it from ComfyUI's queue
 

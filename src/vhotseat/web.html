@@ -700,10 +700,6 @@ function renderHolders() {
     ? `the card is claimed by ${named.slice(0, 3).join(", ")}` +
       (named.length > 3 ? ` and ${named.length - 3} more` : "") + ": nothing new loads while it runs"
     : (g.error ? "" : `${gib(g.other_mib)} GiB held by processes vhotseat doesn't manage`);
-  $("holdersNote").textContent = claims.length
-    ? `${claims.map((c) => `${c.name} (${c.note})`).join(", ")} ` +
-      `${claims.length > 1 ? "own" : "owns"} the card: nothing new loads while they run`
-    : (g.error ? "" : `${gib(g.other_mib)} GiB held by processes vhotseat doesn't manage`);
   if (g.error) {
     box.replaceChildren(el("p", { class: "notice" }, `can't read the card: ${g.error}`));
     return;

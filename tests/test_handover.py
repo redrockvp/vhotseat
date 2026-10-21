@@ -627,6 +627,32 @@ def test_guard_reports_why_gpu_is_busy(rig, monkeypatch):
     t.join()
 
 
+def test_the_guard_falls_back_when_vhotseat_doesnt_know_request(rig, monkeypatch):
+    """An installed vhotseat from before claims rejects --request outright. Every job used to
+    fail with argparse's message; it gets the typed switch instead - the weaker one, since a
+    claim won't refuse it - and says so once, then stops paying for the failed run."""
+    guard = _guard(rig, monkeypatch)
+    calls = []
+
+    class Res:
+        def __init__(self, code, err):
+            self.returncode, self.stderr, self.stdout = code, err, ""
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if "--request" in cmd:
+            return Res(2, "usage: vhotseat switch [-h] ...: error: unrecognized arguments: --request")
+        return Res(0, "")
+
+    monkeypatch.setattr(guard, "REQUEST_OK", True)
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    guard.take_gpu()
+    assert "--request" in calls[0] and "--request" not in calls[1]
+    guard.take_gpu()
+    assert len(calls) == 3 and "--request" not in calls[2]
+    assert guard.REQUEST_OK is False
+
+
 def test_switch_with_wait_lets_a_comfy_batch_finish(rig):
     """`switch strata --wait` while ComfyUI has a batch queued, each job running
     the guard (`switch comfy`). It used to hold the lock while waiting for the

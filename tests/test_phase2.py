@@ -117,13 +117,22 @@ def test_example_config_parses_with_every_section():
 
 
 def test_power_block_is_validated():
-    """A price is a number, and only the documented keys are allowed: a typo in a rate
-    would otherwise turn into a wrong bill."""
+    """A price is a number, and only the documented keys are allowed: a typo in a rate would
+    otherwise turn into a wrong bill. The example ships the tariff commented out - somebody's
+    local tariff is wrong on every other machine - so the commented lines are uncommented here
+    and validated, the way the claims test does it."""
     import pytest
-    raw = config.parse((ROOT / "config.example.yaml").read_text())
-    assert raw["power"]["price_per_kwh"] > 0
-    config.validate(raw)
-    raw["power"]["price_per_kwh"] = "four point one one"
+    import yaml
+    src = (ROOT / "config.example.yaml").read_text()
+    raw = config.parse(src)
+    assert not (raw.get("power") or {}).get("price_per_kwh"), "the example must not ship a live tariff"
+    block = src.split("\npower:", 1)[1].split("\n\n", 1)[0]
+    shown = [ln.strip()[2:] for ln in block.splitlines()
+             if ln.strip().startswith(("# price_per_kwh", "# currency:", "# note:"))]
+    assert shown, "the example still shows a tariff, commented"
+    cfg = config.validate({**raw, "power": yaml.safe_load("power:\n" + "\n".join("  " + s for s in shown))["power"]})
+    assert cfg["power"]["price_per_kwh"] > 0 and cfg["power"]["currency"]
+    raw["power"] = {"price_per_kwh": "four point one one"}
     with pytest.raises(config.ConfigError, match=r"power\.price_per_kwh"):
         config.validate(raw)
     raw["power"] = {"price_per_khw": 4.11}

@@ -60,7 +60,9 @@ def _snapshot_windows() -> dict[int, dict]:
     k32 = _kernel32()
     k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
     snap = k32.CreateToolhelp32Snapshot(0x2, 0)             # TH32CS_SNAPPROCESS
-    if not snap or ctypes.cast(snap, ctypes.c_void_p).value in (None, -1):
+    # INVALID_HANDLE_VALUE, spelled the way ctypes spells it: c_void_p(-1).value is
+    # 18446744073709551615 on a 64-bit build, so comparing the value to -1 never matches.
+    if not snap or ctypes.cast(snap, ctypes.c_void_p).value in (None, ctypes.c_void_p(-1).value, 0xFFFFFFFF):
         return {}
     entry = _ProcEntry()
     entry.dwSize = ctypes.sizeof(_ProcEntry)
@@ -87,9 +89,13 @@ def _snapshot_posix() -> dict[int, dict]:
         try:
             name = Path(entry.path, "comm").read_text().strip() or None
             ppid = int(Path(entry.path, "stat").read_text().rsplit(") ", 1)[1].split()[1])
-            exe = os.readlink(Path(entry.path, "exe"))
         except (OSError, ValueError, IndexError):
             continue                # vanished mid-scan
+        try:
+            exe = os.readlink(Path(entry.path, "exe"))
+        except OSError:
+            exe = None              # there but not readable: a process of another user's.
+                                    # The entry is kept, because `name` alone still claims.
         out[int(entry.name)] = {"pid": int(entry.name), "ppid": ppid, "name": name, "exe": exe}
     return out
 
