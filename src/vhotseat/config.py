@@ -115,10 +115,14 @@ def validate(raw) -> dict:
     for i, r in enumerate(cl):
         where = f"claims[{i}]"
         _check(isinstance(r, dict) and r, where, "expected a mapping with some of name, path, parent, note")
-        bad = set(r) - {"name", "path", "parent", "note"}
+        bad = set(r) - {"name", "path", "parent", "note", "on_start"}
         _check(not bad, where, f"unknown key(s): {', '.join(sorted(bad))}")
         _check(any(r.get(k) for k in ("name", "path", "parent")), where,
                "needs at least one of name, path, parent")
+        if "on_start" in r:
+            _check(r["on_start"] in ("release", "block"), f"{where}.on_start",
+                   "expected release (ask the workloads to let go of their models when it "
+                   "starts) or block (refuse new loads only)")
         for k in ("name", "path", "parent", "note"):
             if k in r:
                 _check(isinstance(r[k], str) and r[k], f"{where}.{k}", "expected a non-empty string")

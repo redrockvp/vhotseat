@@ -354,8 +354,18 @@ claims:
     note: World of Warcraft            # how it's described in a refusal
   - name: rocketleague.exe             # or by exe name: works when the path can't be read
   - parent: mylauncher.exe             # or by any ancestor's exe name (its helpers too)
+  on_start: release                    # per rule: release (default) or block, see below
 claims_ignore: [myelectronapp.exe]     # names or path globs the built-in rules won't claim
 ```
+
+**What a claim does when it appears.** `on_start: release` (the default, and what the built-in
+game rules use) frees the card for it: every idle workload vhotseat manages is asked to let go of
+its model through the normal release path - API unload, then the card confirms the MiB went - and
+the servers stay running. A workload with work in flight is never interrupted: it is skipped,
+recorded as `claim-release-waiting`, and released on a later check as soon as it goes idle, while
+the claim lasts. `on_start: block` is the older behaviour: nothing new loads, and what is already
+loaded keeps what it has. Both are enforced at every gate whether or not `watch` runs; `release`
+is the extra half, and it's why `vhotseat autostart install --command watch` is worth having.
 
 While something matches, nothing **new** loads: the gate refuses a load a request would
 wake, and `switch --request` - what ComfyUI's guard node uses, because the queue is

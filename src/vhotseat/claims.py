@@ -46,7 +46,13 @@ LAUNCHERS = (
     "steam", "steam.sh", "steamwebhelper",
 )
 
-KEYS = ("name", "path", "parent", "note")
+KEYS = ("name", "path", "parent", "note", "on_start")
+# What a claim does when it appears. `block` is the original behaviour: refuse new loads,
+# leave what's loaded alone. `release` also asks whatever vhotseat manages to let go of their
+# models, through the normal release path, so the game gets the card without anything closing.
+# Work in flight is never interrupted: a busy workload is skipped and retried while it runs.
+ACTIONS = ("release", "block")
+_DEFAULT_ACTION = "release"
 _LAUNCHERS = frozenset(s.lower() for s in LAUNCHERS)
 
 # Not games, whatever folder they live in: things that run all day inside a game directory.
@@ -69,7 +75,8 @@ def ignores(extra=()) -> frozenset:
 
 class Rule:
     """One claim rule: match a process by exe name, image path, or the name of any
-    ancestor process. `note` says what it means to have matched, in the report.
+    ancestor process. `note` says what it means to have matched, in the report, and
+    `on_start` says what vhotseat does when it appears (see ACTIONS).
 
     Built-in rules carry `builtin = True`: they are the ones the known non-games are held back
     from. A rule in the config claims whatever it names, non-game or not."""
@@ -85,6 +92,10 @@ class Rule:
         self.path = str(raw.get("path") or "")
         self.parent = str(raw.get("parent") or "")
         self.note = str(raw.get("note") or "")
+        self.on_start = str(raw.get("on_start") or _DEFAULT_ACTION)
+        if self.on_start not in ACTIONS:
+            raise ValueError(f"claim rule: on_start must be {' or '.join(ACTIONS)}, "
+                             f"got {self.on_start!r}")
         self.builtin = builtin
 
     def __repr__(self) -> str:
@@ -158,7 +169,7 @@ def matching(rs: list[Rule], procs: dict[int, dict], exclude: set = frozenset(),
                                  for pat in ignore):
                 continue                # a built-in won't call a wallpaper renderer a game
             hits.append({"pid": pid, "name": name, "exe": exe or None,
-                         "note": r.note or "claimed", "by": by})
+                         "note": r.note or "claimed", "by": by, "on_start": r.on_start})
             break                       # one rule per process: the first match explains it
     return hits
 
