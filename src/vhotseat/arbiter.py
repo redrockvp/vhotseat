@@ -238,8 +238,21 @@ class Arbiter:
         return done
 
     def _claims_in(self, held: list[dict]) -> list[dict]:
+        procs = host.processes()
+        # Every pid of a configured workload, not just the ones holding enough memory to make
+        # the holder list. A workload installed under D:\Games\ matches the built-in rule for a
+        # game in a Games folder: while it is idle it isn't in that list, and it would then
+        # claim the card against its own loads.
         owned = {r["pid"] for r in held if r["workload"]}
-        return claims.matching(self.claim_rules, host.processes(), owned)
+        for w in self.workloads.values():
+            sel = w.vram_selector
+            if not sel or sel[0] != "process":
+                continue
+            needle = sel[1].lower()
+            for pid, p in procs.items():
+                if needle in f"{p.get('exe') or ''} {p.get('name') or ''}".lower():
+                    owned.add(pid)
+        return claims.matching(self.claim_rules, procs, owned)
 
     def claim_hits(self) -> list[dict]:
         """Processes that own the card right now - a game, or whatever a `claims:` rule

@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from vhotseat import claims, config
+from vhotseat import claims, config, host
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -20,6 +20,21 @@ def procs(*rows):
 
 def rules(*raw):
     return claims.rules(raw, builtin=False)
+
+
+def test_an_idle_workload_is_not_claimed_by_its_own_directory(rig, monkeypatch):
+    r"""A workload installed under D:\Games\ matches the built-in rule for a game in a Games
+    folder. The exclusion came from the holder list - the top few by memory - so an idle
+    workload wasn't in it, and it blocked its own loads by existing."""
+    procs = {7: {"pid": 7, "ppid": 4, "name": "strata.exe", "exe": r"D:\Games\strata\strata.exe"},
+             8: {"pid": 8, "ppid": 4, "name": "EldenRing.exe", "exe": r"D:\Games\elden\EldenRing.exe"},
+             9: {"pid": 9, "ppid": 4, "name": "dwm.exe", "exe": r"C:\Windows\System32\dwm.exe"}}
+    monkeypatch.setattr(host, "processes", lambda: procs)
+    monkeypatch.setattr(rig.arb, "claim_rules",
+                        claims.rules([{"path": r"*\Games\*", "note": "a game in a Games folder"}], builtin=False))
+    rig.arb.workloads["strata"].vram_selector = ("process", "games\\strata\\")
+    hits = rig.arb._claims_in([])                  # nobody on the card, so the holder list is empty
+    assert [h["name"] for h in hits] == ["EldenRing.exe"]
 
 
 def test_a_game_directory_claims_the_card():
