@@ -73,7 +73,7 @@ def _rules(rules, where: str):
 def validate(raw) -> dict:
     _check(isinstance(raw, dict), "config", "expected a mapping at the top level")
     unknown = set(raw) - {"gpu", "workloads", "events", "telemetry", "power", "claims",
-                          "claims_builtin", "claims_ignore", "patches"}
+                          "claims_builtin", "claims_ignore", "claims_poll_s", "patches"}
     _check(not unknown, "config", f"unknown key(s): {', '.join(sorted(unknown))}")
     gpu = raw.get("gpu") or {}
     _check(isinstance(gpu, dict), "gpu", "expected a mapping")
@@ -104,6 +104,11 @@ def validate(raw) -> dict:
                "power.price_per_kwh", f"expected a number > 0 (what one kWh costs you), got {v!r}")
     _check(isinstance(raw.get("claims_builtin", True), bool), "claims_builtin",
            "expected true or false")
+    if "claims_poll_s" in raw:
+        v = raw["claims_poll_s"]
+        _check(isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0,
+               "claims_poll_s", f"expected a number of seconds > 0 (how often the watcher looks "
+                               f"for a claim), got {v!r}")
     ci = raw.get("claims_ignore") or []
     _check(isinstance(ci, list), "claims_ignore",
            "expected a list of exe names or path globs, e.g. [wallpaper64.exe]")

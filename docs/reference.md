@@ -356,6 +356,7 @@ claims:
   - parent: mylauncher.exe             # or by any ancestor's exe name (its helpers too)
   on_start: release                    # per rule: release (default) or block, see below
 claims_ignore: [myelectronapp.exe]     # names or path globs the built-in rules won't claim
+claims_poll_s: 2                       # how often `watch` looks for a claim (default 2 s)
 ```
 
 **What a claim does when it appears.** `on_start: release` (the default, and what the built-in
@@ -366,6 +367,9 @@ recorded as `claim-release-waiting`, and released on a later check as soon as it
 the claim lasts. `on_start: block` is the older behaviour: nothing new loads, and what is already
 loaded keeps what it has. Both are enforced at every gate whether or not `watch` runs; `release`
 is the extra half, and it's why `vhotseat autostart install --command watch` is worth having.
+
+`claims_poll_s` is how often that watcher looks - a game has allocated within seconds of starting.
+It's independent of `telemetry.interval_s`, which stays whatever it is for the history graphs.
 
 While something matches, nothing **new** loads: the gate refuses a load a request would
 wake, and `switch --request` - what ComfyUI's guard node uses, because the queue is

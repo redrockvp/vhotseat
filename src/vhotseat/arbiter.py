@@ -34,7 +34,7 @@ class Arbiter:
     def __init__(self, workloads: list[Workload], gpu, lock: GpuLock, events: EventLog, *,
                  gate_release_timeout_s: float = 20, release_timeout_s: float = 60,
                  machine_ram=host.machine_ram, telemetry=None, power: dict | None = None,
-                 claim_rules: list | None = None, claim_ignore=()):
+                 claim_rules: list | None = None, claim_ignore=(), claim_poll_s: float = 2.0):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
         self.lock = lock
@@ -52,6 +52,11 @@ class Arbiter:
         self.claim_rules = claim_rules if claim_rules is not None else claims.rules([])
         # Names and path globs the built-in rules won't claim (Wallpaper Engine, a VR runtime).
         self.claim_ignore = claims.ignores(claim_ignore)
+        # How often the watcher looks for a claim. A game allocates within seconds of starting,
+        # so this is faster than the telemetry sampling and keeps its own clock (config
+        # `claims_poll_s`). The refusal doesn't depend on it - every gate and guard checks for
+        # itself - only the release and the record do.
+        self.claim_poll_s = claim_poll_s
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
@@ -431,7 +436,9 @@ class Arbiter:
         Returns {"declined": why-or-None, "released": [{workload, freed_mib}],
         "waiting": [{workload, why}], "freed_mib": int}.
         """
-        want = {n: max(0, y.vram_mib() - y.idle_vram_mib) for n, y in self.workloads.items()}
+        snap = self.snapshot()
+        want = {n: max(0, (snap.get(f"{n}_mib") or 0) - y.idle_vram_mib)
+                for n, y in self.workloads.items()}
         if not any(want.values()):
             # Nothing of ours is on the card, so there is nothing to free and no reason to take
             # the lock every poll for as long as the game runs. `would` says as much.
@@ -461,7 +468,7 @@ class Arbiter:
                 except (Busy, ReleaseFailed, SwitchError) as e:
                     waiting.append({"workload": n, "why": str(e) or type(e).__name__})
                     continue
-                left = max(0, y.vram_mib() - y.idle_vram_mib)
+                left = max(0, (self.snapshot().get(f"{n}_mib") or 0) - y.idle_vram_mib)
                 freed = max(0, want[n] - left)
                 released.append({"workload": n, "freed_mib": freed})
                 if left:

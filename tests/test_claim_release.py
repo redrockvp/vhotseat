@@ -7,9 +7,13 @@ what it did, and retrying what is still holding while the claim lasts.
 """
 
 import time
+from pathlib import Path
 
+from vhotseat import config as cfgmod
 from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, STRATA_VRAM
 from vhotseat import web
+
+ROOT = Path(__file__).resolve().parents[1]
 
 NOTE = "Elden Ring"
 
@@ -46,6 +50,33 @@ def test_a_claim_starting_unloads_the_idle_workloads_once(rig, monkeypatch):
     assert out[0]["workloads"] == ["strata"] and out[0]["freed_mib"] == STRATA_VRAM
     assert len(rows(rig, "claim")) == 1                     # one claim row for three polls
 
+
+
+def test_the_claim_check_keeps_its_own_cadence(rig, monkeypatch):
+    """A game has allocated within seconds of starting, so `watch` looks on `claims_poll_s`
+    (2 s by default) whatever the telemetry sampling is set to. Here the sampler is slower than
+    any wait: if the loop were still riding the telemetry interval, this would hang."""
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: game())
+    rig.arb.telemetry.interval_s = 600
+    rig.arb.claim_poll_s = 0.01
+    rig.strata.loaded = True
+    web.watch(rig.arb, polls=2)                       # two claim checks, not two sample periods
+    assert not rig.strata.loaded
+
+
+def test_claims_poll_s_is_validated_and_reaches_the_arbiter(rig):
+    """Default 2 s; the config's value is what the watcher uses."""
+    assert rig.arb.claim_poll_s == 2
+    raw = cfgmod.parse((ROOT / "config.example.yaml").read_text())
+    raw["claims_poll_s"] = 5
+    assert cfgmod.validate(raw)["claims_poll_s"] == 5
+    for bad in ("2", 0, -1, True):
+        raw["claims_poll_s"] = bad
+        try:
+            cfgmod.validate(raw)
+        except cfgmod.ConfigError:
+            continue
+        raise AssertionError(f"{bad!r} accepted")
 
 def test_a_running_render_is_never_interrupted_and_goes_next(rig, monkeypatch):
     """Work in flight outranks a game: the render keeps its weights, the claim is recorded as

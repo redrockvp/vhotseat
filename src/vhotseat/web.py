@@ -200,14 +200,16 @@ def watch(arbiter, polls: int | None = None) -> int:
             signal.signal(sig, lambda *_: stop.set())
     if arbiter.telemetry is None:
         util.log("telemetry is off in the config: watch records claim events and no samples")
-    interval = arbiter.telemetry.interval_s if arbiter.telemetry else 5
+    # A game allocates within seconds of starting, so the claim check runs on its own clock
+    # (`claims_poll_s`, default 2 s); the telemetry sampler keeps its own, usually slower one.
+    claim_every = arbiter.claim_poll_s * util.SCALE
     with Sampler(arbiter) if arbiter.telemetry else contextlib.nullcontext():
         while polls is None or polls > 0:
             polls = None if polls is None else polls - 1
             claim_transitions(arbiter, arbiter.claim_hits())
             if polls is not None and polls <= 0:
                 break
-            stop.wait(interval)
+            stop.wait(claim_every)
     return 0
 
 
