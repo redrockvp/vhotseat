@@ -456,19 +456,34 @@ class Arbiter:
         Returns {"declined": why-or-None, "released": [{workload, freed_mib}],
         "waiting": [{workload, why}], "freed_mib": int}.
         """
-        snap = self.snapshot()
-        want = {n: max(0, (snap.get(f"{n}_mib") or 0) - y.idle_vram_mib)
-                for n, y in self.workloads.items()}
-        if not any(want.values()):
+        pre = self.snapshot()
+        if not any((pre.get(f"{n}_mib") or 0) > y.idle_vram_mib for n, y in self.workloads.items()):
             # Nothing of ours is on the card, so there is nothing to free and no reason to take
             # the lock every poll for as long as the game runs. `would` says as much.
-            return {"declined": None, "would": [], "released": [], "waiting": [], "freed_mib": 0}
+            return {"declined": None, "by_actor": False, "would": [], "released": [],
+                    "waiting": [], "freed_mib": 0}
         got = self.lock.try_take(f"claim release {claim.get('name') or ''}".strip())
         if not isinstance(got, Held):
-            return {"declined": f"{got or 'a switch'} in progress",
+            want = {n: max(0, (pre.get(f"{n}_mib") or 0) - y.idle_vram_mib)
+                    for n, y in self.workloads.items()}
+            # Another watcher (watch and the dashboard both act) is mid-release for this same
+            # claim. That isn't a workload holding on: saying so once per workload would both
+            # spam the log and shadow the reason that matters, if one turns up later.
+            sister = bool(got and got.startswith("claim release"))
+            return {"declined": f"{got or 'a switch'} in progress", "by_actor": sister,
                     "would": sorted(n for n, mib in want.items() if mib),
                     "released": [], "waiting": [], "freed_mib": 0}
         with got:
+            # Read the card again now that the lock is ours. Whoever was waiting behind this
+            # lock - the other poller, on a box where watch and the dashboard both run - sees
+            # the card as the first one left it, so it frees nothing and writes nothing rather
+            # than unloading a second time. Same for a switch that happened while we queued.
+            snap = self.snapshot()
+            want = {n: max(0, (snap.get(f"{n}_mib") or 0) - y.idle_vram_mib)
+                    for n, y in self.workloads.items()}
+            if not any(want.values()):
+                return {"declined": None, "by_actor": False, "would": [], "released": [],
+                        "waiting": [], "freed_mib": 0}
             released, waiting = [], []
             for n, y in self.workloads.items():
                 if not want[n]:
@@ -497,7 +512,7 @@ class Arbiter:
                     waiting.append({"workload": n, "why": f"reports unloaded and still holds {left} MiB"})
             if released:
                 self.lock.bump()          # seats cache who owns the card: drop that answer
-            return {"declined": None, "would": [], "released": released, "waiting": waiting,
+            return {"declined": None, "by_actor": False, "released": released, "waiting": waiting,
                     "freed_mib": sum(r["freed_mib"] for r in released)}
 
     def _busy_other(self, name: str) -> str | None:

@@ -280,6 +280,8 @@ def release_for(arbiter, key: tuple, rec: dict) -> None:
     if not pending:
         return
     out = arbiter.claim_release({"name": key[0], "note": key[1]})
+    if out.get("by_actor"):
+        return              # another watcher is mid-release for this claim: ask again next poll
     label = lambda n: arbiter.workloads[n].label if n in arbiter.workloads else n  # noqa: E731
     if out["released"]:
         names = [r["workload"] for r in out["released"]]

@@ -166,6 +166,21 @@ def test_the_dashboard_frees_the_card_with_nobody_looking(rig, monkeypatch):
     assert not rig.strata.loaded
     assert rows(rig, "claim-release")
 
+
+def test_two_watchers_colliding_say_nothing_and_try_again(rig, monkeypatch):
+    """watch and the dashboard can both be mid-check. The one that loses the lock doesn't report
+    every workload as waiting on the other watcher: that fills the log with a reason nobody asked
+    about, and - reported once per claim - it shadows the reason that matters when it turns up."""
+    claim_rule(rig, monkeypatch)
+    rig.strata.loaded = True
+    with rig.arb.lock.try_take(f"claim release {NAME}"):        # the other actor, mid-release
+        web.claim_transitions(rig.arb, rig.arb.claim_hits())
+        assert rig.strata.loaded
+        assert rows(rig, "claim-release") == []
+        assert rows(rig, "claim-release-waiting") == []         # no noise about the other actor
+    web.watch(rig.arb, polls=1)                                 # and it simply tries again
+    assert not rig.strata.loaded
+
 def test_two_pollers_free_the_card_once(rig, monkeypatch):
     """`web` and `watch` both run claim_transitions, both on their own schedule. One release and
     one set of rows: the log says what is already open and already released, and the GPU lock
@@ -179,6 +194,19 @@ def test_two_pollers_free_the_card_once(rig, monkeypatch):
     assert len(rows(rig, "claim-release")) == 1
     assert rig.strata.calls.count("POST /unload") == 1
 
+
+
+def test_the_actor_behind_the_lock_finds_the_card_already_clear(rig, monkeypatch):
+    """watch and the dashboard can be mid-check at the same moment. The lock serialises them,
+    and the one that gets in second re-reads the card inside the lock: it frees nothing and
+    writes nothing, instead of unloading a second time and writing a second row."""
+    claim_rule(rig, monkeypatch)
+    rig.strata.loaded = True
+    first = rig.arb.claim_release({"name": NAME, "note": NOTE})
+    assert first["released"] == [{"workload": "strata", "freed_mib": STRATA_VRAM}]
+    second = rig.arb.claim_release({"name": NAME, "note": NOTE})
+    assert second["released"] == [] and second["freed_mib"] == 0 and second["declined"] is None
+    assert rig.strata.calls.count("POST /unload") == 1
 
 def test_claims_shows_the_action_and_what_it_has_done(rig, monkeypatch, capsys):
     """`vhotseat claims` answers three questions at once: which rule matched and what it does,
