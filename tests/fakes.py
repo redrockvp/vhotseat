@@ -134,6 +134,8 @@ class FakeStrata(_Server):
             return h.send_json(200, {"vram": self.vram})
         if path == "/last-model":
             return h.send_json(200, {"id": self.model, "gguf_variant": "Q4_K_XL"})
+        if path == "/loaded-list":      # the shape some servers use: a list, empty when idle
+            return h.send_json(200, {"data": [{"id": self.model}] if self.loaded else []})
         if path == "/estimate" and method == "POST":
             # What the server says a model costs on the card, at the context it was asked for.
             self.estimate_calls += 1

@@ -300,7 +300,13 @@ class HttpWorkload(Workload):
         """Whether its own API says something is loaded, asked directly. A release that
         would name nothing is skipped only while this says nothing is loaded too."""
         code, body = self._call(self.spec["resident"])
-        return code == 200 and bool(lookup(body, self.spec["resident"]["path"]))
+        if code != 200:
+            return False
+        # MISSING is a truthy object(): an absent path is "nothing loaded", not "something
+        # loaded that we can't name". Reading it as the latter made every handover away from
+        # the workload fail, because release() then insisted on naming a model that wasn't there.
+        value = lookup(body, self.spec["resident"]["path"])
+        return value is not MISSING and bool(value)
 
     def can_load(self) -> bool:
         return "load" in self.spec

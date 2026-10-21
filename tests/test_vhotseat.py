@@ -381,6 +381,22 @@ def test_a_workload_that_needs_a_key_says_so_rather_than_looking_down(vh, monkey
     assert said and "wants a key" in said[0] and "VH_TEST_KEY" in said[0]
 
 
+def test_an_empty_loaded_list_does_not_mean_a_model_is_loaded(vh):
+    """`data.0` in {"data": []} is nothing. The absent-path sentinel is a truthy object, so
+    reading it as a value made release() insist a model was loaded but unnameable, and every
+    handover away from that workload failed."""
+    w = vh.arb.workloads["strata"]
+    w.spec["resident"] = {"get": "/loaded-list", "path": "data.0"}
+    w.spec["model"] = {"get": "/loaded-list", "path": "data.0.id"}
+    w.spec["release"]["body"] = {"model_path": "{model}"}
+    result = vh.arb.switch("comfy", 0)
+    assert result["ok"] is True, result.get("error")
+    vh.strata.loaded = True
+    assert vh.arb.probe()["strata"]["loaded"] is True
+    assert vh.arb.switch("strata", 0)["ok"] is True
+    assert vh.arb.switch("comfy", 0)["ok"] is True
+
+
 def test_a_workload_is_never_refused_by_its_own_floor(vh):
     """min_free_vram_mib is what a model needs room to load into. Weights already on the card
     are not room it still has to find: asking for the card again while they land must not be
