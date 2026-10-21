@@ -10,6 +10,7 @@ The claims here are real rules matched against a real (faked) process table, so 
 their `on_start` the way they do on a machine with a game running.
 """
 
+import contextlib
 import json
 import threading
 import time
@@ -34,6 +35,33 @@ def claim_rule(rig, monkeypatch, on_start="release", arb=None):
     procs = {4242: {"pid": 4242, "ppid": 4, "name": NAME, "exe": r"D:\Libraries\elden\EldenRing.exe"}}
     monkeypatch.setattr(host, "processes", lambda: procs)
     return procs
+
+
+@contextlib.contextmanager
+def dashboard(rig, monkeypatch):
+    """The real dashboard on a port of its own: `web.serve`, which is what autostart runs and the
+    only thing that starts the claim watcher thread. It is shut down and joined on the way out.
+    Left running, it outlives its test and goes on probing whatever process table the next test
+    has put in place - the suite used to end with `claim check failed: AttributeError: FakeK32
+    object has no attribute OpenProcess`."""
+    seen = {}
+    real = web.ThreadingHTTPServer
+
+    class Tracked(real):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            seen["srv"] = self
+
+    monkeypatch.setattr(web, "ThreadingHTTPServer", Tracked)
+    th = threading.Thread(target=web.serve, args=(rig.arb, "127.0.0.1", 0), daemon=True)
+    th.start()
+    while "srv" not in seen:
+        time.sleep(0.01)
+    try:
+        yield f"http://127.0.0.1:{seen['srv'].server_address[1]}"
+    finally:
+        seen["srv"].shutdown()             # serve_forever returns, and its finally stops the watcher
+        th.join(timeout=10)
 
 
 def rows(rig, kind):
@@ -161,12 +189,19 @@ def test_the_dashboard_frees_the_card_with_nobody_looking(rig, monkeypatch):
     claim_rule(rig, monkeypatch)
     rig.arb.claim_poll_s = 0.02
     rig.strata.loaded = True
-    threading.Thread(target=web.serve, args=(rig.arb, "127.0.0.1", 0), daemon=True).start()
-    deadline = time.monotonic() + 10
-    while rig.strata.loaded and time.monotonic() < deadline:
-        time.sleep(0.05)
+    with dashboard(rig, monkeypatch):
+        deadline = time.monotonic() + 10
+        while rig.strata.loaded and time.monotonic() < deadline:
+            time.sleep(0.05)
     assert not rig.strata.loaded
     assert rows(rig, "claim-release")
+    # The thread it started is gone rather than polling the next test's process table. It wakes
+    # on its own interval, so give it that much time rather than assuming it noticed already.
+    left = lambda: [t for t in threading.enumerate() if t.name == "vhotseat-claims"]  # noqa: E731
+    deadline = time.monotonic() + 5
+    while left() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert left() == []
 
 
 def test_two_watchers_colliding_say_nothing_and_try_again(rig, monkeypatch):
