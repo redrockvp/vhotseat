@@ -167,13 +167,19 @@ class Arbiter:
         for y in others:
             try:
                 if y.service_active():
-                    # "Closed by hand must not block the others" and "a server that is still
-                    # coming up must not be walked over" are the same question: is anything there?
-                    # Nothing listening and nothing on the card means it is gone, and release()
-                    # judges from the GPU counters. Anything else gets the wait: a llama-server
-                    # mid-load answers 503, and a 2 s reachable() probe reads that as dead.
-                    if ensure and (y.listening() or y.vram_mib() > y.idle_vram_mib):
-                        y.ensure_running()
+                    # "A server still coming up must not be walked over" and "a workload closed by
+                    # hand must not block the others" are the same question: is there something to
+                    # bring up? Holding its port, or holding no more than its idle weight, yes: it
+                    # gets the chance to come up and unload politely. Answering nothing *while*
+                    # holding the card is the other case - a process that died with its VRAM stuck -
+                    # and starting a program can't free that memory, so there it goes straight to
+                    # the wait below, which says so by MiB and names what to do instead.
+                    if ensure and (y.listening() or y.vram_mib() <= y.idle_vram_mib):
+                        try:
+                            y.ensure_running(timeout=min(self.release_timeout_s, max(1.0, timeout)))
+                        except Exception as exc:
+                            util.log(f"{y.name}: can't be started to unload from ({exc}); "
+                                     "waiting for its GPU memory to drop")
                     try:
                         done += y.release(wait, timeout)
                     except ReleaseFailed as e:
