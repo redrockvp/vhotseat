@@ -57,6 +57,7 @@ def test_a_claim_starting_unloads_the_idle_workloads_once(rig, monkeypatch):
     out = rows(rig, "claim-release")
     assert len(out) == 1, out
     assert out[0]["workloads"] == ["strata"] and out[0]["freed_mib"] == STRATA_VRAM
+    assert out[0]["freed"] == [{"workload": "strata", "freed_mib": STRATA_VRAM}]  # phase 3 reloads from this
     assert len(rows(rig, "claim")) == 1                      # one claim row for three polls
 
 

@@ -267,8 +267,13 @@ def release_for(arbiter, key: tuple, rec: dict) -> None:
     if out["released"]:
         names = [r["workload"] for r in out["released"]]
         events.record("claim-release", source="watch", name=key[0], note=key[1],
-                      workloads=names, freed_mib=out["freed_mib"],
-                      **{r["workload"]: r["freed_mib"] for r in out["released"]})
+                      workloads=[r["workload"] for r in out["released"]],
+                      # What went, per workload: the handle phase 3 reloads from. Kept inside the
+                      # row rather than spread over its keys, where a workload called `name` or
+                      # `note` would have overwritten the row's own fields.
+                      freed=[{"workload": r["workload"], "freed_mib": r["freed_mib"]}
+                             for r in out["released"]],
+                      freed_mib=out["freed_mib"])
         util.log(f"{key[0]} ({key[1]}) freed the card: " +
                  ", ".join(f"{label(n)} {r['freed_mib']} MiB" for n, r in
                            zip(names, out["released"])) + " unloaded, nothing closed")

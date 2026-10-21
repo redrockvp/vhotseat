@@ -72,6 +72,7 @@ class EventLog:
             elif kind == "claim-release":
                 rec = record(key)
                 rec["released"] = sorted(set(rec["released"]) | set(e.get("workloads") or []))
+                rec["freed"] = (rec.get("freed") or []) + (e.get("freed") or [])
                 rec["freed_mib"] += e.get("freed_mib") or 0
             elif e.get("workload"):
                 rec = record(key)
