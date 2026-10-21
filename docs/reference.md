@@ -354,6 +354,7 @@ claims:
     note: World of Warcraft            # how it's described in a refusal
   - name: rocketleague.exe             # or by exe name: works when the path can't be read
   - parent: mylauncher.exe             # or by any ancestor's exe name (its helpers too)
+claims_ignore: [myelectronapp.exe]     # names or path globs the built-in rules won't claim
 ```
 
 While something matches, nothing **new** loads: the gate refuses a load a request would
@@ -363,7 +364,12 @@ and is not refused; neither is a requested switch that would load nothing, so a 
 mid-flight carries on. Nothing loaded is interrupted, and no claimed process is touched.
 Built-ins know Steam (`*\steamapps\common\*`), Epic, Riot, anything under a `Games`
 folder, and a handful of exes; launchers and their helpers never claim the card, because
-they run all day. `claims_builtin: false` leaves only your rules.
+they run all day - and neither do Wallpaper Engine and a VR runtime, which live under
+`steamapps\common\` like a game does but mean nobody is playing one. Extend that list with
+`claims_ignore:`; a rule of your own can still claim anything it names, non-game or not.
+A process belonging to a configured workload never claims the card against its own loads
+either, even when that workload is installed under `D:\Games\` and is sitting idle.
+`claims_builtin: false` leaves only your rules.
 
 **`vhotseat watch`** adds the record, not the rule: `claim` and `claim-end` rows in the
 event log, one per kind of process rather than one per pid (a game is twenty), plus the

@@ -22,6 +22,32 @@ def rules(*raw):
     return claims.rules(raw, builtin=False)
 
 
+def test_a_tool_under_steamapps_does_not_claim_the_card_all_day():
+    r"""Wallpaper Engine and a VR runtime live under steamapps\common\ like a game and stay
+    running while the desktop is up. The built-in Steam rule claiming them refused every load
+    for hours, with nobody playing anything."""
+    rs = [claims.Rule({"path": r"*\steamapps\common\*", "note": "a Steam game"}, builtin=True)]
+    p = procs((10, 4, "wallpaper64.exe", r"C:\Steam\steamapps\common\wallpaper_engine\wallpaper64.exe"),
+              (11, 4, "vrserver.exe", r"C:\Steam\steamapps\common\SteamVRin\win64rserver.exe"),
+              (12, 4, "eldenring.exe", r"C:\Steam\steamapps\common\ELDEN RING\eldenring.exe"))
+    assert [h["name"] for h in claims.matching(rs, p)] == ["eldenring.exe"]
+    assert [h["name"] for h in claims.matching(rs, p, ignore=frozenset())] == [
+        "wallpaper64.exe", "vrserver.exe", "eldenring.exe"]
+
+
+def test_a_rule_of_your_own_can_still_claim_a_known_non_game():
+    rs = [claims.Rule({"name": "wallpaper64.exe", "note": "hold the card while the wallpaper renders"})]
+    p = procs((10, 4, "wallpaper64.exe", r"C:\Steam\steamapps\common\wallpaper_engine\wallpaper64.exe"))
+    assert [h["name"] for h in claims.matching(rs, p)] == ["wallpaper64.exe"]
+
+
+def test_claims_ignore_extends_what_the_built_ins_won_claim():
+    rs = [claims.Rule({"path": r"*\steamapps\common\*", "note": "a Steam game"}, builtin=True)]
+    p = procs((12, 4, "ScreenSteam.exe", r"C:\Steam\steamapps\common\ScreenSteam\ScreenSteam.exe"))
+    assert [h["name"] for h in claims.matching(rs, p)] == ["ScreenSteam.exe"]
+    assert claims.matching(rs, p, ignore=claims.ignores(["screensteam.exe"])) == []
+
+
 def test_an_idle_workload_is_not_claimed_by_its_own_directory(rig, monkeypatch):
     r"""A workload installed under D:\Games\ matches the built-in rule for a game in a Games
     folder. The exclusion came from the holder list - the top few by memory - so an idle
@@ -118,6 +144,19 @@ def test_a_broken_parent_chain_does_not_loop():
     assert claims.ancestors(3, p) == []
 
 
+def test_the_arbiter_hands_its_ignores_to_the_matcher(rig, monkeypatch):
+    """The arbiter's `claims_ignore` from the config reaches the matcher; otherwise the list is
+    decoration and Wallpaper Engine still owns the card."""
+    p = procs((10, 4, "wallpaper64.exe", r"C:\Steam\steamapps\common\wallpaper_engine\wallpaper64.exe"))
+    monkeypatch.setattr(host, "processes", lambda: p)
+    monkeypatch.setattr(rig.arb, "claim_rules",
+                        [claims.Rule({"path": r"*\steamapps\common\*", "note": "a Steam game"}, builtin=True)])
+    monkeypatch.setattr(rig.arb, "claim_ignore", claims.ignores())
+    assert rig.arb._claims_in([]) == []
+    monkeypatch.setattr(rig.arb, "claim_ignore", frozenset())
+    assert [h["name"] for h in rig.arb._claims_in([])] == ["wallpaper64.exe"]
+
+
 def test_claim_rules_are_validated():
     """A typo in a rule would silently claim the wrong thing - or nothing."""
     raw = config.parse((ROOT / "config.example.yaml").read_text())
@@ -139,6 +178,15 @@ def test_claim_rules_are_validated():
     with pytest.raises(config.ConfigError, match=r"claims: expected a list"):
         config.validate(raw)
     raw["claims"] = []
+    raw["claims_ignore"] = ["wallpaper64.exe", "*Electron*"]
+    assert config.validate(raw)["claims_ignore"] == ["wallpaper64.exe", "*Electron*"]
+    raw["claims_ignore"] = [{"name": "wallpaper64.exe"}]
+    with pytest.raises(config.ConfigError, match=r"claims_ignore\[0\]: expected a non-empty string"):
+        config.validate(raw)
+    raw["claims_ignore"] = "wallpaper64.exe"
+    with pytest.raises(config.ConfigError, match=r"claims_ignore: expected a list"):
+        config.validate(raw)
+    raw["claims_ignore"] = []
     raw["claims_builtin"] = "yes"
     with pytest.raises(config.ConfigError, match=r"claims_builtin"):
         config.validate(raw)

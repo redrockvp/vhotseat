@@ -34,7 +34,7 @@ class Arbiter:
     def __init__(self, workloads: list[Workload], gpu, lock: GpuLock, events: EventLog, *,
                  gate_release_timeout_s: float = 20, release_timeout_s: float = 60,
                  machine_ram=host.machine_ram, telemetry=None, power: dict | None = None,
-                 claim_rules: list | None = None):
+                 claim_rules: list | None = None, claim_ignore=()):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
         self.lock = lock
@@ -50,6 +50,8 @@ class Arbiter:
         self.power = power or {}
         # What owns the card by right rather than by arrangement (a game): see claims.py.
         self.claim_rules = claim_rules if claim_rules is not None else claims.rules([])
+        # Names and path globs the built-in rules won't claim (Wallpaper Engine, a VR runtime).
+        self.claim_ignore = claims.ignores(claim_ignore)
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
@@ -252,7 +254,7 @@ class Arbiter:
             for pid, p in procs.items():
                 if needle in f"{p.get('exe') or ''} {p.get('name') or ''}".lower():
                     owned.add(pid)
-        return claims.matching(self.claim_rules, procs, owned)
+        return claims.matching(self.claim_rules, procs, owned, self.claim_ignore)
 
     def claim_hits(self) -> list[dict]:
         """Processes that own the card right now - a game, or whatever a `claims:` rule

@@ -151,3 +151,7 @@ power:
 #   - parent: mylauncher.exe           # or by any ancestor's exe name; it matches that
 #                                      # launcher's helpers too, so prefer path or name
 # claims_builtin: true                 # false leaves only the rules you wrote
+# claims_ignore: [wallpaper64.exe]     # names or globs the built-ins won't claim: the
+#                                      # built-ins already skip Wallpaper Engine, SteamVR
+#                                      # and the Oculus runtime, which live under
+#                                      # steamapps\common\ but aren't somebody playing

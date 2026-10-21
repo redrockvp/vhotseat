@@ -49,12 +49,32 @@ LAUNCHERS = (
 KEYS = ("name", "path", "parent", "note")
 _LAUNCHERS = frozenset(s.lower() for s in LAUNCHERS)
 
+# Not games, whatever folder they live in: things that run all day inside a game directory.
+# Wallpaper Engine and a VR runtime hold the card like a game does, but nobody is playing one,
+# and refusing loads for them all day is not what the rule means. A `claims:` rule of your own
+# can still name any of them: this only stops the built-ins calling them games.
+NON_GAMES = (
+    "wallpaper32.exe", "wallpaper64.exe",                # Wallpaper Engine
+    "steamvr.exe", "vrserver.exe", "vrcompositor.exe", "vrmonitor.exe", "vrstartup.exe",
+    "vrclearcache.exe", "vrappstatus.exe", "vrtracefunctionhook.exe",
+    "ovrserver.exe", "ovrlogmonitor.exe", "OVRServer_x64.exe",
+)
+
+
+def ignores(extra=()) -> frozenset:
+    """What never claims the card by a built-in rule: the known non-games plus the config's
+    `claims_ignore:`. Entries are exe names or path globs, matched the way rules are."""
+    return frozenset(_fold(s) for s in (*NON_GAMES, *(extra or ())))
+
 
 class Rule:
     """One claim rule: match a process by exe name, image path, or the name of any
-    ancestor process. `note` says what it means to have matched, in the report."""
+    ancestor process. `note` says what it means to have matched, in the report.
 
-    def __init__(self, raw: dict):
+    Built-in rules carry `builtin = True`: they are the ones the known non-games are held back
+    from. A rule in the config claims whatever it names, non-game or not."""
+
+    def __init__(self, raw: dict, builtin: bool = False):
         bad = [k for k in raw if k not in KEYS]
         if bad:
             raise ValueError(f"claim rule: unknown key{'s' if len(bad) > 1 else ''} "
@@ -65,6 +85,7 @@ class Rule:
         self.path = str(raw.get("path") or "")
         self.parent = str(raw.get("parent") or "")
         self.note = str(raw.get("note") or "")
+        self.builtin = builtin
 
     def __repr__(self) -> str:
         return f"Rule({self.name or self.path or self.parent})"
@@ -75,7 +96,7 @@ def rules(cfg_rules=(), builtin: bool = True) -> list[Rule]:
     out = []
     if builtin:
         builtins = WINDOWS_GAMES if os.name == "nt" else POSIX_GAMES
-        out += [Rule(r) for r in builtins]
+        out += [Rule(r, builtin=True) for r in builtins]
     out += [Rule(r) for r in cfg_rules or ()]
     return out
 
@@ -102,23 +123,28 @@ def ancestors(pid: int, procs: dict[int, dict], depth: int = 12) -> list[str]:
     return out
 
 
-def matching(rs: list[Rule], procs: dict[int, dict], exclude: set = frozenset()) -> list[dict]:
+def matching(rs: list[Rule], procs: dict[int, dict], exclude: set = frozenset(),
+             ignore: frozenset | None = None) -> list[dict]:
     """Every running process a rule claims: [{pid, name, exe, note, by}].
 
     `exclude` is the set of pids already attributed to configured workloads: the thing
     holding the card *for* vhotseat is never also the thing that owns it, and a
     workload's directory isn't guaranteed to sit outside a Games folder.
+
+    `ignore` (see ignores()) holds names and path globs that the *built-in* rules won't claim.
     """
+    ignore = ignores() if ignore is None else ignore
     hits = []
     for pid, p in procs.items():
         name, exe = p.get("name") or "", (p.get("exe") or "")
         if not name or pid in exclude or _fold(name) in _LAUNCHERS:
             continue
+        folded, folded_exe = _fold(name), _fold(exe)
         chain = None
         for r in rs:
-            if r.name and fnmatch.fnmatch(_fold(name), _fold(r.name)):
+            if r.name and fnmatch.fnmatch(folded, _fold(r.name)):
                 by = f"{name}"
-            elif r.path and exe and fnmatch.fnmatch(_fold(exe), _fold(r.path)):
+            elif r.path and exe and fnmatch.fnmatch(folded_exe, _fold(r.path)):
                 by = f"{name} ({exe})"
             elif r.parent:
                 if chain is None:
@@ -128,6 +154,9 @@ def matching(rs: list[Rule], procs: dict[int, dict], exclude: set = frozenset())
                 by = f"{name}, launched by {next(a for a in chain if fnmatch.fnmatch(_fold(a), _fold(r.parent)))}"
             else:
                 continue
+            if r.builtin and any(fnmatch.fnmatch(folded, pat) or (exe and fnmatch.fnmatch(folded_exe, pat))
+                                 for pat in ignore):
+                continue                # a built-in won't call a wallpaper renderer a game
             hits.append({"pid": pid, "name": name, "exe": exe or None,
                          "note": r.note or "claimed", "by": by})
             break                       # one rule per process: the first match explains it

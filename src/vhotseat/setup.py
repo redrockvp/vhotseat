@@ -47,6 +47,7 @@ def build(cfg: dict, *, env=os.environ, gpu=None, machine_ram=None, **arbiter_ar
         EventLog(state / "events.jsonl", keep=(cfg.get("events") or {}).get("keep", 500), telemetry=telemetry),
         machine_ram=machine_ram or host.machine_ram, telemetry=telemetry, power=cfg.get("power") or {},
         claim_rules=claims.rules(cfg.get("claims") or [], cfg.get("claims_builtin", True)),
+        claim_ignore=cfg.get("claims_ignore") or [],
         **arbiter_args,
     )
     return arbiter
