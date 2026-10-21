@@ -213,7 +213,8 @@ class HttpWorkload(Workload):
             names = re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", template)
             if any(fields.get(n) in (None, "") for n in names):
                 continue
-            if template.strip() == "{%s}" % names[0] and isinstance(fields[names[0]], (int, float)):
+            if len(names) == 1 and template.strip() == "{%s}" % names[0] \
+                    and isinstance(fields[names[0]], (int, float)):
                 body[field_name] = fields[names[0]]   # the field's own type: "32768" is not 32768
                 continue
             body[field_name] = re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda m: str(fields[m.group(1)]), template)

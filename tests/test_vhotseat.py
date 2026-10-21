@@ -397,6 +397,18 @@ def test_an_empty_loaded_list_does_not_mean_a_model_is_loaded(vh):
     assert vh.arb.switch("comfy", 0)["ok"] is True
 
 
+def test_an_estimate_body_field_with_no_placeholder_is_sent_as_is(vh):
+    """A constant in the estimate body - quant: "Q4_K_M" - carries no {placeholder}, so the
+    single-placeholder check indexed names[0] of an empty list: IndexError inside probe(),
+    which takes status, switch, gate and the dashboard down with it."""
+    w = vh.arb.workloads["strata"]
+    w.spec["estimate"] = {"from": {"get": "/last-model"}, "post": "/estimate",
+                          "body": {"model_path": "{id}", "quant": "Q4_K_M"}, "path": "gpu_bytes"}
+    st = vh.arb.probe()["strata"]
+    assert st["sized"]["bytes"] == 19 * 2**30
+    assert vh.strata.last_body == {"model_path": vh.strata.model, "quant": "Q4_K_M"}
+
+
 def test_a_workload_is_never_refused_by_its_own_floor(vh):
     """min_free_vram_mib is what a model needs room to load into. Weights already on the card
     are not room it still has to find: asking for the card again while they land must not be
