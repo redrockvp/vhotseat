@@ -15,7 +15,7 @@ import threading
 import time
 from pathlib import Path
 
-from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, STRATA_VRAM
+from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, STRATA_VRAM, FakeStrata
 from vhotseat import claims, config as cfgmod, host, setup, web
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -314,3 +314,48 @@ def test_a_restarted_watcher_honours_the_recorded_targets(rig, monkeypatch):
     assert rig.comfy.vram == COMFY_MODEL_VRAM
     assert len(rows(rig, "claim")) == 1
     assert [r["workloads"] for r in rows(rig, "claim-release")] == [["strata"]]
+
+
+def test_an_unload_that_leaves_its_vram_behind_is_tried_three_times(rig, monkeypatch):
+    """Its release answers "unloaded" and the card still shows the weights: an owner's `confirm:`
+    more generous than `idle_vram_mib`, or a node that doesn't hand memory back. It is not
+    recorded as released - `claim-release` says "unloaded" and must only name what the card
+    agrees is clear - and it is retried, bounded: asking forever would spend the whole game
+    taking the GPU lock for nothing. The last row says it gave up."""
+    claim_rule(rig, monkeypatch)
+    rig.strata.loaded = True
+    # The lie: the fake keeps claiming its weights after a successful /unload, and its own
+    # confirm is set so the release itself considers itself done.
+    monkeypatch.setattr(FakeStrata, "vram", property(lambda self: STRATA_VRAM))
+    rig.arb.workloads["strata"].spec.setdefault("confirm", {})["vram_at_most"] = STRATA_VRAM
+    rig.arb.claim_poll_s = 0.01
+    web.watch(rig.arb, polls=8)
+    assert rows(rig, "claim-release") == []
+    got = rows(rig, "claim-release-waiting")
+    assert [r["attempts"] for r in got] == [1, 2, 3]
+    assert all(r["stuck"] and r["held_mib"] == STRATA_VRAM for r in got)
+    assert "still holds 14000 MiB" in got[0]["why"]
+    assert "leaving it until the claim ends" in got[-1]["why"]
+    assert rig.strata.calls.count("POST /unload") == 3      # asked three times, then stopped
+
+
+def test_a_retry_that_works_clears_the_row_saying_it_was_stuck(rig, monkeypatch, capsys):
+    """The second try gets the memory back: it is recorded as released, and `status` stops
+    saying it is still holding. An owner reading `vhotseat status` mid-game should see what the
+    claim was given now, not every problem the release ran into on the way."""
+    claim_rule(rig, monkeypatch)
+    rig.strata.loaded = True
+    lying = [True]
+    monkeypatch.setattr(FakeStrata, "vram", property(lambda self: STRATA_VRAM if lying[0] else 0))
+    rig.arb.workloads["strata"].spec.setdefault("confirm", {})["vram_at_most"] = STRATA_VRAM
+    rig.arb.claim_poll_s = 0.01
+    web.watch(rig.arb, polls=1)
+    assert rows(rig, "claim-release") == []
+    assert [r["attempts"] for r in rows(rig, "claim-release-waiting")] == [1]
+    lying[0] = False
+    web.watch(rig.arb, polls=1)
+    assert [r["workloads"] for r in rows(rig, "claim-release")] == [["strata"]]
+    assert rig.cli("status") == 0
+    out = capsys.readouterr().out
+    assert f"unloaded strata ({STRATA_VRAM} MiB)" in out
+    assert "keeps its model" not in out

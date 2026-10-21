@@ -77,13 +77,26 @@ class EventLog:
                 record(key)["targets"] = list(e.get("targets") or [])
             elif kind == "claim-release":
                 rec = record(key)
-                rec["released"] = sorted(set(rec["released"]) | set(e.get("workloads") or []))
+                got = set(e.get("workloads") or [])
+                rec["released"] = sorted(set(rec["released"]) | got)
                 rec["freed"] = (rec.get("freed") or []) + (e.get("freed") or [])
                 rec["freed_mib"] += e.get("freed_mib") or 0
+                # A retry that worked: the row saying it was still holding is history now.
+                rec["waiting"] = [w for w in rec["waiting"] if w["workload"] not in got]
             elif e.get("workload"):
                 rec = record(key)
-                if e["workload"] not in [w["workload"] for w in rec["waiting"]]:
-                    rec["waiting"].append({"workload": e["workload"], "why": e.get("why") or ""})
+                for w in rec["waiting"]:
+                    if w["workload"] == e["workload"]:
+                        # The newest reason, and however many tries the log has seen.
+                        w["why"], w["stuck"] = e.get("why") or w["why"], bool(e.get("stuck")) or w["stuck"]
+                        w["attempts"] = max(w.get("attempts") or 0, e.get("attempts") or 1)
+                        w["held_mib"] = e.get("held_mib") or w.get("held_mib") or 0
+                        break
+                else:
+                    rec["waiting"].append({"workload": e["workload"], "why": e.get("why") or "",
+                                           "attempts": e.get("attempts") or 1,
+                                           "stuck": bool(e.get("stuck")),
+                                           "held_mib": e.get("held_mib") or 0})
         return out
 
     def last(self) -> dict | None:

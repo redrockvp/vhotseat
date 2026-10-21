@@ -266,6 +266,9 @@ def claim_transitions(arbiter, hits: list[dict]) -> None:
         release_for(arbiter, key, state.get(key) or {"released": [], "waiting": []})
 
 
+CLAIM_STUCK_TRIES = 3      # tries at a workload that says it unloaded and keeps holding
+
+
 def release_for(arbiter, key: tuple, rec: dict) -> None:
     """One claim's share of the release.
 
@@ -276,7 +279,10 @@ def release_for(arbiter, key: tuple, rec: dict) -> None:
     Once every target is released the claim has been given its due: later polls take no GPU
     lock and read no card for it, for as long as the game runs.
 
-    A target that is working is asked again on every poll while the claim lasts."""
+    A target that is working is asked again on every poll while the claim lasts. A target that
+    says it unloaded and keeps holding its VRAM is asked CLAIM_STUCK_TRIES times in total: that
+    is a unload that doesn't work, not a busy moment, and asking forever would spend the whole
+    game taking and releasing the GPU lock for nothing. The row for the last try says so."""
     events = arbiter.events
     if rec.get("targets") is None:
         targets = arbiter.claim_targets()
@@ -285,8 +291,10 @@ def release_for(arbiter, key: tuple, rec: dict) -> None:
         rec = {**rec, "targets": targets}
     label = lambda n: arbiter.workloads[n].label if n in arbiter.workloads else n  # noqa: E731
     waiting = rec.get("waiting") or []
+    stuck = {w["workload"]: w.get("attempts") or 1 for w in waiting if w.get("stuck")}
+    held = {w["workload"]: w.get("held_mib") or 0 for w in waiting}
     given = set(rec.get("released") or [])
-    pending = [n for n in rec["targets"] if n not in given]
+    pending = [n for n in rec["targets"] if n not in given and stuck.get(n, 0) < CLAIM_STUCK_TRIES]
     if not pending:
         return
     # Only now is the card read again, and only while something is still owed. A target that
@@ -298,8 +306,12 @@ def release_for(arbiter, key: tuple, rec: dict) -> None:
              or (snap.get(f"{n}_mib") or 0) <= arbiter.workloads[n].idle_vram_mib]
     still = [n for n in pending if n not in clear]
     if clear:
+        # What it was last seen holding, which is what stopped being held. Zero when there was
+        # nothing to measure - the owner closed the program rather than releasing it.
         events.record("claim-release", source="watch", name=key[0], note=key[1],
-                      workloads=clear, freed=[], freed_mib=0, late=True)
+                      workloads=clear, freed=[{"workload": n, "freed_mib": held.get(n, 0)}
+                                              for n in clear if held.get(n, 0)],
+                      freed_mib=sum(held.get(n, 0) for n in clear), late=True)
         util.log(f"{key[0]} ({key[1]}): " + ", ".join(label(n) for n in clear) +
                  " holds nothing on the card now")
     if not still:
@@ -333,7 +345,14 @@ def release_for(arbiter, key: tuple, rec: dict) -> None:
         n = w["workload"]
         if n not in still:
             continue
-        if n not in said:
+        if w.get("stuck"):
+            k = stuck.get(n, 0) + 1
+            why = w["why"] + (f" - {k} tries and it still holds, so leaving it until the claim ends"
+                              if k >= CLAIM_STUCK_TRIES else "")
+            events.record("claim-release-waiting", source="watch", name=key[0], note=key[1],
+                          workload=n, why=why, attempts=k, stuck=True, held_mib=w.get("held_mib") or 0)
+            util.log(f"{key[0]} ({key[1]}): {label(n)} keeps its model - {why}")
+        elif n not in said:
             events.record("claim-release-waiting", source="watch", name=key[0], note=key[1],
                           workload=n, why=w["why"])
             util.log(f"{key[0]} ({key[1]}): {label(n)} keeps its model for now - {w['why']}")

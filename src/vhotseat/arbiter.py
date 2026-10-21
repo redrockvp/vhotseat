@@ -467,11 +467,12 @@ class Arbiter:
 
         Nothing is restarted and nothing is killed. A workload whose release doesn't finish -
         busy, refusing, or stuck holding its VRAM - is reported as waiting, and the watcher tries
-        it again while the claim lasts. A workload with nothing on the card isn't touched at all:
-        a model living entirely in RAM has nothing here that the game is short of.
+        it again while the claim lasts, bounded for a workload that says it unloaded and keeps
+        holding. A workload with nothing on the card isn't touched at all: a model living
+        entirely in RAM has nothing here that the game is short of.
 
         Returns {"declined": why-or-None, "released": [{workload, freed_mib}],
-        "waiting": [{workload, why}], "freed_mib": int}.
+        "waiting": [{workload, why, stuck?}], "freed_mib": int}.
         """
         cands = self.workloads if only is None else {n: y for n, y in self.workloads.items()
                                                     if n in set(only)}
@@ -523,12 +524,16 @@ class Arbiter:
                     waiting.append({"workload": n, "why": str(e) or type(e).__name__})
                     continue
                 left = max(0, (self.snapshot().get(f"{n}_mib") or 0) - y.idle_vram_mib)
-                freed = max(0, want[n] - left)
-                released.append({"workload": n, "freed_mib": freed})
                 if left:
-                    # It says unloaded and the card still shows it: worth saying, and worth
-                    # trying again next poll - it counts as waiting, not as done.
-                    waiting.append({"workload": n, "why": f"reports unloaded and still holds {left} MiB"})
+                    # It answered "unloaded" and the card still shows its weights - an owner's
+                    # `confirm:` that is more generous than `idle_vram_mib`, or a node that
+                    # doesn't give the memory back. Not done, and not recorded as released:
+                    # `claim-release` says "unloaded" and must only name what the card agrees
+                    # is clear. `stuck` is what the watcher counts its bounded retries on.
+                    waiting.append({"workload": n, "stuck": True, "held_mib": left,
+                                    "why": f"says it unloaded and still holds {left} MiB"})
+                    continue
+                released.append({"workload": n, "freed_mib": want[n]})
             if released:
                 self.lock.bump()          # seats cache who owns the card: drop that answer
             return {"declined": None, "by_actor": False, "released": released, "waiting": waiting,

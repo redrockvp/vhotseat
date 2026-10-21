@@ -369,7 +369,8 @@ recorded as `claim-release-waiting`, and released on a later check as soon as it
 the claim lasts. Which workloads the claim is owed is decided when its release first runs, from
 what the card held then, and recorded: a model the owner loads afterwards - a typed `vhotseat
 switch` is an order - is left alone, and a workload that held nothing to begin with isn't waited
-on. `on_start: block` is the older behaviour: nothing new loads, and what is
+on. A workload that says it unloaded and keeps holding its VRAM is asked three times and then left
+for the rest of the claim. `on_start: block` is the older behaviour: nothing new loads, and what is
 already loaded keeps what it has. Both are enforced at every gate whether or not `watch` runs;
 `release` is the extra half, and it's why `vhotseat autostart install --command watch` is worth
 having.

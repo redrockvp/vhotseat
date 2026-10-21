@@ -340,6 +340,12 @@ release starts from what the card actually holds, so whichever arrives second fi
 A target found to hold nothing when it is asked - the unload landed late, or the owner closed the
 program - is recorded as released and stops being named as holding.
 
+A target that is working is asked again on every check while the claim lasts. A target that says it
+unloaded and still holds its VRAM is asked three times in total: that is an unload that does not
+work, not a busy moment, and asking forever would spend a whole game taking the GPU lock for
+nothing. The `claim-release-waiting` row for the last try says it is leaving it until the claim
+ends.
+
 The check happens at the moment of the decision - a machine-wide process snapshot costs
 tens of milliseconds - so the rule holds with nothing resident: no daemon has to notice
 the game for the refusal to happen. Recording it, and running the release, is a separate
