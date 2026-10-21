@@ -329,11 +329,11 @@ def test_cli_claims_lists_what_matches_and_the_rules(rig, monkeypatch, capsys):
     assert rig.cli("claims", "--json") == 0
     out = json.loads(capsys.readouterr().out)
     assert out["hits"][0]["name"] == "game.exe"
-    assert out["rules"] == [{"name": "game.exe", "note": "the game I play"}]
+    assert out["rules"] == [{"name": "game.exe", "note": "the game I play", "on_start": "release"}]
     assert rig.cli("claims") == 0
     text = capsys.readouterr().out
     assert "the card is claimed by game.exe (the game I play)" in text
-    assert "- name game.exe  (the game I play)" in text      # what's in force, and why
+    assert "- name game.exe  (the game I play)  -> on_start: release" in text   # in force, and what it does
 
 
 def test_hook_allows_when_comfy_idle(rig):

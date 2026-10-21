@@ -236,8 +236,8 @@ def claim_transitions(arbiter, hits: list[dict]) -> None:
 
     A claim is a kind of process, not a pid: one game is twenty processes, and when one of them
     exits the other nineteen still hold the card, so that is not the card opening again. What is
-    already open comes from the log (see open_claims), not from this process's memory, which is
-    what keeps `watch` and the dashboard from each doing the same thing twice."""
+    already open comes from the log (see EventLog.claims_open), not from this process's memory,
+    which is what keeps `watch` and the dashboard from each doing the same thing twice."""
     events = arbiter.events
     now = _groups(h for h in hits)
     was = events.claims_open()
@@ -286,7 +286,7 @@ def release_for(arbiter, key: tuple, rec: dict) -> None:
     if out["released"]:
         names = [r["workload"] for r in out["released"]]
         events.record("claim-release", source="watch", name=key[0], note=key[1],
-                      workloads=[r["workload"] for r in out["released"]],
+                      workloads=names,
                       # What went, per workload: the handle phase 3 reloads from. Kept inside the
                       # row rather than spread over its keys, where a workload called `name` or
                       # `note` would have overwritten the row's own fields.
