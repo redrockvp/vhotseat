@@ -30,6 +30,17 @@ class FakeProxy:
             self.seat.acquire(self.name, wait)
 
 
+def test_a_gate_asking_through_the_seat_is_a_request_so_claims_refuse_it(rig, seat, monkeypatch):
+    """Everything that reaches a proxy is a load nobody typed, so it asks: while the card is
+    claimed, it is refused. A person typing `vhotseat switch comfy` has decided, and still
+    gets the card - which is exactly the difference the guard's --request flag carries."""
+    hits = [{"pid": 4242, "name": "EldenRing.exe", "exe": "", "note": "Elden Ring", "by": "name"}]
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: hits)
+    with pytest.raises(api.SwitchError):
+        seat.acquire("comfy", 0)
+    assert rig.cli("switch", "comfy") == 0            # the typed order is not refused
+
+
 def test_a_seat_that_just_took_the_card_owns_it_while_the_weights_land(rig, seat):
     """A server that loads on request shows nothing on the card until its weights arrive, so
     a probe straight after acquire() says nobody holds the GPU. The seat knows better: it

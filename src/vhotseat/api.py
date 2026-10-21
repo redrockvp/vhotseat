@@ -84,7 +84,10 @@ class Seat:
         return self._switch(NONE, wait)
 
     def _switch(self, name: str, wait: float) -> list[str]:
-        result = self.arbiter.switch(name, wait, load=False)
+        # A gate asking through the Seat API is a load nobody explicitly chose, so it is a
+        # request and claims refuse it: a proxy must not put weights on the card under a game.
+        # A typed `vhotseat switch` is an order, and goes through switch() without this flag.
+        result = self.arbiter.switch(name, wait, load=False, request=True)
         self._cache = None
         self._acquired = None
         if not result["ok"]:
