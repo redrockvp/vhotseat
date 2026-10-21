@@ -7,7 +7,8 @@ from pathlib import Path
 from . import util
 
 # The rows that say a claim is open, and what has been done about it.
-CLAIM_ROWS = ("claim", "claim-end", "claim-release", "claim-release-waiting")
+CLAIM_ROWS = ("claim", "claim-end", "claim-release", "claim-release-targets",
+              "claim-release-waiting")
 
 
 class EventLog:
@@ -47,17 +48,18 @@ class EventLog:
         return out
 
     def claims_open(self, limit: int = 500) -> dict:
-        """What the log shows as claimed right now: {(process, rule note): {claim, released,
-        waiting, freed_mib}}, rebuilt from its tail.
+        """What the log shows as claimed right now: {(process, rule note): {claim, targets,
+        released, waiting, freed_mib}}, rebuilt from its tail.
 
-        The log is the record, so it is what says whether a claim has been written, what has
-        already been released for it, and what has already been reported waiting - rather than
-        each process keeping its own copy of that. The trade is that a claim older than the
-        retained log (`keep` lines) is forgotten, and recording it again is honest."""
+        The log is the record, so it is what says whether a claim has been written, which
+        workloads it was owed (`targets`), what has already been released for it, and what has
+        already been reported waiting and how many times - rather than each process keeping its
+        own copy of that. The trade is that a claim older than the retained log (`keep` lines)
+        is forgotten, and recording it again is honest."""
         out: dict[tuple, dict] = {}
 
         def record(key):
-            return out.setdefault(key, {"claim": {"name": key[0], "note": key[1]},
+            return out.setdefault(key, {"claim": {"name": key[0], "note": key[1]}, "targets": None,
                                         "released": [], "waiting": [], "freed_mib": 0})
 
         for e in self.tail(limit):
@@ -69,6 +71,10 @@ class EventLog:
                 out.pop(key, None)
             elif kind == "claim":
                 record(key)["claim"] = e
+            elif kind == "claim-release-targets":
+                # Decided once, when the claim's release first ran. An empty list is a real
+                # answer - nothing of ours was on the card then - so it isn't left as None.
+                record(key)["targets"] = list(e.get("targets") or [])
             elif kind == "claim-release":
                 rec = record(key)
                 rec["released"] = sorted(set(rec["released"]) | set(e.get("workloads") or []))

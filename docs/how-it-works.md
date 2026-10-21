@@ -324,16 +324,27 @@ while the claim lasts. Releasing never goes through the claim refusal: freeing t
 load (§4 of docs/guides/proxy-gate.md is the same rule from the gate's side). And it never runs
 under someone else's `hold`, because that work owns the card at that moment.
 
-That is one action per workload per claim, not a re-unload every poll: what has already been
-released for a claim is read back from the event log, which is also what keeps `watch` and
-`vhotseat web` - both of which notice claims - from doing the same release twice. The GPU lock is
-the mutex between them, and the release starts from what the card actually holds, so whichever
-one arrives second finds nothing to do.
+The workloads a claim is *owed* are decided once, when its release first runs, from what the card
+held at that moment, and recorded as a `claim-release-targets` row. That is what keeps a typed
+`vhotseat switch strata` in the middle of a game an order rather than something undone two seconds
+later: what the owner loads after the game starts is theirs, and the watcher does not go back for
+it. It is also why a workload that held nothing when the game started - ComfyUI sitting on its CUDA
+context, a model resident only in RAM - isn't something the claim waits on. Once every target has
+gone the claim has been given its due, and later checks take no GPU lock and read no card for it
+for as long as the game runs.
+
+That list, and what has already been released for a claim, come back from the event log rather
+than from a process's memory, which is also what keeps `watch` and `vhotseat web` - both of which
+notice claims - from doing the same release twice. The GPU lock is the mutex between them, and the
+release starts from what the card actually holds, so whichever arrives second finds nothing to do.
+A target found to hold nothing when it is asked - the unload landed late, or the owner closed the
+program - is recorded as released and stops being named as holding.
 
 The check happens at the moment of the decision - a machine-wide process snapshot costs
 tens of milliseconds - so the rule holds with nothing resident: no daemon has to notice
 the game for the refusal to happen. Recording it, and running the release, is a separate
-and smaller job: `claim`, `claim-end`, `claim-release` and `claim-release-waiting` rows in
+and smaller job: `claim`, `claim-end`, `claim-release-targets`, `claim-release` and
+`claim-release-waiting` rows in
 the event log, grouped per process name. Whatever probes often enough is the actor and the
 recorder - `vhotseat watch` on a headless box, or `vhotseat web` where the dashboard
 already runs - which is what lets the dashboard show when the card was somebody else's,

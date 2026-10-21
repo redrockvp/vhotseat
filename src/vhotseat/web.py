@@ -267,26 +267,50 @@ def claim_transitions(arbiter, hits: list[dict]) -> None:
 
 
 def release_for(arbiter, key: tuple, rec: dict) -> None:
-    """One claim's share of the release: ask only for the workloads the record doesn't already
-    show as released for it. So a claim's release is one action per workload rather than the same
-    unload every poll, and a workload the owner chose to load after the claim started - a typed
-    `vhotseat switch` is an order - is not chased.
+    """One claim's share of the release.
 
-    Both pollers call this; the GPU lock inside arbiter.claim_release is what serialises them,
-    and the release starts from what the card actually holds, so a second poller that arrives
-    after the first finds nothing to release and writes nothing."""
+    The workloads it is owed are decided once, when its release first runs, from what the card
+    held at that moment, and recorded. So a model the owner loads in the middle of a game - a
+    typed `vhotseat switch` is an order - stays theirs, and no later poll unloads it; and a
+    workload that held nothing when the claim started isn't something the claim is waiting on.
+    Once every target is released the claim has been given its due: later polls take no GPU
+    lock and read no card for it, for as long as the game runs.
+
+    A target that is working is asked again on every poll while the claim lasts."""
     events = arbiter.events
-    pending = {n for n in arbiter.workloads if n not in set(rec.get("released") or [])}
+    if rec.get("targets") is None:
+        targets = arbiter.claim_targets()
+        events.record("claim-release-targets", source="watch", name=key[0], note=key[1],
+                      targets=targets)
+        rec = {**rec, "targets": targets}
+    label = lambda n: arbiter.workloads[n].label if n in arbiter.workloads else n  # noqa: E731
+    waiting = rec.get("waiting") or []
+    given = set(rec.get("released") or [])
+    pending = [n for n in rec["targets"] if n not in given]
     if not pending:
         return
+    # Only now is the card read again, and only while something is still owed. A target that
+    # has come clear by itself - the unload landing late, or the owner closing the program -
+    # is as done as the claim cares: say so, so the log and `status` stop naming it as holding.
+    snap = arbiter.snapshot()
+    clear = [n for n in pending
+             if n not in arbiter.workloads
+             or (snap.get(f"{n}_mib") or 0) <= arbiter.workloads[n].idle_vram_mib]
+    still = [n for n in pending if n not in clear]
+    if clear:
+        events.record("claim-release", source="watch", name=key[0], note=key[1],
+                      workloads=clear, freed=[], freed_mib=0, late=True)
+        util.log(f"{key[0]} ({key[1]}): " + ", ".join(label(n) for n in clear) +
+                 " holds nothing on the card now")
+    if not still:
+        return
     try:
-        out = arbiter.claim_release({"name": key[0], "note": key[1]})
+        out = arbiter.claim_release({"name": key[0], "note": key[1]}, only=still)
     except Exception as e:            # a watcher that lives at logon must not die on one bad poll
         util.log(f"{key[0]} ({key[1]}): couldn't free the card - {type(e).__name__}: {e}")
         return
     if out.get("by_actor"):
-        return              # another watcher is mid-release for this claim: ask again next poll
-    label = lambda n: arbiter.workloads[n].label if n in arbiter.workloads else n  # noqa: E731
+        return          # another watcher is mid-release for this claim: ask again on the next poll
     if out["released"]:
         names = [r["workload"] for r in out["released"]]
         events.record("claim-release", source="watch", name=key[0], note=key[1],
@@ -298,17 +322,21 @@ def release_for(arbiter, key: tuple, rec: dict) -> None:
                              for r in out["released"]],
                       freed_mib=out["freed_mib"])
         util.log(f"{key[0]} ({key[1]}) freed the card: " +
-                 ", ".join(f"{label(n)} {r['freed_mib']} MiB" for n, r in
-                           zip(names, out["released"])) + " unloaded, nothing closed")
-    already = {w["workload"] for w in rec.get("waiting") or []}
-    waiting = ([{"workload": n, "why": out["declined"]} for n in out.get("would", []) if n in pending]
-               if out["declined"] else out["waiting"])
-    for w in waiting:
-        if w["workload"] not in pending or w["workload"] in already:
-            continue                        # said once per workload per claim, then retried quietly
-        events.record("claim-release-waiting", source="watch", name=key[0], note=key[1],
-                      workload=w["workload"], why=w["why"])
-        util.log(f"{key[0]} ({key[1]}): {label(w['workload'])} keeps its model for now - {w['why']}")
+                 ", ".join(f"{label(r['workload'])} {r['freed_mib']} MiB" for r in out["released"]) +
+                 " unloaded, nothing closed")
+    if out["declined"] is not None:
+        asked = [{"workload": n, "why": out["declined"]} for n in out.get("would") or []]
+    else:
+        asked = out["waiting"]
+    said = {w["workload"] for w in waiting}
+    for w in asked:
+        n = w["workload"]
+        if n not in still:
+            continue
+        if n not in said:
+            events.record("claim-release-waiting", source="watch", name=key[0], note=key[1],
+                          workload=n, why=w["why"])
+            util.log(f"{key[0]} ({key[1]}): {label(n)} keeps its model for now - {w['why']}")
 
 
 def _groups(hits):

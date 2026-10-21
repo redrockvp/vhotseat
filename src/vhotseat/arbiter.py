@@ -438,10 +438,27 @@ class Arbiter:
             util.log(f"refusing {x.label} load: {reason}")
             return False
 
-    def claim_release(self, claim: dict) -> dict:
-        """A claim appeared (`on_start: release`): ask every workload that holds memory on the
-        card to let go of it, through the normal release path - API unload, then the card
-        confirms the MiB went - and leave anything that is working alone.
+    def claim_targets(self) -> list[str]:
+        """Which workloads a claim is owed: the ones holding more than their idle VRAM on the
+        card right now.
+
+        This is decided once, when the claim's release first runs, and the answer goes in the
+        event log (`claim-release-targets`). It matters because a claim lasts as long as the
+        game does, and a typed `vhotseat switch strata` in the middle of it is an order: what
+        the owner loads afterwards is theirs, and a watcher that read the card fresh every poll
+        would undo it every 2 seconds for the rest of the game."""
+        snap = self.snapshot()
+        return sorted(n for n, y in self.workloads.items()
+                      if (snap.get(f"{n}_mib") or 0) > y.idle_vram_mib)
+
+    def claim_release(self, claim: dict, only: list[str] | None = None) -> dict:
+        """A claim appeared (`on_start: release`): ask the workloads it was owed to let go of
+        the card, through the normal release path - API unload, then the card confirms the MiB
+        went - and leave anything that is working alone.
+
+        `only` is that set, read back from the log by whoever is acting; workloads outside it
+        are not touched for this claim whatever they come to hold later. With no set passed,
+        every workload holding card memory is a candidate.
 
         It takes the GPU lock exactly as a switch would: a `hold` or a switch in progress owns
         the card, and releasing underneath it would pull the ground out from under that work, so
@@ -456,16 +473,18 @@ class Arbiter:
         Returns {"declined": why-or-None, "released": [{workload, freed_mib}],
         "waiting": [{workload, why}], "freed_mib": int}.
         """
+        cands = self.workloads if only is None else {n: y for n, y in self.workloads.items()
+                                                    if n in set(only)}
         pre = self.snapshot()
-        if not any((pre.get(f"{n}_mib") or 0) > y.idle_vram_mib for n, y in self.workloads.items()):
-            # Nothing of ours is on the card, so there is nothing to free and no reason to take
-            # the lock every poll for as long as the game runs. `would` says as much.
+        if not any((pre.get(f"{n}_mib") or 0) > y.idle_vram_mib for n, y in cands.items()):
+            # Nothing it is owed is on the card, so there is nothing to free and no reason to
+            # take the lock every poll for as long as the game runs. `would` says as much.
             return {"declined": None, "by_actor": False, "would": [], "released": [],
                     "waiting": [], "freed_mib": 0}
         got = self.lock.try_take(f"claim release {claim.get('name') or ''}".strip())
         if not isinstance(got, Held):
             want = {n: max(0, (pre.get(f"{n}_mib") or 0) - y.idle_vram_mib)
-                    for n, y in self.workloads.items()}
+                    for n, y in cands.items()}
             # Another watcher (watch and the dashboard both act) is mid-release for this same
             # claim. That isn't a workload holding on: saying so once per workload would both
             # spam the log and shadow the reason that matters, if one turns up later.
@@ -480,12 +499,12 @@ class Arbiter:
             # than unloading a second time. Same for a switch that happened while we queued.
             snap = self.snapshot()
             want = {n: max(0, (snap.get(f"{n}_mib") or 0) - y.idle_vram_mib)
-                    for n, y in self.workloads.items()}
+                    for n, y in cands.items()}
             if not any(want.values()):
                 return {"declined": None, "by_actor": False, "would": [], "released": [],
                         "waiting": [], "freed_mib": 0}
             released, waiting = [], []
-            for n, y in self.workloads.items():
+            for n, y in cands.items():
                 if not want[n]:
                     continue
                 if y.service_active() and (busy := y.busy()):

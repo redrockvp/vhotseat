@@ -16,19 +16,21 @@ import time
 from pathlib import Path
 
 from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, STRATA_VRAM
-from vhotseat import claims, config as cfgmod, host, web
+from vhotseat import claims, config as cfgmod, host, setup, web
 
 ROOT = Path(__file__).resolve().parents[1]
 
 NAME, NOTE = "EldenRing.exe", "Elden Ring"
 
 
-def claim_rule(rig, monkeypatch, on_start="release"):
+def claim_rule(rig, monkeypatch, on_start="release", arb=None):
     """Put a claim rule in force and the game in the process table. Returns the table: take the
-    game out of it and the claim ends."""
-    monkeypatch.setattr(rig.arb, "claim_rules",
+    game out of it and the claim ends. Pass `arb` to arm a second arbiter over the same log,
+    which is what a restarted `watch` - or the dashboard alongside it - is."""
+    arb = arb or rig.arb
+    monkeypatch.setattr(arb, "claim_rules",
                         claims.rules([{"name": NAME, "note": NOTE, "on_start": on_start}], builtin=False))
-    monkeypatch.setattr(rig.arb, "claim_ignore", claims.ignores())
+    monkeypatch.setattr(arb, "claim_ignore", claims.ignores())
     procs = {4242: {"pid": 4242, "ppid": 4, "name": NAME, "exe": r"D:\Libraries\elden\EldenRing.exe"}}
     monkeypatch.setattr(host, "processes", lambda: procs)
     return procs
@@ -257,3 +259,58 @@ def test_status_shows_what_a_claim_was_given(rig, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "claims:" in out and "unloading what is loaded to free it" in out
     assert "freed for:" in out and f"unloaded strata ({STRATA_VRAM} MiB)" in out
+
+
+def test_a_model_loaded_during_a_claim_is_left_alone(rig, monkeypatch):
+    """The owner is mid-game and types `vhotseat switch strata`. A typed switch is an order, so
+    the watcher does not fight it - and it must not undo it either, which is what reading the
+    card fresh every 2 s would do. The release was decided from what the card held when the
+    game started; what the owner chooses afterwards is theirs."""
+    claim_rule(rig, monkeypatch)
+    rig.strata.loaded = True
+    running_render(rig)                              # comfy holds weights and is working
+    web.watch(rig.arb, polls=1)
+    assert not rig.strata.loaded
+    assert rows(rig, "claim-release-targets")[0]["targets"] == ["comfy", "strata"]
+    rig.strata.loaded = True                         # the typed switch, mid-game
+    while rig.comfy.running or rig.comfy.pending:
+        time.sleep(0.05)
+    web.watch(rig.arb, polls=3)
+    assert rig.comfy.vram == COMFY_CONTEXT_VRAM      # the render's weights went once it went idle
+    assert rig.strata.loaded                         # nobody came back for the new load
+    assert rig.strata.calls.count("POST /unload") == 1
+    assert [r["workloads"] for r in rows(rig, "claim-release")] == [["strata"], ["comfy"]]
+
+
+def test_a_workload_holding_nothing_is_not_a_target(rig, monkeypatch):
+    """ComfyUI is up with only its CUDA context on the card: the game is short of VRAM, not of
+    400 MiB, so it isn't on the list of what the claim is owed. Once strata has gone the claim
+    has been given its due, and the watcher stops asking entirely rather than taking the GPU
+    lock and reading the card every 2 s for as long as the game runs."""
+    claim_rule(rig, monkeypatch)
+    rig.strata.loaded = True
+    web.watch(rig.arb, polls=1)
+    assert rows(rig, "claim-release-targets")[0]["targets"] == ["strata"]
+    asked = []
+    monkeypatch.setattr(rig.arb, "claim_release", lambda *a, **k: asked.append(1) or {})
+    web.watch(rig.arb, polls=3)
+    assert asked == []
+    assert rig.strata.loaded is False
+
+
+def test_a_restarted_watcher_honours_the_recorded_targets(rig, monkeypatch):
+    """`watch` restarting - the logon autostart does that at every reboot, games and all - reads
+    the claim, the list it was owed, and what has gone, back from the event log instead of
+    deciding again from the card. A model loaded after the game started is still nobody's to
+    unload, and the claim isn't written a second time."""
+    claim_rule(rig, monkeypatch)
+    rig.strata.loaded = True
+    web.watch(rig.arb, polls=1)
+    assert not rig.strata.loaded
+    rig.comfy.vram = COMFY_MODEL_VRAM                # the owner went to comfy mid-game
+    fresh = rig.host.install(setup.build(rig.cfg, gpu=rig.gpu))   # a new process, same log
+    claim_rule(rig, monkeypatch, arb=fresh)
+    web.watch(fresh, polls=2)
+    assert rig.comfy.vram == COMFY_MODEL_VRAM
+    assert len(rows(rig, "claim")) == 1
+    assert [r["workloads"] for r in rows(rig, "claim-release")] == [["strata"]]

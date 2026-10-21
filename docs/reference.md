@@ -366,9 +366,13 @@ game rules use) frees the card for it: every idle workload vhotseat manages is a
 its model through the normal release path - API unload, then the card confirms the MiB went - and
 the servers stay running. A workload with work in flight is never interrupted: it is skipped,
 recorded as `claim-release-waiting`, and released on a later check as soon as it goes idle, while
-the claim lasts. `on_start: block` is the older behaviour: nothing new loads, and what is already
-loaded keeps what it has. Both are enforced at every gate whether or not `watch` runs; `release`
-is the extra half, and it's why `vhotseat autostart install --command watch` is worth having.
+the claim lasts. Which workloads the claim is owed is decided when its release first runs, from
+what the card held then, and recorded: a model the owner loads afterwards - a typed `vhotseat
+switch` is an order - is left alone, and a workload that held nothing to begin with isn't waited
+on. `on_start: block` is the older behaviour: nothing new loads, and what is
+already loaded keeps what it has. Both are enforced at every gate whether or not `watch` runs;
+`release` is the extra half, and it's why `vhotseat autostart install --command watch` is worth
+having.
 
 `claims_poll_s` is how often that watcher looks - a game has allocated within seconds of starting.
 It's independent of `telemetry.interval_s`, which stays whatever it is for the history graphs.
