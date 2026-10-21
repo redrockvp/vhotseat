@@ -409,6 +409,18 @@ def test_an_estimate_body_field_with_no_placeholder_is_sent_as_is(vh):
     assert vh.strata.last_body == {"model_path": vh.strata.model, "quant": "Q4_K_M"}
 
 
+def test_a_failed_sizing_answer_is_not_asked_again_every_probe(vh):
+    """A failed answer is still an answer. Nothing was cached for it, so every probe paid the
+    `from:` round trip again - on Windows, seconds of it, per probe, for a server that is down."""
+    w = vh.arb.workloads["strata"]
+    w.spec["estimate"] = {"from": {"get": "/last-model"}, "post": "/estimate",
+                          "body": {"model_path": "{id}"}, "path": "gpu_bytes"}
+    vh.strata.down = True
+    for _ in range(3):
+        vh.arb.probe()
+    assert vh.strata.calls.count("GET /last-model") == 1, vh.strata.calls
+
+
 def test_a_workload_is_never_refused_by_its_own_floor(vh):
     """min_free_vram_mib is what a model needs room to load into. Weights already on the card
     are not room it still has to find: asking for the card again while they land must not be

@@ -83,6 +83,7 @@ class FakeStrata(_Server):
         self.answering = 0          # requests being answered
         self.load_s = 0.05
         self.estimate_calls = 0
+        self.down = False               # the API is up but answering nothing useful
         self.on_load = lambda: True
         super().__init__()
 
@@ -126,6 +127,8 @@ class FakeStrata(_Server):
     def route(self, h, method, url, body):
         path, q = url
         self.calls.append(f"{method} {path}")
+        if self.down:
+            return h.send_json(503, {"error": "loading"})
         if path == "/health":
             if self.want_header and self.last_headers.get("authorization") != self.want_header:
                 return h.send_json(401, {"error": "unauthorized"})

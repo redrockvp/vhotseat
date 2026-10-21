@@ -47,6 +47,7 @@ from .base import Workload
 
 MISSING = object()
 ESTIMATE_TTL_S = 60.0
+ESTIMATE_FAIL_TTL_S = 10.0     # a failed answer is still an answer: don't re-ask every probe
 
 
 def lookup(body, path: str):
@@ -188,7 +189,11 @@ class HttpWorkload(Workload):
         if not spec or not self.service_active():
             return None
         now = time.monotonic()
-        if self._estimate is not None and now - self._estimate_at < ESTIMATE_TTL_S:
+        # None is a legitimate answer (no sizing available), so "asked at" is what says whether
+        # there is a cached answer at all - otherwise a server that is down pays the `from:` and
+        # `post:` round trips again on every single probe.
+        ttl = ESTIMATE_TTL_S if self._estimate else ESTIMATE_FAIL_TTL_S
+        if now - self._estimate_at < ttl:
             return self._estimate
         self._estimate, self._estimate_at = self._ask_estimate(spec), now
         return self._estimate
