@@ -165,10 +165,12 @@ class Arbiter:
         for y in others:
             try:
                 if y.service_active():
-                    # Don't wait on an API that isn't answering just to release it:
-                    # release() judges from the GPU counters whether there is anything
-                    # to release, which is what lets a closed workload stop blocking.
-                    if ensure and y.reachable():
+                    # "Closed by hand must not block the others" and "a server that is still
+                    # coming up must not be walked over" are the same question: is anything there?
+                    # Nothing listening and nothing on the card means it is gone, and release()
+                    # judges from the GPU counters. Anything else gets the wait: a llama-server
+                    # mid-load answers 503, and a 2 s reachable() probe reads that as dead.
+                    if ensure and (y.listening() or y.vram_mib() > y.idle_vram_mib):
                         y.ensure_running()
                     try:
                         done += y.release(wait, timeout)

@@ -3,6 +3,7 @@
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -409,6 +410,29 @@ def test_an_estimate_body_field_with_no_placeholder_is_sent_as_is(vh):
     assert vh.strata.last_body == {"model_path": vh.strata.model, "quant": "Q4_K_M"}
 
 
+def test_a_server_that_is_still_starting_is_not_read_as_closed(vh):
+    """The other half of "a closed workload must not block the others": a server that is up but
+    not answering yet - llama-server returns 503 from /health while it loads - holds its port.
+    Waiting is right; calling it unreachable lets the target load on top of it, or fails the
+    switch with advice to start a server that is already starting."""
+    vh.strata.loaded = True
+    vh.strata.down = True                          # listening, answering 503: still loading
+    threading.Timer(0.4, lambda: setattr(vh.strata, "down", False)).start()
+    result = vh.arb.switch("comfy", 5)
+    assert result["ok"] is True, result.get("error")
+    assert vh.strata.loaded is False               # released, not walked over
+
+
+def test_a_workload_that_is_really_closed_still_does_not_block(vh):
+    """And the half that must not regress: nothing listening, nothing on the card - it is off,
+    and a handover must not wait on a port nobody owns or complain that it can't start it."""
+    vh.strata.close()
+    result = vh.arb.switch("comfy", 5)
+    assert result["ok"] is True, result.get("error")
+    assert vh.host.starts == []                    # nothing was started on the way
+    assert "cannot start it" not in str(result.get("error") or "")
+
+
 def test_a_failed_sizing_answer_is_not_asked_again_every_probe(vh):
     """A failed answer is still an answer. Nothing was cached for it, so every probe paid the
     `from:` round trip again - on Windows, seconds of it, per probe, for a server that is down."""
@@ -448,6 +472,21 @@ def test_a_workload_can_size_a_model_before_it_lands(vh):
     assert vh.strata.estimate_calls == 1                    # the sampler doesn't pay per probe
     assert "sizes at 19456 MiB" in w.describe(st)
     assert any("sizes at 19456 MiB at 32768 ctx" in n for n in vh.arb.why_all()["strata"]["notes"])
+
+
+def test_restarting_a_workload_that_wants_a_key_does_not_wait_on_its_auth(vh, monkeypatch):
+    """The restart and start loops polled with a bare GET, so the workload's own `headers:`
+    were never sent: a keyed API answered 401 forever, the loop waited out its whole timeout,
+    and the switch failed over a server that was up the entire time."""
+    w = vh.arb.workloads["strata"]
+    w.spec["headers"] = {"Authorization": "Bearer ${VH_TEST_KEY}"}
+    vh.strata.want_header = "Bearer sekrit"        # 401 to everything else, /health included
+    monkeypatch.delenv("VH_TEST_KEY", raising=False)
+    w.restart_timeout_s = 2.0
+    started = time.monotonic()
+    w.restart("its RAM is pinned")                 # used to wait the full 2 s and raise
+    assert vh.host.restarts, vh.host.restarts
+    assert time.monotonic() - started < 1.5
 
 
 def test_a_release_can_name_the_model_it_is_unloading(vh):

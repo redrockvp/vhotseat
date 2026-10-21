@@ -2,6 +2,8 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import socket
+from urllib.parse import urlsplit
 
 from .. import util
 from ..errors import ReleaseFailed, SwitchError
@@ -109,6 +111,27 @@ class Workload:
         home", not "is it busy", and on Windows a dead port costs seconds per attempt."""
         return self.health_call(timeout=2.0)[0] == 200
 
+    def up(self) -> bool:
+        """Answering at all, including 401/403. For "is it running" a key that wasn't sent is
+        proof of a live API: waiting for a 200 from a keyed server would wait forever on its
+        own auth, and restarts and handovers would fail over a workload that was up the whole
+        time. Reachability - can we actually read it - stays strict about that."""
+        return self.health_call(timeout=2.0)[0] in (200, 401, 403)
+
+    def listening(self) -> bool:
+        """Whether anything is accepting TCP on its API port.
+
+        "Closed by hand" and "still starting" answer nothing over HTTP, and a server that is
+        loading its model answers 503 - all three look dead to reachable(). A socket is what
+        separates the ones that are coming from the one that has gone."""
+        up = urlsplit(self.url)
+        port = up.port or (443 if up.scheme == "https" else 80)
+        try:
+            with socket.create_connection((up.hostname, port), timeout=0.5):
+                return True
+        except OSError:
+            return False
+
     def ensure_running(self, timeout: float = 60.0) -> None:
         """Start its service if it's stopped, and wait until its API answers.
 
@@ -118,13 +141,15 @@ class Workload:
         if not self.service_active():
             util.log(f"starting {self.service.unit}")
             self.service.start()
-        if self.reachable():
+        if self.up():
             return
-        if not getattr(self.service, "can_start", True):
+        if not getattr(self.service, "can_start", True) and not self.listening():
+            # The complaint is about a program nobody has started. Something holding its port
+            # has been started, whether or not vhotseat can start it: that one gets the wait.
             raise SwitchError(f"{self.label}'s API is not answering and it has no service configured, so "
                               "vhotseat cannot start it: start it yourself")
         url = self.url + self.health_path
-        util.wait_until(lambda: util.http("GET", url)[0] == 200, timeout, f"{self.label} to answer {url}")
+        util.wait_until(self.up, timeout, f"{self.label} to answer {url}")
 
     def release(self, wait: float, timeout: float) -> list[str]:
         """Drop its models without interrupting work, waiting up to `wait` for
@@ -146,8 +171,7 @@ class Workload:
         self.ready_to_restart()
         util.log(f"restarting {self.label}: {why}")
         self.service.restart()
-        url = self.url + self.health_path
-        util.wait_until(lambda: util.http("GET", url)[0] == 200, self.restart_timeout_s,
+        util.wait_until(self.up, self.restart_timeout_s,
                         f"{self.label} to answer after its restart")
 
 
