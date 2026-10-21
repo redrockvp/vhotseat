@@ -87,7 +87,9 @@ class Seat:
         # A gate asking through the Seat API is a load nobody explicitly chose, so it is a
         # request and claims refuse it: a proxy must not put weights on the card under a game.
         # A typed `vhotseat switch` is an order, and goes through switch() without this flag.
-        result = self.arbiter.switch(name, wait, load=False, request=True)
+        # Letting go of the card is not a load: a claim must never stop work getting *off* the
+        # card, which is also the door the release-on-claim-start (phase 1) goes through.
+        result = self.arbiter.switch(name, wait, load=False, request=(name != NONE))
         self._cache = None
         self._acquired = None
         if not result["ok"]:

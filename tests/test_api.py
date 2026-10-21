@@ -41,6 +41,22 @@ def test_a_gate_asking_through_the_seat_is_a_request_so_claims_refuse_it(rig, se
     assert rig.cli("switch", "comfy") == 0            # the typed order is not refused
 
 
+def test_freeing_the_card_is_never_refused_by_a_claim(rig, seat, monkeypatch):
+    """A claim stops loads nobody chose. Work getting *off* the card isn't one: with a game
+    running, release_all() (switch to none) has to unload, and the release that phase 1 runs on
+    a claim start goes through this same door. Regression from e52b123, which made every Seat
+    switch a request."""
+    hits = [{"pid": 4242, "name": "EldenRing.exe", "exe": "", "note": "Elden Ring", "by": "name"}]
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: hits)
+    rig.strata.loaded = True
+    assert rig.cli("switch", "strata") == 0          # the typed order puts it on the card
+    seat.release_all(wait=5)                         # must not raise
+    assert not rig.strata.loaded
+    assert rig.arb.probe()["mode"] == "none"
+    with pytest.raises(api.SwitchError):
+        seat.acquire("strata", 0)                    # loading under the same claim still refused
+
+
 def test_a_seat_that_just_took_the_card_owns_it_while_the_weights_land(rig, seat):
     """A server that loads on request shows nothing on the card until its weights arrive, so
     a probe straight after acquire() says nobody holds the GPU. The seat knows better: it
