@@ -413,6 +413,66 @@ class Arbiter:
             util.log(f"refusing {x.label} load: {reason}")
             return False
 
+    def claim_release(self, claim: dict) -> dict:
+        """A claim appeared (`on_start: release`): ask every workload that holds memory on the
+        card to let go of it, through the normal release path - API unload, then the card
+        confirms the MiB went - and leave anything that is working alone.
+
+        It takes the GPU lock exactly as a switch would: a `hold` or a switch in progress owns
+        the card, and releasing underneath it would pull the ground out from under that work, so
+        this declines and the watcher asks again on the next poll. The claim it is serving never
+        refuses this: freeing the card is not a load (see api.Seat._switch and switch's `request`).
+
+        Nothing is restarted and nothing is killed. A workload whose release doesn't finish -
+        busy, refusing, or stuck holding its VRAM - is reported as waiting, and the watcher tries
+        it again while the claim lasts. A workload with nothing on the card isn't touched at all:
+        a model living entirely in RAM has nothing here that the game is short of.
+
+        Returns {"declined": why-or-None, "released": [{workload, freed_mib}],
+        "waiting": [{workload, why}], "freed_mib": int}.
+        """
+        want = {n: max(0, y.vram_mib() - y.idle_vram_mib) for n, y in self.workloads.items()}
+        if not any(want.values()):
+            # Nothing of ours is on the card, so there is nothing to free and no reason to take
+            # the lock every poll for as long as the game runs. `would` says as much.
+            return {"declined": None, "would": [], "released": [], "waiting": [], "freed_mib": 0}
+        got = self.lock.try_take(f"claim release {claim.get('name') or ''}".strip())
+        if not isinstance(got, Held):
+            return {"declined": f"{got or 'a switch'} in progress",
+                    "would": sorted(n for n, mib in want.items() if mib),
+                    "released": [], "waiting": [], "freed_mib": 0}
+        with got:
+            released, waiting = [], []
+            for n, y in self.workloads.items():
+                if not want[n]:
+                    continue
+                if y.service_active() and (busy := y.busy()):
+                    waiting.append({"workload": n, "why": busy})
+                    continue
+                if not y.service_active():
+                    waiting.append({"workload": n,
+                                    "why": f"a {y.label} process holds {want[n]} MiB but "
+                                          f"{y.service.unit or 'its service'} is stopped"})
+                    continue
+                try:
+                    # wait=0: anything still working was skipped above, and the release path's
+                    # own timeout keeps this inside one poll rather than a whole handover's.
+                    y.release(0, self.gate_release_timeout_s)
+                except (Busy, ReleaseFailed, SwitchError) as e:
+                    waiting.append({"workload": n, "why": str(e) or type(e).__name__})
+                    continue
+                left = max(0, y.vram_mib() - y.idle_vram_mib)
+                freed = max(0, want[n] - left)
+                released.append({"workload": n, "freed_mib": freed})
+                if left:
+                    # It says unloaded and the card still shows it: worth saying, and worth
+                    # trying again next poll - it counts as waiting, not as done.
+                    waiting.append({"workload": n, "why": f"reports unloaded and still holds {left} MiB"})
+            if released:
+                self.lock.bump()          # seats cache who owns the card: drop that answer
+            return {"declined": None, "would": [], "released": released, "waiting": waiting,
+                    "freed_mib": sum(r["freed_mib"] for r in released)}
+
     def _busy_other(self, name: str) -> str | None:
         """Why another workload mustn't be released now, if one says it's working."""
         return next((r for y in self._others(name) if y.service_active() and (r := y.busy())), None)

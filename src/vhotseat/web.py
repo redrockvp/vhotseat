@@ -84,7 +84,7 @@ class Dashboard:
                     cached["retention_hours"] = self.telemetry.retention_s / 3600
                     cached["interval_s"] = self.telemetry.interval_s
                     cached["oldest"] = self.telemetry.oldest()
-                claim_transitions(self.arbiter.events, cached.get("claims", []))
+                claim_transitions(self.arbiter, cached.get("claims", []))
                 self._status = (time.monotonic(), cached)
             return cached
 
@@ -180,14 +180,16 @@ def serve(arbiter, host: str, port: int) -> int:
 
 
 def watch(arbiter, polls: int | None = None) -> int:
-    """`vhotseat watch`: sample the telemetry and record when a claim starts and ends.
+    """`vhotseat watch`: sample the telemetry, and when a claim starts, record it and free the
+    card for it.
 
-    Nothing depends on this process to defend a game's card: every gate and guard asks
-    who owns the card at the moment it decides, so a load is refused whether or not
-    watch runs. What watch adds is the record - `claim` and `claim-end` in the event log,
-    with the process and what matched it - so the dashboard can show when the card was
-    somebody else's, and a refusal can be read back weeks later. It is also the cheapest
-    always-on sampler, which is what `vhotseat autostart install --command watch` starts.
+    Nothing depends on this process to refuse a load: every gate and guard asks who owns the
+    card at the moment it decides, so a load is refused whether or not watch runs. What watch
+    adds is the acting half - the release a claim asks for (`on_start: release`) - and the
+    record: `claim`, `claim-end`, `claim-release` and `claim-release-waiting` in the event log,
+    so the dashboard can show when the card was somebody else's, what was unloaded for it and
+    what is still holding. It is also the cheapest always-on sampler, which is what
+    `vhotseat autostart install --command watch` starts.
 
     `polls` stops it after that many polls: what the tests use, and what a scheduled
     claim log can use instead of a resident process.
@@ -202,55 +204,119 @@ def watch(arbiter, polls: int | None = None) -> int:
     with Sampler(arbiter) if arbiter.telemetry else contextlib.nullcontext():
         while polls is None or polls > 0:
             polls = None if polls is None else polls - 1
-            claim_transitions(arbiter.events, arbiter.claim_hits())
+            claim_transitions(arbiter, arbiter.claim_hits())
             if polls is not None and polls <= 0:
                 break
             stop.wait(interval)
     return 0
 
 
-def open_claims(events, limit: int = 500) -> dict:
-    """Which claims the record already shows as open, read back from the tail of the event log.
+CLAIM_ROWS = ("claim", "claim-end", "claim-release", "claim-release-waiting")
 
-    The log is the record, so it's what says whether a claim has been written: `watch`
-    restarting does not re-open a claim that is still running, and `web` and `watch` running
-    together write the row once rather than twice. The trade is that a claim older than the
-    retained log (`events.keep` lines) is forgotten, and recording it again is honest."""
+
+def open_claims(events, limit: int = 500) -> dict:
+    """What the record shows as claimed right now: {(process, rule note): {claim row, released,
+    waiting}}, built from the tail of the event log.
+
+    The log is the record, so it is what says whether a claim has been written and what has
+    already been released for it: `watch` restarting neither re-opens a claim that is still
+    running nor unloads a card that is already clear, and `web` and `watch` running together
+    write each row once. The trade is that a claim older than the retained log (`events.keep`
+    lines) is forgotten, and recording it again is honest."""
     out: dict[tuple, dict] = {}
+
+    def record(key):
+        return out.setdefault(key, {"claim": {"name": key[0], "note": key[1]},
+                                    "released": [], "waiting": []})
+
     for e in events.tail(limit):
-        if e.get("event") not in ("claim", "claim-end"):
+        kind = e.get("event")
+        if kind not in CLAIM_ROWS:
             continue
         key = (e.get("name"), e.get("note"))
-        if e.get("event") == "claim":
-            out[key] = e
-        else:
+        if kind == "claim-end":
             out.pop(key, None)
+        elif kind == "claim":
+            rec = record(key)
+            rec["claim"] = e
+        elif kind == "claim-release":
+            rec = record(key)
+            rec["released"] = sorted(set(rec["released"]) | set(e.get("workloads") or []))
+            rec["freed_mib"] = (rec.get("freed_mib") or 0) + (e.get("freed_mib") or 0)
+        else:                                       # claim-release-waiting
+            rec = record(key)
+            rec["waiting"] = sorted(set(rec["waiting"]) | ({e["workload"]} if e.get("workload") else set()))
     return out
 
 
-def claim_transitions(events, hits: list[dict]) -> None:
-    """Record a `claim` / `claim-end` row as the set of claims changes. What's already open comes
-    from the log (see open_claims), not from this process's memory.
+def claim_transitions(arbiter, hits: list[dict]) -> None:
+    """Record a `claim` / `claim-end` row as the set of claims changes, and for a claim that
+    wants the card (`on_start: release`) ask the workloads to let go of what they hold.
 
     A claim is a kind of process, not a pid: one game is twenty processes, and when one of them
-    exits the other nineteen still hold the card, so that is not the card opening again."""
+    exits the other nineteen still hold the card, so that is not the card opening again. What is
+    already open comes from the log (see open_claims), not from this process's memory, which is
+    what keeps `watch` and the dashboard from each doing the same thing twice."""
+    events = arbiter.events
     now = _groups(h for h in hits)
     was = open_claims(events)
-    for (name, note), group in now.items():
-        if (name, note) in was:
+    for key, group in now.items():
+        if key in was:
             continue
-        events.record("claim", source="watch", pid=group[0]["pid"], name=name, note=note,
-                      by=group[0]["by"], processes=len(group))
-        util.log(f"{name}" + (f" x{len(group)}" if len(group) > 1 else "") +
-                 f" claims the card ({note}): nothing new loads while it runs")
-    for (name, note), row in was.items():
-        if (name, note) in now:
+        action = group[0].get("on_start") or "release"
+        events.record("claim", source="watch", pid=group[0]["pid"], name=key[0], note=key[1],
+                      by=group[0]["by"], processes=len(group), on_start=action)
+        util.log(f"{key[0]}" + (f" x{len(group)}" if len(group) > 1 else "") +
+                 f" claims the card ({key[1]}): " +
+                 ("unloading what is loaded to free it" if action == "release"
+                  else "nothing new loads while it runs"))
+    for key, rec in was.items():
+        if key in now:
             continue
+        row = rec["claim"]
         n = row.get("processes") or 1
-        events.record("claim-end", source="watch", pid=row.get("pid"), name=name, note=note,
+        events.record("claim-end", source="watch", pid=row.get("pid"), name=key[0], note=key[1],
                       processes=n)
-        util.log(f"{name}" + (f" x{n}" if n > 1 else "") +
-                 " is gone: the card is open to loads again")
+        util.log(f"{key[0]}" + (f" x{n}" if n > 1 else "") + " is gone: the card is open to loads again")
+    state = open_claims(events)             # ours are in the record now
+    for key, group in now.items():
+        if (group[0].get("on_start") or "release") != "release":
+            continue                        # `block`: the loads are the lever, as before
+        release_for(arbiter, key, state.get(key) or {"released": [], "waiting": []})
+
+
+def release_for(arbiter, key: tuple, rec: dict) -> None:
+    """One claim's share of the release: ask only for the workloads the record doesn't already
+    show as released for it. So a claim's release is one action per workload rather than the same
+    unload every poll, and a workload the owner chose to load after the claim started - a typed
+    `vhotseat switch` is an order - is not chased.
+
+    Both pollers call this; the GPU lock inside arbiter.claim_release is what serialises them,
+    and the release starts from what the card actually holds, so a second poller that arrives
+    after the first finds nothing to release and writes nothing."""
+    events = arbiter.events
+    pending = {n for n in arbiter.workloads if n not in set(rec.get("released") or [])}
+    if not pending:
+        return
+    out = arbiter.claim_release({"name": key[0], "note": key[1]})
+    label = lambda n: arbiter.workloads[n].label if n in arbiter.workloads else n  # noqa: E731
+    if out["released"]:
+        names = [r["workload"] for r in out["released"]]
+        events.record("claim-release", source="watch", name=key[0], note=key[1],
+                      workloads=names, freed_mib=out["freed_mib"],
+                      **{r["workload"]: r["freed_mib"] for r in out["released"]})
+        util.log(f"{key[0]} ({key[1]}) freed the card: " +
+                 ", ".join(f"{label(n)} {r['freed_mib']} MiB" for n, r in
+                           zip(names, out["released"])) + " unloaded, nothing closed")
+    already = set(rec.get("waiting") or [])
+    waiting = ([{"workload": n, "why": out["declined"]} for n in out.get("would", []) if n in pending]
+               if out["declined"] else out["waiting"])
+    for w in waiting:
+        if w["workload"] not in pending or w["workload"] in already:
+            continue                        # said once per workload per claim, then retried quietly
+        events.record("claim-release-waiting", source="watch", name=key[0], note=key[1],
+                      workload=w["workload"], why=w["why"])
+        util.log(f"{key[0]} ({key[1]}): {label(w['workload'])} keeps its model for now - {w['why']}")
 
 
 def _groups(hits):

@@ -296,7 +296,8 @@ port nobody owns.
 ### 3.7 A game starts while a model is loaded
 
 A game isn't a workload: it has no API to ask, and killing it isn't vhotseat's call.
-What vhotseat can still do is stop putting anything *on top of* it. A `claims:` rule -
+What vhotseat can still do is stop putting anything *on top of* it, and - by default - get
+what it can out of the way underneath. A `claims:` rule -
 or a built-in one for the usual installations - names the processes that own the card
 by being the thing a person is using. While one of them runs:
 
@@ -305,17 +306,38 @@ by being the thing a person is using. While one of them runs:
 - a **requested** switch is refused. ComfyUI's guard node asks with
   `switch comfy --request`, because the queue is asking on somebody's behalf. A switch
   a person typed at a terminal is an order, and isn't refused;
-- nothing already loaded is touched. A render in flight keeps the card and finishes,
-  and the next prompt of that batch goes ahead, because the card is already ComfyUI's
-  and nothing new would load. The game waits out that clip exactly as a `switch` does.
+- nothing already loaded is touched **while work is running**. A render in flight keeps the card
+  and finishes, and the next prompt of that batch goes ahead, because the card is already
+  ComfyUI's and nothing new would load. The game waits out that clip exactly as a `switch` does.
+
+What happens to a model that is loaded and *idle* is the rule's `on_start:` (§3.7.1). The default,
+and what the built-in game rules use, is `release`: the idle workloads are asked to let go of
+their models so the game gets the card without anyone closing anything.
+
+**3.7.1 `on_start: release` - the card is given up, not taken away.** When a claim appears, every
+workload that holds memory on the card and is not working is unloaded through the same release
+path `vhotseat switch none` uses: API unload, then the card confirms the MiB went. Servers and
+apps stay running; nothing is restarted and nothing is killed. A workload that *is* working - a
+render, a training run, a completion being generated - is skipped, recorded as
+`claim-release-waiting` naming it and why, and released on a later check the moment it goes idle,
+while the claim lasts. Releasing never goes through the claim refusal: freeing the card is not a
+load (§4 of docs/guides/proxy-gate.md is the same rule from the gate's side). And it never runs
+under someone else's `hold`, because that work owns the card at that moment.
+
+That is one action per workload per claim, not a re-unload every poll: what has already been
+released for a claim is read back from the event log, which is also what keeps `watch` and
+`vhotseat web` - both of which notice claims - from doing the same release twice. The GPU lock is
+the mutex between them, and the release starts from what the card actually holds, so whichever
+one arrives second finds nothing to do.
 
 The check happens at the moment of the decision - a machine-wide process snapshot costs
 tens of milliseconds - so the rule holds with nothing resident: no daemon has to notice
-the game for the refusal to happen. Recording it is a separate, smaller job: `claim` and
-`claim-end` rows in the event log, grouped per process name. Whatever probes often
-enough is the recorder - `vhotseat watch` on a headless box, or `vhotseat web` where the
-dashboard already runs - which is what lets the dashboard show when the card was somebody
-else's.
+the game for the refusal to happen. Recording it, and running the release, is a separate
+and smaller job: `claim`, `claim-end`, `claim-release` and `claim-release-waiting` rows in
+the event log, grouped per process name. Whatever probes often enough is the actor and the
+recorder - `vhotseat watch` on a headless box, or `vhotseat web` where the dashboard
+already runs - which is what lets the dashboard show when the card was somebody else's,
+what was unloaded for it, and what is still holding.
 
 What counts as a claim is deliberately narrow, because a wrong rule is worse than no
 rule: the game process itself, by its directory or its exe name, and never the launcher.

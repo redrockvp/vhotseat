@@ -1,0 +1,127 @@
+"""What a claim does when it appears: free the card, without interrupting anything.
+
+The rules themselves are tests/test_claims.py. This is the acting half - `watch` (and the
+dashboard, which probes as often) noticing a claim with `on_start: release`, unloading the idle
+workloads through their normal release path, leaving anything that is working alone, recording
+what it did, and retrying what is still holding while the claim lasts.
+"""
+
+import time
+
+from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, STRATA_VRAM
+from vhotseat import web
+
+NOTE = "Elden Ring"
+
+
+def game(name="EldenRing.exe", on_start="release"):
+    """What arbiter.claim_hits() answers for a game that has just started."""
+    return [{"pid": 4242, "name": name, "exe": None, "note": NOTE, "by": "name",
+             "on_start": on_start}]
+
+
+def rows(rig, kind):
+    return [e for e in rig.events() if e["event"] == kind]
+
+
+def running_render(rig, seconds=1.0):
+    """A ComfyUI job on the fake's executor, with its weights on the card."""
+    rig.comfy.slow_s = seconds
+    rig.comfy.queue_job({"1": {"class_type": "Slow", "inputs": {}}})
+    while not rig.comfy.running:
+        time.sleep(0.01)
+
+
+def test_a_claim_starting_unloads_the_idle_workloads_once(rig, monkeypatch):
+    """The owner launches a game without closing anything first: Strata's model goes through its
+    own unload, the server stays up, and it happens once - not once per poll."""
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: game())
+    rig.strata.loaded = True
+    web.watch(rig.arb, polls=3)
+    assert not rig.strata.loaded
+    assert "POST /unload" in rig.strata.calls                # asked, never killed
+    assert rig.host.active["strata"] is True                # the service is still running
+    out = rows(rig, "claim-release")
+    assert len(out) == 1, out
+    assert out[0]["workloads"] == ["strata"] and out[0]["freed_mib"] == STRATA_VRAM
+    assert len(rows(rig, "claim")) == 1                     # one claim row for three polls
+
+
+def test_a_running_render_is_never_interrupted_and_goes_next(rig, monkeypatch):
+    """Work in flight outranks a game: the render keeps its weights, the claim is recorded as
+    waiting for it, and the moment it is idle - while the claim still holds - it is released."""
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: game())
+    rig.strata.loaded = True
+    running_render(rig)
+    web.watch(rig.arb, polls=1)
+    assert not rig.strata.loaded                           # the idle one went
+    assert rig.comfy.vram == COMFY_MODEL_VRAM              # the busy one did not
+    waiting = rows(rig, "claim-release-waiting")
+    assert len(waiting) == 1 and waiting[0]["workload"] == "comfy" and waiting[0]["why"]
+    while rig.comfy.running or rig.comfy.pending:
+        time.sleep(0.05)
+    web.watch(rig.arb, polls=1)                            # a later poll, same claim
+    assert rig.comfy.vram == COMFY_CONTEXT_VRAM
+    assert [r["workloads"] for r in rows(rig, "claim-release")] == [["strata"], ["comfy"]]
+    assert len(rows(rig, "claim")) == 1                    # still one claim, not a new one
+    assert len(rows(rig, "claim-release-waiting")) == 1    # said once, then retried quietly
+
+
+def test_a_claim_that_ends_first_leaves_the_work_alone(rig, monkeypatch):
+    """The game quit before the render finished: there is no claim to free the card for any
+    more, so nothing further is released and the record closes."""
+    now = {"hits": game()}
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: now["hits"])
+    running_render(rig)
+    web.watch(rig.arb, polls=1)
+    assert rows(rig, "claim-release-waiting")
+    now["hits"] = []                                       # the game closed
+    web.watch(rig.arb, polls=1)
+    assert len(rows(rig, "claim-end")) == 1
+    while rig.comfy.running or rig.comfy.pending:
+        time.sleep(0.05)
+    web.watch(rig.arb, polls=1)
+    assert rig.comfy.vram == COMFY_MODEL_VRAM              # nobody came back for it
+    assert rows(rig, "claim-release") == []
+
+
+def test_on_start_block_is_the_old_behaviour(rig, monkeypatch):
+    """`block`: refuse new loads, leave what is loaded alone. That is all claims used to do."""
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: game(on_start="block"))
+    rig.strata.loaded = True
+    web.watch(rig.arb, polls=2)
+    assert rig.strata.loaded
+    assert rows(rig, "claim-release") == []
+    assert rows(rig, "claim-release-waiting") == []
+    assert rows(rig, "claim")[0]["on_start"] == "block"
+
+
+def test_a_release_never_runs_under_someone_elses_hold(rig, monkeypatch):
+    """A `hold` owns the card and the work under it. Releasing underneath it would pull the
+    ground out from under that work, so the watcher declines, names the holder, and asks again
+    on the next poll."""
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: game())
+    rig.strata.loaded = True
+    held = rig.arb.lock.try_take("hold comfy")
+    with held:
+        web.watch(rig.arb, polls=1)
+    assert rig.strata.loaded                               # nothing released under the hold
+    assert rows(rig, "claim-release") == []
+    waiting = rows(rig, "claim-release-waiting")
+    assert waiting and "hold comfy in progress" in waiting[0]["why"]
+    web.watch(rig.arb, polls=1)                            # the hold is over: it goes
+    assert not rig.strata.loaded
+
+
+def test_two_pollers_free_the_card_once(rig, monkeypatch):
+    """`web` and `watch` both run claim_transitions, both on their own schedule. One release and
+    one set of rows: the log says what is already open and already released, and the GPU lock
+    inside claim_release is what keeps the two from acting at the same moment."""
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: game())
+    rig.strata.loaded = True
+    web.claim_transitions(rig.arb, rig.arb.claim_hits())     # the dashboard
+    web.claim_transitions(rig.arb, rig.arb.claim_hits())     # watch
+    assert not rig.strata.loaded
+    assert len(rows(rig, "claim")) == 1
+    assert len(rows(rig, "claim-release")) == 1
+    assert rig.strata.calls.count("POST /unload") == 1

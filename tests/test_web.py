@@ -177,13 +177,13 @@ def test_claim_events_are_per_claim_not_per_process(rig):
     `watch` restarting doesn't re-open a claim that is still running."""
     hits = [{"pid": 10, "name": "eldenring.exe", "exe": None, "note": "a Steam game", "by": "path x"},
             {"pid": 11, "name": "eldenring.exe", "exe": None, "note": "a Steam game", "by": "path x"}]
-    web.claim_transitions(rig.arb.events, hits)
-    web.claim_transitions(rig.arb.events, hits)        # a second recorder, same claim
-    web.claim_transitions(rig.arb.events, hits[:1])    # one of the game's processes exited
-    rows = [e for e in rig.arb.events.tail() if e["event"].startswith("claim")]
+    web.claim_transitions(rig.arb, hits)
+    web.claim_transitions(rig.arb, hits)        # a second recorder, same claim
+    web.claim_transitions(rig.arb, hits[:1])    # one of the game's processes exited
+    rows = [e for e in rig.arb.events.tail() if e["event"] in ("claim", "claim-end")]
     assert [e["event"] for e in rows] == ["claim"] and rows[0]["processes"] == 2
-    web.claim_transitions(rig.arb.events, [])          # the game is gone
-    rows = [e for e in rig.arb.events.tail() if e["event"].startswith("claim")]
+    web.claim_transitions(rig.arb, [])          # the game is gone
+    rows = [e for e in rig.arb.events.tail() if e["event"] in ("claim", "claim-end")]
     assert [e["event"] for e in rows] == ["claim", "claim-end"]
 
 
