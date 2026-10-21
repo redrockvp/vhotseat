@@ -170,20 +170,21 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path
         self.sent = False
 
-        # Counted from before anything is decided. If the count only started once the request
-        # was already forwarded, a drain that ran while this one was still waiting on the card
-        # saw nobody in flight, unloaded the server and handed the card on - and then this
-        # request loaded its model on top of whoever had just been given the GPU.
-        self.state.enter()
+        # Counted from before the gate decision, but never while waiting for a drain: the drain
+        # handler waits for in_flight to reach zero, so a request counted while it waits on the
+        # drain deadlocks the pair - the drain times out into a 409 (release fails with Busy) and
+        # the request then gets its own 503. The loop is enter / check / put-back-and-wait.
+        self.sent = False
+        hold_until = time.monotonic() + self.hold
+        while True:
+            self.state.enter()
+            if not self.state.snapshot()[1]:
+                break                                # counted, and not waiting on anything
+            self.state.leave()
+            if time.monotonic() >= hold_until:
+                return self._busy(f"{self.workload} is giving up the GPU (waited {int(self.hold)} s)")
+            time.sleep(0.25)
         try:
-            if self.state.snapshot()[1]:
-                # Draining: vhotseat is taking the card from this workload. Wait, then 503.
-                deadline = time.monotonic() + self.hold
-                while self.state.snapshot()[1] and time.monotonic() < deadline:
-                    time.sleep(0.25)
-                if self.state.snapshot()[1]:
-                    return self._busy(f"{self.workload} is giving up the GPU (waited {int(self.hold)} s)")
-
             if loads_a_model(method, path):
                 # The fast path first: while nothing has changed hands since the last check this
                 # is a file read, no lock and no probe - and a cold check probes this workload

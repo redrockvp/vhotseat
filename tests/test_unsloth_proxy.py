@@ -217,6 +217,35 @@ def test_a_request_waiting_on_the_card_is_already_in_flight(studio):
         p.stop()
 
 
+def test_a_request_arriving_while_a_drain_waits_does_not_break_the_drain(studio):
+    """A request must not stay counted while it waits for a drain to end: the drain waits for
+    in_flight to reach zero. With one request still streaming, a second one that arrived during
+    the drain held the count at one forever, the drain timed out into a 409 (vhotseat's release
+    fails with Busy) and the request then got its own 503. This is a0c8182's fix for the other
+    race, taken one step too far."""
+    studio.stream_s = 0.4                       # ~1.2 s of tokens still reaching the client
+    seat = StubSeat(owner="unsloth")
+    p = proxy.Proxy(seat, studio.url, workload="unsloth", hold=5.0, unload=lambda: None).start()
+    out = {}
+
+    def go(key, method_path, body):
+        out[key] = call(p.url, "POST", method_path, body)[0]
+
+    threading.Thread(target=go, args=("first", "/v1/chat/completions", {"model_path": "m"})).start()
+    studio.stream_started.wait(5)               # weights on the card, streaming
+    t = threading.Thread(target=go, args=("drain", "/_vhotseat/drain?wait=3", None))
+    t.start()
+    time.sleep(0.2)                             # the drain is waiting on the stream
+    r = threading.Thread(target=go, args=("second", "/api/inference/load", {"model_path": "m2"}))
+    r.start()
+    time.sleep(0.3)
+    assert p.status()["draining"] is True       # and the second request lands mid-drain
+    t.join(15)
+    r.join(15)
+    assert out["drain"] == 200, out             # the drain cleared when the stream ended
+    assert out["second"] == 200, out            # and the request that arrived went through
+
+
 def test_an_open_websocket_does_not_hold_the_card_hostage(studio):
     """A UI tab keeps its websocket open for as long as it is open. Counting that as in flight
     means every drain answers 409 while somebody has a window on the screen, and the card can
