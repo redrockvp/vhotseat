@@ -279,7 +279,11 @@ def release_for(arbiter, key: tuple, rec: dict) -> None:
     pending = {n for n in arbiter.workloads if n not in set(rec.get("released") or [])}
     if not pending:
         return
-    out = arbiter.claim_release({"name": key[0], "note": key[1]})
+    try:
+        out = arbiter.claim_release({"name": key[0], "note": key[1]})
+    except Exception as e:            # a watcher that lives at logon must not die on one bad poll
+        util.log(f"{key[0]} ({key[1]}): couldn't free the card - {type(e).__name__}: {e}")
+        return
     if out.get("by_actor"):
         return              # another watcher is mid-release for this claim: ask again next poll
     label = lambda n: arbiter.workloads[n].label if n in arbiter.workloads else n  # noqa: E731

@@ -208,6 +208,21 @@ def test_the_actor_behind_the_lock_finds_the_card_already_clear(rig, monkeypatch
     assert second["released"] == [] and second["freed_mib"] == 0 and second["declined"] is None
     assert rig.strata.calls.count("POST /unload") == 1
 
+
+def test_one_bad_poll_does_not_stop_the_watcher(rig, monkeypatch):
+    """`watch` starts at logon and stays up for weeks. A release that blows up - a driver that
+    raises where it should have refused - is logged and tried again, not fatal."""
+    claim_rule(rig, monkeypatch)
+    rig.strata.loaded = True
+
+    def explode(claim):
+        raise RuntimeError("driver bug")
+
+    monkeypatch.setattr(rig.arb, "claim_release", explode)
+    assert web.watch(rig.arb, polls=2) == 0
+    assert rows(rig, "claim")
+    assert rig.strata.loaded                                   # nothing released, nothing crashed
+
 def test_claims_shows_the_action_and_what_it_has_done(rig, monkeypatch, capsys):
     """`vhotseat claims` answers three questions at once: which rule matched and what it does,
     what has been unloaded for this claim, and what is still holding and why."""
