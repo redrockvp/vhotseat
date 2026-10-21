@@ -213,44 +213,6 @@ def watch(arbiter, polls: int | None = None) -> int:
     return 0
 
 
-CLAIM_ROWS = ("claim", "claim-end", "claim-release", "claim-release-waiting")
-
-
-def open_claims(events, limit: int = 500) -> dict:
-    """What the record shows as claimed right now: {(process, rule note): {claim row, released,
-    waiting}}, built from the tail of the event log.
-
-    The log is the record, so it is what says whether a claim has been written and what has
-    already been released for it: `watch` restarting neither re-opens a claim that is still
-    running nor unloads a card that is already clear, and `web` and `watch` running together
-    write each row once. The trade is that a claim older than the retained log (`events.keep`
-    lines) is forgotten, and recording it again is honest."""
-    out: dict[tuple, dict] = {}
-
-    def record(key):
-        return out.setdefault(key, {"claim": {"name": key[0], "note": key[1]},
-                                    "released": [], "waiting": []})
-
-    for e in events.tail(limit):
-        kind = e.get("event")
-        if kind not in CLAIM_ROWS:
-            continue
-        key = (e.get("name"), e.get("note"))
-        if kind == "claim-end":
-            out.pop(key, None)
-        elif kind == "claim":
-            rec = record(key)
-            rec["claim"] = e
-        elif kind == "claim-release":
-            rec = record(key)
-            rec["released"] = sorted(set(rec["released"]) | set(e.get("workloads") or []))
-            rec["freed_mib"] = (rec.get("freed_mib") or 0) + (e.get("freed_mib") or 0)
-        else:                                       # claim-release-waiting
-            rec = record(key)
-            rec["waiting"] = sorted(set(rec["waiting"]) | ({e["workload"]} if e.get("workload") else set()))
-    return out
-
-
 def claim_transitions(arbiter, hits: list[dict]) -> None:
     """Record a `claim` / `claim-end` row as the set of claims changes, and for a claim that
     wants the card (`on_start: release`) ask the workloads to let go of what they hold.
@@ -261,7 +223,7 @@ def claim_transitions(arbiter, hits: list[dict]) -> None:
     what keeps `watch` and the dashboard from each doing the same thing twice."""
     events = arbiter.events
     now = _groups(h for h in hits)
-    was = open_claims(events)
+    was = events.claims_open()
     for key, group in now.items():
         if key in was:
             continue
@@ -280,7 +242,7 @@ def claim_transitions(arbiter, hits: list[dict]) -> None:
         events.record("claim-end", source="watch", pid=row.get("pid"), name=key[0], note=key[1],
                       processes=n)
         util.log(f"{key[0]}" + (f" x{n}" if n > 1 else "") + " is gone: the card is open to loads again")
-    state = open_claims(events)             # ours are in the record now
+    state = events.claims_open()             # ours are in the record now
     for key, group in now.items():
         if (group[0].get("on_start") or "release") != "release":
             continue                        # `block`: the loads are the lever, as before
@@ -310,7 +272,7 @@ def release_for(arbiter, key: tuple, rec: dict) -> None:
         util.log(f"{key[0]} ({key[1]}) freed the card: " +
                  ", ".join(f"{label(n)} {r['freed_mib']} MiB" for n, r in
                            zip(names, out["released"])) + " unloaded, nothing closed")
-    already = set(rec.get("waiting") or [])
+    already = {w["workload"] for w in rec.get("waiting") or []}
     waiting = ([{"workload": n, "why": out["declined"]} for n in out.get("would", []) if n in pending]
                if out["declined"] else out["waiting"])
     for w in waiting:

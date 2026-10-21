@@ -344,8 +344,10 @@ it is a report and not a gate. `--json` gives the same per workload
 **Next handover** card.
 
 **Claims: a game owns the card.** `vhotseat claims` prints what the rules match right
-now and the rules themselves; the same scan runs inside every gate and guard decision,
-so nothing resident is needed for the rule to hold (docs/how-it-works.md §3.7).
+now, the rules themselves and what each one does when it appears, and - while a claim is
+open - what has already been unloaded for it and what is still holding and why. The same
+scan runs inside every gate and guard decision, so nothing resident is needed for the
+rule to hold (docs/how-it-works.md §3.7).
 
 ```yaml
 claims_builtin: true        # the built-in rules for the usual installations (default true)

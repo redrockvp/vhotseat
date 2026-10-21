@@ -89,8 +89,14 @@ class Arbiter:
         mode = "conflict" if len(active) > 1 else active[0] if active else NONE
         ram = self.machine_ram()
         ram.update({n: w.memory() for n, w in self.workloads.items()})
-        status = {"mode": mode, **states, "gpu": gpu, "holders": held, "claims": self._claims_in(held),
+        hits = self._claims_in(held)
+        status = {"mode": mode, **states, "gpu": gpu, "holders": held, "claims": hits,
                   "ram": ram, "last_event": self.events.last()}
+        if hits:
+            # And what has been done about it: what this claim has already been given, and what
+            # is still holding. Read back from the event log, so it costs nothing when nothing
+            # claims the card and survives whichever process did the releasing.
+            status["claims_state"] = self.events.claims_open()
         if self.telemetry is not None:
             self.telemetry.sample(status, self.gpu_health)
         return status
@@ -108,8 +114,22 @@ class Arbiter:
                               for r in rows[:5])
             lines.append(f"{'holds:':<{width}}{shown}")
         if hits := s.get("claims"):
-            lines.append(f"{'claims:':<{width}}the card is claimed by {claims.describe(hits)}: nothing new "
-                         "loads while it runs")
+            free = any(h.get("on_start", "release") == "release" for h in hits)
+            lines.append(f"{'claims:':<{width}}the card is claimed by {claims.describe(hits)}: "
+                         + ("unloading what is loaded to free it, and nothing new loads while it "
+                            "runs" if free else "nothing new loads while it runs"))
+            hit_keys = {(h["name"], h["note"]) for h in hits}
+            for key, rec in sorted((s.get("claims_state") or {}).items()):
+                if key not in hit_keys:
+                    continue
+                bits = []
+                if rec["released"]:
+                    bits.append("unloaded " + ", ".join(rec["released"])
+                                + (f" ({rec['freed_mib']} MiB)" if rec.get("freed_mib") else ""))
+                for w in rec["waiting"]:
+                    bits.append(f"{w['workload']} keeps its model: {w['why']}")
+                if bits:
+                    lines.append(f"{'freed for:':<{width}}{key[0]} ({key[1]}) - " + "; ".join(bits))
         lines.append(f"{'ram:':<{width}}" + self._describe_ram(s["ram"]))
         if ev := s.get("last_event"):
             detail = ", ".join(f"{k}={v}" for k, v in ev.items() if k not in ("time", "event"))
