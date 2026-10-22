@@ -8,7 +8,7 @@ Validated when loaded: a mistake is reported with its key path, and nothing runs
 import os
 from pathlib import Path
 
-from . import policy
+from . import policy, pressure
 from .drivers.base import Context, Workload
 from .drivers.comfyui import ComfyUI
 from .drivers.http import HttpWorkload
@@ -74,7 +74,7 @@ def _rules(rules, where: str):
 def validate(raw) -> dict:
     _check(isinstance(raw, dict), "config", "expected a mapping at the top level")
     unknown = set(raw) - {"gpu", "workloads", "events", "telemetry", "power", "claims",
-                          "claims_builtin", "claims_ignore", "claims_poll_s", "patches"}
+                          "claims_builtin", "claims_ignore", "claims_poll_s", "pressure", "patches"}
     _check(not unknown, "config", f"unknown key(s): {', '.join(sorted(unknown))}")
     gpu = raw.get("gpu") or {}
     _check(isinstance(gpu, dict), "gpu", "expected a mapping")
@@ -115,6 +115,26 @@ def validate(raw) -> dict:
            "expected a list of exe names or path globs, e.g. [wallpaper64.exe]")
     for i, s in enumerate(ci):
         _check(isinstance(s, str) and s.strip(), f"claims_ignore[{i}]",
+               "expected a non-empty string (an exe name or a path glob)")
+    pr = raw.get("pressure") or {}
+    _check(isinstance(pr, dict), "pressure", "expected a mapping (see the pressure keys in the docs)")
+    unknown = set(pr) - set(pressure.KEYS)
+    _check(not unknown, "pressure", f"unknown key(s): {', '.join(sorted(unknown))}")
+    _check(isinstance(pr.get("enabled", True), bool), "pressure.enabled",
+           "expected true or false: whether vhotseat may release models when an app it doesn't "
+           "manage takes the card")
+    for k in ("min_free_mib", "grow_mib", "headroom_mib", "end_margin_mib"):
+        _int(pr, k, "pressure")
+    for k in ("sustain_s", "cooldown_s"):
+        if k in pr:
+            v = pr[k]
+            _check(isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0,
+                   f"pressure.{k}", f"expected a number of seconds ≥ 0, got {v!r}")
+    pi = pr.get("ignore") or []
+    _check(isinstance(pi, list), "pressure.ignore",
+           "expected a list of exe names or path globs, e.g. [vmware-vmx.exe]")
+    for i, s in enumerate(pi):
+        _check(isinstance(s, str) and s.strip(), f"pressure.ignore[{i}]",
                "expected a non-empty string (an exe name or a path glob)")
     cl = raw.get("claims") or []
     _check(isinstance(cl, list), "claims", "expected a list of {name, path, parent, note} rules")

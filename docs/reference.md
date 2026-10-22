@@ -452,6 +452,66 @@ in the event log (which the dashboard shows as a warning until it goes stale), a
 named as `kept for its policy:` in `vhotseat claims` and `vhotseat status`, next to what the claim
 was given.
 
+**Pressure: an app vhotseat doesn't manage takes the card.** A game names itself, and the claim
+rules say what to do with it. A Blender render, a CUDA script, or a browser that decides to use the
+GPU for something large does not: no rule covers it, nobody asked for the card, and the card is
+short anyway. Pressure is how vhotseat notices that and answers with the only lever it has -
+releasing workloads that are idle. It needs a sampler running to say "has been short for 30 s", so
+it works when `vhotseat watch`, `vhotseat web` or `vhotseat record` is (which is what `vhotseat
+autostart install` starts); without samples, nothing fires.
+
+```yaml
+pressure:
+  enabled: true              # false: never release for an app vhotseat doesn't manage
+  min_free_mib: 512          # the card is out of working room below this...
+  sustain_s: 30              # ...and has been for this long (6 samples at 5 s)...
+  grow_mib: 2000             # ...and the memory vhotseat doesn't manage is this far over its floor
+  headroom_mib: 1000         # release enough to get back to min_free plus this
+  end_margin_mib: 2000       # the episode ends once free is back above min_free plus this
+  cooldown_s: 600            # and the next episode starts no sooner than this after the last
+  ignore: [vmware-vmx.exe]   # names or path globs that are never growers: a VM, a benchmark, a miner
+```
+
+All of it is on by default, and every number is deliberately wide, because a wrong firing costs
+unloading ~20 GB, reloading it, and possibly a server restart. They come off a read-only
+measurement of this box (2026-10-22, 87 samples over 175 s with the current apps open: Strata
+loaded with a 21394 MiB model, ComfyUI down, browser, Orca and Discord open): the card sat at
+**779-958 MiB free** all through it, and the processes vhotseat doesn't manage held
+**3096-3269 MiB** - dwm 1370, firefox 372, explorer 362, Discord 211, Orca ~186 - varying by
+**173 MiB** in three minutes. So `min_free_mib: 512` is under this machine's ordinary bottom,
+which means "low" is a change rather than the state of a card with a model on it; `grow_mib: 2000`
+is ten times that jitter. `sustain_s: 30` is six samples, so a single spike - a tab opening, a
+video seeking - is not pressure. `end_margin_mib` is wider than the trigger on purpose: an
+episode that ends at the same line it started at restarts itself forever, and a 24 GB card with a
+21 GB model has under 1 GB of slack to oscillate in, so the design is few, large, deliberate
+evictions rather than continuous trimming. The floor is the median the telemetry recorded, the same
+number the **Fits alongside** tiles use, so the trigger never goes hunting for memory that was never
+there (a game's memory last evening is not a floor: it came back when the game closed).
+
+What pressure never does: **refuse a load** - growth by a process nobody manages justifies releasing
+idle workloads, never saying no to something you typed, or to a queue that asks; **chase a model you
+load afterwards** - the workloads an episode is owed are decided once, at its start, and recorded;
+touch a workload with work in flight, which is skipped and retried while the episode lasts; and
+unload anything for a process named in `ignore:`. A workload whose `yields_to:` doesn't list
+`pressure` is not a candidate either, which is how you keep one server out of it: Strata with
+`yields_to: [comfy, claims]` keeps its model however big a render gets. `pressure.enabled: false`
+switches the whole thing off.
+
+**Shared GPU memory is evidence, not a trigger.** On Windows each process reports two GPU memory
+figures: dedicated (what is on the card) and shared (system RAM the card borrows once it runs out -
+Task Manager's "shared GPU memory"). Only dedicated is what the trigger reads. Measured on this box
+in the same window: 37 processes reporting **51.8 GiB** of shared GPU memory between them, 50.9 GiB
+of it Strata, while the card was merely full. Shared usage goes into the episode's row as evidence
+that the card was oversubscribed at that moment, which is a different fact with a different answer.
+
+Both `vhotseat watch` and the dashboard's watcher run the check, and both act on it; they coordinate
+through the GPU lock and the event log, the same way claim releases do, so whichever gets there
+first does it and the other declines quietly. The episode is one `pressure` row - who grew, by how
+much, over how long, what the card was doing, what was decided - then `pressure-release` and
+`pressure-release-waiting` rows, and one `pressure-end` row when the room is back or the grower is
+gone. `vhotseat status`, `vhotseat why` and the dashboard read the episode from those rows, so they
+say the same thing whichever process is asked.
+
 **Fits alongside.** The dashboard's policy panel answers the question the owner actually has:
 can these two run at the same time? It is arithmetic on what the card has been *seen* doing:
 each workload at the most the telemetry recorded it holding - a workload costs what its biggest
