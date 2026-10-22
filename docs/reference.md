@@ -474,7 +474,7 @@ pressure:
 
 All of it is on by default, and every number is deliberately wide, because a wrong firing costs
 unloading ~20 GB, reloading it, and possibly a server restart. They come off a read-only
-measurement of this box (2026-10-22, 87 samples over 175 s with the current apps open: Strata
+measurement of this box (2026-10-22, 99 samples over ~200 s with the current apps open: Strata
 loaded with a 21394 MiB model, ComfyUI down, browser, Orca and Discord open): the card sat at
 **779-958 MiB free** all through it, and the processes vhotseat doesn't manage held
 **3096-3269 MiB** - dwm 1370, firefox 372, explorer 362, Discord 211, Orca ~186 - varying by
@@ -500,7 +500,7 @@ switches the whole thing off.
 **Shared GPU memory is evidence, not a trigger.** On Windows each process reports two GPU memory
 figures: dedicated (what is on the card) and shared (system RAM the card borrows once it runs out -
 Task Manager's "shared GPU memory"). Only dedicated is what the trigger reads. Measured on this box
-in the same window: 37 processes reporting **51.8 GiB** of shared GPU memory between them, 50.9 GiB
+in the same window: 37 processes reporting **51.0 GiB** of shared GPU memory between them, 50.9 GiB
 of it Strata, while the card was merely full. Shared usage goes into the episode's row as evidence
 that the card was oversubscribed at that moment, which is a different fact with a different answer.
 The card-wide total is kept in the samples too (`vram_shared`), and the dashboard's VRAM card shows it

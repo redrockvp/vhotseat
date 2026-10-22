@@ -32,14 +32,14 @@ it closed, is not counted as a permanent floor either.
 
 Shared GPU memory (system RAM the card borrows when it runs out) is recorded as evidence that the
 card was oversubscribed at that moment. It is never a trigger: on this box 37 processes report
-51.8 GiB of it between them - 50.9 GiB of it Strata - while the card is simply full.
+51.0 GiB of it between them - 50.9 GiB of it Strata - while the card is simply full.
 """
 
 import fnmatch
 import os
 
 DEFAULTS = {
-    # Measured on this box 2026-10-22 (87 samples over 175 s: Strata loaded with a 21394 MiB model,
+    # Measured on this box 2026-10-22 (99 samples over ~200 s: Strata loaded with a 21394 MiB model,
     # ComfyUI down, browser/Orca/Discord open). free 779-958 MiB; non-workload dedicated
     # 3096-3269 MiB (dwm 1370, firefox 372, explorer 362, Discord 211, Orca ~186). The defaults are
     # deliberately slow to anger: a false positive costs an unload and reload of a ~20 GB model.

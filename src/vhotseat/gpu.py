@@ -380,7 +380,10 @@ class Backend:
                      "other_mib": 0, "error": str(e)}, [])
         summary, rows = classify(total, free, procs, selectors, self.procinfo)
         rows.sort(key=lambda r: -r["mib"])
-        return summary, rows[:limit]
+        # 0 means "every process", not "no processes": the caller that wants the whole list is
+        # looking for the app that grew, which a workload running several processes can push out of
+        # the biggest eight. A slice would answer that caller with nothing.
+        return summary, (rows[:limit] if limit > 0 else rows)
 
     def health(self) -> dict:
         """Model, load, temperature and power, for the dashboard; {} if the backend can't say."""

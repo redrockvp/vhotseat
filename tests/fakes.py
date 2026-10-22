@@ -411,7 +411,8 @@ class FakeGpu:
         rows.extend({"pid": e["pid"], "mib": e["mib"], "name": e["name"], "workload": None}
                     for e in self.extra)
         rows.sort(key=lambda r: -r["mib"])
-        return snap, rows[:limit] if limit else rows
+        # the same rule the real backend uses: 0 is "every process", not "no processes"
+        return snap, (rows[:limit] if limit > 0 else rows)
 
 
 class _FakeService:

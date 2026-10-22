@@ -270,3 +270,19 @@ def test_autostart_status_says_when_nothing_is_registered(tmp_path, capsys):
     calls, run = _spy()
     assert autostart.status(at="systemd", run=run, units=tmp_path) == 1
     assert "not registered" in capsys.readouterr().out
+
+
+def test_a_limit_of_zero_asks_for_every_process_not_for_none():
+    """`limit=0` is what the arbiter passes when it wants the whole process list: the app that grew
+    is not necessarily among the eight biggest holders, since a workload running several processes
+    can fill that list on its own. The real backend sliced, and `rows[:0]` is empty, while the fake
+    GPU read 0 as "no limit" - so the suite passed while the real box returned no processes at all,
+    `status` lost its `holds:` line, and the pressure trigger could never find a grower. A fake that
+    is friendlier than the thing it stands in for hides exactly this class of bug."""
+    procs = [(1, 500, "gimp.exe"), (2, 20000, "strata.exe"), (3, 900, "blender.exe")]
+    b = gpu.Backend(_Reader(procs), procinfo=lambda pid: ("", ""))
+    _, every = b.read_all({"strata": ("process", "strata.exe")}, limit=0)
+    assert [r["name"] for r in every] == ["strata.exe", "blender.exe", "gimp.exe"]
+    _, top2 = b.read_all({"strata": ("process", "strata.exe")}, limit=2)
+    assert [r["name"] for r in top2] == ["strata.exe", "blender.exe"]
+    assert sum(r["mib"] for r in every) == 21400, "the sums and the rows come from one read"
