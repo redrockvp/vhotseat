@@ -12,6 +12,7 @@ their `on_start` the way they do on a machine with a game running.
 
 import contextlib
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -294,6 +295,18 @@ def test_status_shows_what_a_claim_was_given(rig, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "claims:" in out and "unloading what is loaded to free it" in out
     assert "freed for:" in out and f"unloaded strata ({STRATA_VRAM} MiB)" in out
+
+
+def test_a_status_label_is_never_glued_to_what_it_labels(rig, monkeypatch, capsys):
+    """The column is as wide as the longest workload name, and `freed for:` is longer than
+    most of them: with short names the label ran into the process behind it -
+    `freed for:EldenRing.exe` - on the one line that says what the claim was given."""
+    claim_rule(rig, monkeypatch)
+    rig.strata.loaded = True
+    web.watch(rig.arb, polls=1)
+    assert rig.cli("status") == 0
+    out = capsys.readouterr().out
+    assert re.search(r"freed for:\s+\S", out), out
 
 
 def test_a_model_loaded_during_a_claim_is_left_alone(rig, monkeypatch):

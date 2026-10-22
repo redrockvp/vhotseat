@@ -158,22 +158,30 @@ class Arbiter:
     def describe(self, s: dict) -> str:
         g = s["gpu"]
         width = max(len(n) for n in [*self.workloads, "mode"]) + 2
-        lines = [f"{'mode:':<{width}}{s['mode']}"]
-        lines += [f"{n + ':':<{width}}{w.describe(s[n])}" for n, w in self.workloads.items()]
+
+        def pad(label: str) -> str:
+            """A column label, padded to the column - and never narrower than itself. The
+            column is a workload name wide, and `freed for:` is longer than most: the label
+            used to run into the process behind it, on the one line that says what a claim
+            was given."""
+            return f"{label:<{max(width, len(label) + 1)}}"
+
+        lines = [f"{pad('mode:')}{s['mode']}"]
+        lines += [f"{pad(n + ':')}{w.describe(s[n])}" for n, w in self.workloads.items()]
         # Who will make room for whom, and in what order: the two keys are the owner's, and
         # a refusal that doesn't name them is unfixable from the outside.
-        lines.append(f"{'policy:':<{width}}" + "; ".join(
+        lines.append(f"{pad('policy:')}" + "; ".join(
             f"{n} {w.priority} ({policy.describe(w.yields_to)})" for n, w in self.workloads.items()))
         shares = ", ".join(f"{n} {g[f'{n}_mib']}" for n in self.workloads)
-        lines.append(f"{'gpu:':<{width}}" + (g["error"] if "error" in g else
+        lines.append(f"{pad('gpu:')}" + (g["error"] if "error" in g else
                      f"{g['free_mib']} of {g['total_mib']} MiB free ({shares}, other {g['other_mib']})"))
         if rows := s.get("holders"):
             shown = "  ".join(f"{r['name'] or r['pid']} {r['mib']}" + (f" ({r['workload']})" if r["workload"] else "")
                               for r in rows[:5])
-            lines.append(f"{'holds:':<{width}}{shown}")
+            lines.append(f"{pad('holds:')}{shown}")
         if hits := s.get("claims"):
             free = any(h.get("on_start", "release") == "release" for h in hits)
-            lines.append(f"{'claims:':<{width}}the card is claimed by {claims.describe(hits)}: "
+            lines.append(f"{pad('claims:')}the card is claimed by {claims.describe(hits)}: "
                          + ("unloading what is loaded to free it, and nothing new loads while it "
                             "runs" if free else "nothing new loads while it runs"))
             hit_keys = {(h["name"], h["note"]) for h in hits}
@@ -189,11 +197,11 @@ class Arbiter:
                 if kept := rec.get("kept"):
                     bits.append("kept for its policy: " + ", ".join(kept))
                 if bits:
-                    lines.append(f"{'freed for:':<{width}}{key[0]} ({key[1]}) - " + "; ".join(bits))
-        lines.append(f"{'ram:':<{width}}" + self._describe_ram(s["ram"]))
+                    lines.append(f"{pad('freed for:')}{key[0]} ({key[1]}) - " + "; ".join(bits))
+        lines.append(f"{pad('ram:')}" + self._describe_ram(s["ram"]))
         if ev := s.get("last_event"):
             detail = ", ".join(f"{k}={v}" for k, v in ev.items() if k not in ("time", "event"))
-            lines.append(f"{'last:':<{width}}{ev['time']} {ev['event']}" + (f" ({detail})" if detail else ""))
+            lines.append(f"{pad('last:')}{ev['time']} {ev['event']}" + (f" ({detail})" if detail else ""))
         return "\n".join(lines)
 
     def _describe_ram(self, r: dict) -> str:
