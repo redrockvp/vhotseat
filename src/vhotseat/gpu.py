@@ -3,19 +3,110 @@
 A backend reads the card's totals and its compute processes (pid, MiB). Each
 process is then attributed to a workload by its systemd unit (the cgroup it
 runs in) or by a substring of its command line; the rest is "other".
+
+On Windows (WDDM) the driver reports no per-process VRAM: NVML and nvidia-smi
+say N/A. The same figure Task Manager shows comes from the GPU performance
+counters instead (`\\GPU Process Memory(*)\\Dedicated Usage`), filled in for
+each of the card's processes. There are no cgroups there; a process is matched
+by its executable's path plus its command line.
 """
 
 import ctypes
+import os
+import re
 import subprocess
 from pathlib import Path
+
+from . import host
 
 
 class GpuError(Exception):
     pass
 
 
+def _read_proc_windows(pid: int) -> tuple[str, str]:
+    """("", executable path + command line) of a process, empty if it's gone or
+    not ours to read."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    ntdll = ctypes.WinDLL("ntdll")
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return "", ""
+    h = ctypes.c_void_p(h)
+    try:
+        image = ctypes.create_unicode_buffer(1024)
+        n = ctypes.c_ulong(1024)
+        exe = image.value if k32.QueryFullProcessImageNameW(h, 0, image, ctypes.byref(n)) else ""
+        size = ctypes.c_ulong(0)
+        ntdll.NtQueryInformationProcess(h, 60, None, 0, ctypes.byref(size))  # ProcessCommandLineInformation
+        cmd = ""
+        if size.value:
+            buf = ctypes.create_string_buffer(size.value)
+            if ntdll.NtQueryInformationProcess(h, 60, buf, size, ctypes.byref(size)) == 0:
+                length = ctypes.c_ushort.from_buffer(buf).value   # UNICODE_STRING.Length, in bytes
+                ptr = ctypes.c_void_p.from_buffer(buf, 8).value     # .Buffer, after 4 bytes of padding
+                cmd = ctypes.wstring_at(ptr, length // 2) if ptr else ""
+        return "", f"{exe} {cmd}".strip()
+    finally:
+        k32.CloseHandle(h)
+
+
+def process_names() -> dict[int, str]:
+    """Windows: pid -> exe name for every process, from a Toolhelp snapshot.
+
+    Unlike OpenProcess, a snapshot needs no handle, so it still names processes this
+    process cannot open - an elevated workload, for example, whose path and command
+    line are unreadable and whose VRAM would otherwise be unattributable. host.processes()
+    is the same snapshot with parents and image paths, for claims and for `status`."""
+    return {pid: p["name"] for pid, p in host.processes().items() if p["name"]}
+
+
+class _PdhItem(ctypes.Structure):  # PDH_FMT_COUNTERVALUE_ITEM_W with a LONGLONG value
+    _fields_ = [("name", ctypes.c_wchar_p), ("status", ctypes.c_ulong), ("value", ctypes.c_longlong)]
+
+
+PDH_MORE_DATA = 0x800007D2
+PDH_FMT_LARGE = 0x400
+_INSTANCE = re.compile(r"pid_(\d+)_luid_")
+
+
+def wddm_process_vram() -> dict[int, int]:
+    """Windows: dedicated VRAM per pid (MiB), from the GPU performance counters,
+    summed over the process's adapters. Raises GpuError if they can't be read.
+    Meant for a single NVIDIA card: with several, a process's VRAM on each is added up."""
+    pdh = ctypes.WinDLL("pdh")
+    query, counter = ctypes.c_void_p(), ctypes.c_void_p()
+    if pdh.PdhOpenQueryW(None, None, ctypes.byref(query)) != 0:
+        raise GpuError("PDH: can't open a query")
+    try:
+        rc = pdh.PdhAddEnglishCounterW(query, r"\GPU Process Memory(*)\Dedicated Usage", None,
+                                       ctypes.byref(counter))
+        if rc != 0:
+            raise GpuError(f"PDH: no GPU Process Memory counters (0x{rc & 0xFFFFFFFF:08X})")
+        if (rc := pdh.PdhCollectQueryData(query)) != 0:
+            raise GpuError(f"PDH: collecting failed (0x{rc & 0xFFFFFFFF:08X})")
+        size, count = ctypes.c_ulong(0), ctypes.c_ulong(0)
+        rc = pdh.PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, ctypes.byref(size), ctypes.byref(count), None)
+        if rc & 0xFFFFFFFF != PDH_MORE_DATA:
+            raise GpuError(f"PDH: reading failed (0x{rc & 0xFFFFFFFF:08X})")
+        buf = ctypes.create_string_buffer(size.value)
+        rc = pdh.PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, ctypes.byref(size), ctypes.byref(count), buf)
+        if rc != 0:
+            raise GpuError(f"PDH: reading failed (0x{rc & 0xFFFFFFFF:08X})")
+        out: dict[int, int] = {}
+        for item in (_PdhItem * count.value).from_buffer(buf):
+            if (m := _INSTANCE.match(item.name or "")) and item.status in (0, 1):  # PDH_CSTATUS_VALID/NEW_DATA
+                out[int(m.group(1))] = out.get(int(m.group(1)), 0) + item.value
+        return {pid: b // 2**20 for pid, b in out.items()}
+    finally:
+        pdh.PdhCloseQuery(query)
+
+
 def read_proc(pid: int) -> tuple[str, str]:
     """(cgroup path, command line) of a process, empty strings if it's gone."""
+    if os.name == "nt":
+        return _read_proc_windows(pid)
     try:
         cgroup = Path(f"/proc/{pid}/cgroup").read_text().split("::", 1)[-1].strip()
     except OSError:
@@ -27,25 +118,42 @@ def read_proc(pid: int) -> tuple[str, str]:
     return cgroup, cmd
 
 
-def attribute(total: int, free: int, procs: list[tuple[int, int | None, str]],
-              selectors: dict[str, tuple[str, str] | None], procinfo=read_proc) -> dict:
-    """Snapshot keyed "<workload>_mib", plus total_mib, free_mib, other_mib.
+def classify(total: int, free: int, procs: list[tuple[int, int | None, str]],
+             selectors: dict[str, tuple[str, str] | None], procinfo=read_proc) -> tuple[dict, list]:
+    """(the attribution summary, and one row per process holding memory).
 
     selectors: workload -> ("unit", "comfyui.service") or ("process", "ComfyUI/main.py").
-    procs: (pid, MiB or None if the driver can't say, name nvidia-smi reports)."""
+    procs: (pid, MiB or None if the driver can't say, name the GPU reader reports)."""
     out = {"total_mib": total, "free_mib": free, **{f"{n}_mib": 0 for n in selectors}, "other_mib": 0}
+    rows = []
     for pid, mib, name in procs:
         if mib is None:
             continue
         cgroup, cmd = procinfo(pid)
         units = cgroup.split("/")
-        key = "other_mib"
+        key, owner = "other_mib", None
         for n, sel in selectors.items():
             if sel and ((sel[0] == "unit" and sel[1] in units) or (sel[0] == "process" and sel[1] in (cmd or name))):
-                key = f"{n}_mib"
+                key, owner = f"{n}_mib", n
                 break
         out[key] += mib
-    return out
+        rows.append({"pid": pid, "mib": mib, "name": name, "workload": owner})
+    return out, rows
+
+
+def attribute(total: int, free: int, procs: list[tuple[int, int | None, str]],
+              selectors: dict[str, tuple[str, str] | None], procinfo=read_proc) -> dict:
+    """Snapshot keyed "<workload>_mib", plus total_mib, free_mib, other_mib."""
+    return classify(total, free, procs, selectors, procinfo)[0]
+
+
+def holders(total: int, free: int, procs: list[tuple[int, int | None, str]],
+            selectors: dict[str, tuple[str, str] | None], procinfo=read_proc, limit: int = 0) -> list[dict]:
+    """Who holds the card, biggest first: pid, MiB, process name, and the workload it is
+    attributed to (None for processes nothing manages - a desktop, a game, an app)."""
+    rows = classify(total, free, procs, selectors, procinfo)[1]
+    rows.sort(key=lambda r: -r["mib"])
+    return rows[:limit] if limit else rows
 
 
 class NvidiaSmi:
@@ -120,7 +228,7 @@ class Nvml:
 
     def __init__(self, index: int = 0):
         try:
-            self.lib = ctypes.CDLL("libnvidia-ml.so.1")
+            self.lib = ctypes.CDLL("nvml.dll" if os.name == "nt" else "libnvidia-ml.so.1")
         except OSError as e:
             raise GpuError(f"NVML not available: {e}") from None
         self._check(self.lib.nvmlInit_v2(), "nvmlInit")
@@ -181,6 +289,32 @@ class Nvml:
         return mem.total // 2**20, mem.free // 2**20, procs
 
 
+class WddmVram:
+    """Wraps a reader on Windows: the processes it lists with no VRAM figure (all of
+    them, under WDDM) get the one from the GPU performance counters, and the ones it
+    lists with no name (all of them, under NVML) get the one from a process snapshot."""
+
+    def __init__(self, reader, per_pid=wddm_process_vram, names=process_names):
+        self.reader = reader
+        self.name = reader.name
+        self.per_pid = per_pid
+        self.names = names
+
+    def health(self) -> dict:
+        return self.reader.health()
+
+    def read(self) -> tuple[int, int, list]:
+        total, free, procs = self.reader.read()
+        vram = None if all(mib is not None for _, mib, _ in procs) else self.per_pid()
+        names = self.names() if any(not name for _, _, name in procs) else {}
+        out = []
+        for pid, mib, name in procs:
+            if mib is None and vram is not None:
+                mib = vram.get(pid)
+            out.append((pid, mib, name or names.get(pid, "")))
+        return total, free, out
+
+
 class Backend:
     """A GPU backend plus attribution: what the arbiter calls."""
 
@@ -197,6 +331,18 @@ class Backend:
                     "other_mib": 0, "error": str(e)}
         return attribute(total, free, procs, selectors, self.procinfo)
 
+    def read_all(self, selectors: dict, limit: int = 8) -> tuple[dict, list]:
+        """The attribution sums and the named processes behind them, from one read:
+        when `other_mib` is big, what to look at is usually a name, not a number."""
+        try:
+            total, free, procs = self.reader.read()
+        except GpuError as e:
+            return ({"total_mib": None, "free_mib": None, **{f"{n}_mib": 0 for n in selectors},
+                     "other_mib": 0, "error": str(e)}, [])
+        summary, rows = classify(total, free, procs, selectors, self.procinfo)
+        rows.sort(key=lambda r: -r["mib"])
+        return summary, rows[:limit]
+
     def health(self) -> dict:
         """Model, load, temperature and power, for the dashboard; {} if the backend can't say."""
         try:
@@ -207,10 +353,11 @@ class Backend:
 
 def open_backend(kind: str = "auto", index: int = 0) -> Backend:
     """nvml, nvidia-smi, or auto (NVML, falling back to nvidia-smi)."""
+    wrap = WddmVram if os.name == "nt" else (lambda r: r)
     if kind in ("auto", "nvml"):
         try:
-            return Backend(Nvml(index))
+            return Backend(wrap(Nvml(index)))
         except GpuError:
             if kind == "nvml":
                 raise
-    return Backend(NvidiaSmi(index))
+    return Backend(wrap(NvidiaSmi(index)))

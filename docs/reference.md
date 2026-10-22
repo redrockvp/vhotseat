@@ -16,10 +16,18 @@ vhotseat doctor [--json]                        check the config, the GPU, every
 vhotseat doctor --exercise NAME [--wait S]      run a real cycle on NAME, timed
 vhotseat web [--host H] [--port P]              dashboard: RAM and VRAM over time, handovers, events, logs
 vhotseat record                                 sample RAM and VRAM into the telemetry until stopped
+vhotseat autostart install [--command web|record]  keep the dashboard (or the recorder) up from logon
+vhotseat autostart status | remove              is it registered? · take it back out
+vhotseat cost [--since 24h] [--json]            what the card's power has cost (needs power.price_per_kwh)
+vhotseat why [NAME] [--json]                    why a workload can or can't take the GPU now: a dry run of the handover
+vhotseat claims [--json]                        what owns the card by right (a game), and what matches now
+vhotseat watch                                  log when a claim starts and ends, and sample, until stopped
 ```
 
-Exit codes: `0` ok · `1` switch failed or gate refused · `2` usage or bad
-config. `hold` exits with COMMAND's own exit code once COMMAND has started.
+Exit codes: `0` ok · `1` switch failed, gate refused, or `autostart status` with
+nothing registered · `2` usage or bad config. `hold` exits with COMMAND's own
+exit code once COMMAND has started. `why` and `claims` are reports: they exit `0`
+whatever they find, including a card somebody else owns.
 
 **Modes.** `status` reports the owner, derived live from each workload's API
 and the GPU's per-process memory; there is no state file to drift. The mode is
@@ -71,6 +79,11 @@ and [guides/proxy-gate.md](guides/proxy-gate.md).
 Releasing the others always happens. Admission decides whether that's enough
 for the incoming workload to load safely:
 
+A floor is what a model needs *room to load into*, so it is never applied to a workload
+whose weights are already on the card: its own memory doesn't count against it. Without
+that, a second request reaching a server while the first one's weights are still streaming
+in reads that 20 GB as the blocker, and refuses the load that put it there.
+
 ```yaml
 admission:
   min_available_ram_mib: 46000   # MemAvailable: free RAM plus cache the kernel can drop
@@ -89,6 +102,61 @@ the load is refused and the event log says what was short.
 A ComfyUI restart wipes its `/history`, so it only happens with an empty queue,
 and once the latest result is at least 10 s old (`history_settle_s`), so
 clients reading results have had time to.
+
+## Talking to a server that isn't a plain server
+
+Two things a URL doesn't cover:
+
+- **A key.** `headers:` are sent with every request vhotseat makes to that workload:
+
+  ```yaml
+  headers: {Authorization: "Bearer ${UNSLOTH_KEY}"}
+  ```
+
+  `$NAME` and `${NAME}` read the environment, because a key doesn't belong in a config file
+  that gets pasted into terminals and committed. If the name isn't in the environment,
+  nothing is invented for it: `status` says *asks for a key it isn't being sent (401)* and
+  `doctor` fails naming the variable. A 401 is reported as **answering and refusing**, never
+  as *not answering*: blurred together, a key that rotated looks like a server that's down,
+  and every handover starts looking for a dead port.
+- **A named unload.** Some servers release one model at a time and want its id in a body.
+  `body:` provides it, with `{model}` filled from what `model:` says is served and `{wait}`
+  from the release's wait:
+
+  ```yaml
+  release:
+    post: /api/inference/unload
+    body: {model_path: "{model}"}
+  ```
+
+  With nothing loaded there's no id to send, and an empty one is either a 422 or a success
+  that did nothing: the ask is skipped and logged (`no model loaded: nothing to release`).
+  If the workload says something *is* loaded and `model:` can't name it, the release fails
+  and names the key to fix, rather than reporting success over a model that stayed on the
+  card.
+
+- **A sizing question.** `estimate:` asks the server what one of its models would cost on
+  the card, at a context you name:
+
+  ```yaml
+  estimate:
+    from: {get: /settings/last-model}
+    post: /estimate-memory
+    body: {model_path: "{id}", gguf_variant: "{gguf_variant}", n_ctx: "{ctx}"}
+    ctx: 32768
+    path: gpu_bytes
+  ```
+
+  `from:` reads the response that names the model and its fields fill the body; a
+  placeholder with nothing behind it drops its key rather than sending the placeholder text.
+  The answer is **reported, never enforced**: `status` says *X sizes at 19865 MiB* and `why`
+  adds *more than the card's 24576 MiB: only part of it can be resident*. A server can fit a
+  model by shrinking its context or spilling into RAM, and refusing on the number would be
+  vhotseat holding an opinion about a trade its owner is making.
+
+A workload with nothing inside it that can ask for the GPU - no hook, no plugin - is
+declared `gate: {kind: hold}`: it is guarded only while it runs under `vhotseat hold`, so
+the habit is to take the card for it (`vhotseat switch NAME`) before loading anything there.
 
 ## The ComfyUI guard
 
@@ -171,9 +239,10 @@ cancelled some job (wins over `1` and `3`: ask them why before re-running). On
 a timeout the unfinished jobs are left in ComfyUI's queue.
 
 - `--url`, else `$COMFY_URL`, else `http://127.0.0.1:8188`.
-- `--comfy-dir`, else `$COMFY_DIR`, else the folder ComfyUI reports for its
-  models: used to print saved files as absolute paths. Without it, paths are
-  relative to ComfyUI's folder (`output/…`).
+- `--comfy-dir`, else `$COMFY_DIR`, else ComfyUI's own folder, read from its
+  `custom_nodes` path (a model folder alone can be an `extra_model_paths.yaml`
+  collection on another drive): used to print saved files as absolute paths.
+  Without it, paths are relative to ComfyUI's folder (`output/…`).
 - `--hold [NAME]` runs the batch under `vhotseat hold NAME` (default `comfy`),
   so even unrelated traffic, another conversation say, can't take the GPU back
   between two jobs. `--hold-wait` is how long to wait for the current owner's
@@ -188,8 +257,14 @@ vhotseat web                 # http://localhost:8765/ ; --host 0.0.0.0 to reach 
 One page, refreshed every 5 s, that works on a phone too:
 
 - **Owner**: who holds the GPU now, each workload's state, and the owner over time.
+- **Holders**: every process holding card memory, named, with how much, and which
+  workload it belongs to (or *unmanaged*: a desktop, a browser, a game, an app you
+  started yourself). `status` prints the five biggest on its `holds:` line, and
+  `status --json` carries them as `holders: [{pid, mib, name, workload}]`.
 - **GPU load**: the card's model, load, temperature and power, now and over time.
 - **VRAM** and **RAM / Swap**: per workload, stacked against the totals.
+- **Power cost**: what the card's watts cost across the range you're looking at, in
+  total and per holder, plus what it's drawing right now. Needs `power.price_per_kwh`.
 - **Events / Logs**: every switch, hold and gate decision, and every line a
   vhotseat command logged, from any process (the guard's `switch comfy`,
   Strata's `gate strata`, your `hold`).
@@ -208,8 +283,18 @@ samples every `interval_s` while it lasts. So a dashboard started later shows
 what happened before. Between commands nothing samples, which shows as gaps;
 for an unbroken history run the recorder as a service:
 
+```sh
+vhotseat autostart install          # Task Scheduler at logon on Windows, a systemd user unit elsewhere
+vhotseat autostart status           # registered? running? (exit 1 when nothing is registered)
+vhotseat autostart remove
+```
+
+`--command record` installs the sampler without the page. It registers one thing
+only, named `vhotseat`; everything else in vhotseat stays per-command on purpose.
+The unit it writes elsewhere, if you'd rather keep it by hand:
+
 ```ini
-# ~/.config/systemd/user/vhotseat-record.service   (or run `vhotseat web` this way instead)
+# ~/.config/systemd/user/vhotseat.service   (or `vhotseat autostart install` writes this)
 [Service]
 ExecStart=%h/.local/bin/vhotseat record
 Restart=on-failure
@@ -223,6 +308,75 @@ telemetry:
   interval_s: 5         # default
   # enabled: false      # record nothing; the dashboard shows the live status only
 ```
+
+```yaml
+power:
+  price_per_kwh: 4.11   # what one unit of electricity costs where this machine is
+  currency: "R"         # written in front of the numbers
+  note: "eThekwini (Durban) home 2026/27: 357.47 c/kWh ex VAT"   # shown under the tiles
+```
+
+With a price set, `vhotseat cost` and the **Power cost** card integrate the sampled
+wattage into kWh and money, per holder: each gap between two samples that both
+carry a wattage counts, charged to whoever held the card at the start of it. A
+stretch with no samples is no data rather than a card that drew nothing, so it is
+skipped, and the report says how much of the window had samples in it - with
+`vhotseat autostart install` the sampling is continuous and the number means what
+it says. What it counts is the card's draw as the driver reports it: the rest of
+the machine, and what the PSU burns getting those watts there, are not in it, so
+read it as a floor. At 300 W and R4.11 a unit that is R1.23 an hour, about R30 a
+day, about R890 a month - which is the case for unloading a model you aren't using.
+
+**`why [NAME]`** is the handover read backwards. Where `switch` acts, `why` reports:
+for each workload it walks the same preconditions - every other workload that would
+be released, the ones that would have to be waited for, then the admission floors -
+and says which of `could take the card now`, `would have to wait` or `is blocked`
+applies and why. The blocked reasons are the ones that make a handover fail: a
+workload whose API is dead while its VRAM is still on the card (start it so there is
+something to ask, or kill the process), a process holding memory with its service
+stopped, and an admission floor the card can't reach - shown as arithmetic, since
+"needs 14,000 MiB free, 900 after everything releasable is released" is a diagnosis
+where "refused" is a mystery. The memory that can't be freed is named: the processes
+vhotseat doesn't manage and how much each holds. `why` releases nothing, loads
+nothing and restarts nothing; it exits 0 even when the answer is `blocked`, because
+it is a report and not a gate. `--json` gives the same per workload
+(`{would, holder, free_mib, resident, notes[]}`); the dashboard shows it as the
+**Next handover** card.
+
+**Claims: a game owns the card.** `vhotseat claims` prints what the rules match right
+now and the rules themselves; the same scan runs inside every gate and guard decision,
+so nothing resident is needed for the rule to hold (docs/how-it-works.md §3.7).
+
+```yaml
+claims_builtin: true        # the built-in rules for the usual installations (default true)
+claims:
+  - path: '*\World of Warcraft\*'      # matched against the process's image path
+    note: World of Warcraft            # how it's described in a refusal
+  - name: rocketleague.exe             # or by exe name: works when the path can't be read
+  - parent: mylauncher.exe             # or by any ancestor's exe name (its helpers too)
+claims_ignore: [myelectronapp.exe]     # names or path globs the built-in rules won't claim
+```
+
+While something matches, nothing **new** loads: the gate refuses a load a request would
+wake, and `switch --request` - what ComfyUI's guard node uses, because the queue is
+asking on somebody's behalf - is refused too. A `switch` you type yourself is an order
+and is not refused; neither is a requested switch that would load nothing, so a batch
+mid-flight carries on. Nothing loaded is interrupted, and no claimed process is touched.
+Built-ins know Steam (`*\steamapps\common\*`), Epic, Riot, anything under a `Games`
+folder, and a handful of exes; launchers and their helpers never claim the card, because
+they run all day - and neither do Wallpaper Engine and a VR runtime, which live under
+`steamapps\common\` like a game does but mean nobody is playing one. Extend that list with
+`claims_ignore:`; a rule of your own can still claim anything it names, non-game or not.
+A process belonging to a configured workload never claims the card against its own loads
+either, even when that workload is installed under `D:\Games\` and is sitting idle.
+`claims_builtin: false` leaves only your rules.
+
+**`vhotseat watch`** adds the record, not the rule: `claim` and `claim-end` rows in the
+event log, one per kind of process rather than one per pid (a game is twenty), plus the
+telemetry sampling. It's the cheapest thing to keep up from logon:
+`vhotseat autostart install --command watch`. Where the dashboard already runs, it is the
+recorder itself: `vhotseat web` probes the machine often enough to notice a claim start
+and end, so a box with the dashboard up needs nothing else.
 
 **Disk:** about 6 MiB per day of retention with two workloads at the default
 5 s interval (~305 bytes a sample, 17,280 a day, plus events and logs), so

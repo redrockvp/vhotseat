@@ -22,16 +22,54 @@ def log(msg: str) -> None:
         LOG_SINK(msg)
 
 
+def safe_output() -> None:
+    """Never crash on printing: a Windows pipe is cp1252, which has no → or ≤.
+    Characters the output can't encode come out as ?."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+
+
+def window(text) -> float:
+    """`7d`, `24h`, `90m`, `30s` or bare seconds, as seconds."""
+    t = str(text).strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    num, mult = (t[:-1], units[t[-1]]) if t[-1:] in units else (t, 1)
+    try:
+        value = float(num)
+    except ValueError:
+        raise ValueError(f"not a length of time: {text!r} (try 90m, 24h, 7d, or seconds)") from None
+    if value <= 0:
+        raise ValueError(f"not a length of time: {text!r} (needs a positive one)")
+    return value * mult
+
+
 def sleep(seconds: float) -> None:
     time.sleep(seconds * SCALE)
 
 
-def http(method: str, url: str, body: dict | None = None, timeout: float = 5.0):
+def replace(tmp, path, tries: int = 20) -> None:
+    """tmp.replace(path), atomically. On Windows that fails while another process
+    has `path` open for its brief read, so it's retried for up to a second."""
+    for attempt in range(tries):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(0.05)
+
+
+def http(method: str, url: str, body: dict | None = None, timeout: float = 5.0,
+         headers: dict | None = None):
     """Return (status, parsed JSON or text), or (None, error string) if unreachable."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     if data is not None:
         req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status, raw = resp.status, resp.read()

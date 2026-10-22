@@ -27,9 +27,9 @@ two handovers. That needs the `vhotseat` command (else $VHOTSEAT_BIN); without
 --hold, comfy-render works with ComfyUI alone.
 
 ComfyUI is at --url, else $COMFY_URL, else http://127.0.0.1:8188. Saved files
-are printed as absolute paths under --comfy-dir (else $COMFY_DIR, else the
-folder ComfyUI reports for its models); if neither is known, as paths relative
-to ComfyUI's folder (output/...).
+are printed as absolute paths under --comfy-dir (else $COMFY_DIR, else ComfyUI's
+own folder, found through its custom_nodes folder); if neither is known, as
+paths relative to ComfyUI's folder (output/...).
 
 Exit codes: 0 every job produced output · 1 at least one job was rejected or
 failed · 2 bad input file or ComfyUI unreachable · 3 timed out · 4 the user
@@ -210,18 +210,42 @@ def _validation_errors(body) -> list[str]:
 
 
 def comfy_dir() -> Path | None:
-    """ComfyUI's folder: --comfy-dir / $COMFY_DIR, else where ComfyUI keeps its
-    models (/internal/folder_paths: <dir>/models/checkpoints), else None."""
+    """ComfyUI's folder: --comfy-dir / $COMFY_DIR, else found in what ComfyUI
+    reports at /internal/folder_paths, else None."""
     global COMFY_DIR
     if COMFY_DIR is None:
         try:
             code, body = _request("GET", "/internal/folder_paths", timeout=5)
-            first = Path(body["checkpoints"][0]) if code == 200 else None
-        except (urllib.error.URLError, OSError, KeyError, IndexError, TypeError):
-            first = None
-        if first is not None and first.parts[-2:] == ("models", "checkpoints"):
-            COMFY_DIR = first.parent.parent
+        except (urllib.error.URLError, OSError):
+            code, body = 0, {}
+        COMFY_DIR = _comfy_dir_from(code, body)
     return COMFY_DIR
+
+
+def _folders(body: dict, key: str) -> list[Path]:
+    return [Path(p) for p in (body.get(key) or []) if isinstance(p, str)]
+
+
+def _comfy_dir_from(code: int, body: dict) -> Path | None:
+    """The install folder out of ComfyUI's list of model folders.
+
+    extra_model_paths.yaml puts model folders on other drives and they are
+    listed first, so checkpoints[0] can be somebody else's collection: the
+    saved files would then be printed under a folder that never holds them.
+    custom_nodes is not a model folder, so <install>/custom_nodes is the
+    install folder; among several, the one with its own models/checkpoints in
+    the list is the surest."""
+    if code != 200 or not isinstance(body, dict):
+        return None
+    checkpoints = [p for p in _folders(body, "checkpoints") if p.parts[-2:] == ("models", "checkpoints")]
+    installs = [p.parent for p in _folders(body, "custom_nodes") if p.parts[-1:] == ("custom_nodes",)]
+    model_roots = {p.parent.parent for p in checkpoints}
+    for root in installs:
+        if root in model_roots:
+            return root
+    if installs:
+        return installs[0]
+    return checkpoints[0].parent.parent if checkpoints else None
 
 
 def _files(outputs: dict) -> list[str]:
@@ -566,8 +590,12 @@ def summarize(results: list[dict]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Never crash on printing a node's message: a Windows pipe is cp1252.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     p = argparse.ArgumentParser(prog="comfy-render", description=__doc__.split("\n\n")[0])
-    p.add_argument("jobs", help="JSON file: a workflow, a list of them, or {base, jobs}")
+    p.add_argument("jobs", nargs="?", help="JSON file: a workflow, a list of them, or {base, jobs}")
     p.add_argument("--url", help="ComfyUI's address (default: $COMFY_URL, else http://127.0.0.1:8188)")
     p.add_argument("--comfy-dir", type=Path, metavar="DIR",
                    help="ComfyUI's folder, for absolute output paths (default: $COMFY_DIR, else asked of ComfyUI)")
@@ -581,6 +609,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--hold-wait", type=float, default=600, metavar="SECONDS",
                    help="with --hold: how long to wait for the GPU's current work to finish (default 600)")
     args = p.parse_args(argv)
+    if args.jobs is None:
+        # `--hold jobs/x.json` (as the skill writes it): --hold's optional NAME took the file.
+        if args.hold and (args.hold.lower().endswith(".json") or Path(args.hold).is_file()):
+            args.jobs, args.hold = args.hold, "comfy"
+        else:
+            p.error("the following arguments are required: jobs")
     reader = stdout_reader()
     if reader in BUFFERING_READERS:
         print(f"comfy-render: don't pipe its output (to {reader}): its progress lines are how the "

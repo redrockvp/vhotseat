@@ -36,7 +36,8 @@ COMMON = {"driver", "label", "url", "service", "vram", "idle_vram_mib", "gate", 
           "allow_restart", "restart_timeout_s"}
 GATE_KEYS = {"kind", "timeout", "config", "custom_nodes", "status"}
 DRIVER_KEYS = {
-    "http": {"resident", "busy", "release", "confirm", "load", "model"},
+    "http": {"resident", "busy", "release", "confirm", "load", "model", "headers", "body",
+             "estimate"},
     "comfyui": {"restart_above_ram_mib", "history_settle_s"},
 }
 
@@ -71,7 +72,8 @@ def _rules(rules, where: str):
 
 def validate(raw) -> dict:
     _check(isinstance(raw, dict), "config", "expected a mapping at the top level")
-    unknown = set(raw) - {"gpu", "workloads", "events", "telemetry", "patches"}
+    unknown = set(raw) - {"gpu", "workloads", "events", "telemetry", "power", "claims",
+                          "claims_builtin", "claims_ignore", "patches"}
     _check(not unknown, "config", f"unknown key(s): {', '.join(sorted(unknown))}")
     gpu = raw.get("gpu") or {}
     _check(isinstance(gpu, dict), "gpu", "expected a mapping")
@@ -91,6 +93,38 @@ def validate(raw) -> dict:
             v = tel[k]
             _check(isinstance(v, (int, float)) and not isinstance(v, bool) and v >= minimum,
                    f"telemetry.{k}", f"expected a number ≥ {minimum:g}, got {v!r}")
+
+    power = raw.get("power") or {}
+    _check(isinstance(power, dict), "power", "expected a mapping")
+    unknown = set(power) - {"price_per_kwh", "currency", "note"}
+    _check(not unknown, "power", f"unknown key(s): {', '.join(sorted(unknown))}")
+    if "price_per_kwh" in power:
+        v = power["price_per_kwh"]
+        _check(isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0,
+               "power.price_per_kwh", f"expected a number > 0 (what one kWh costs you), got {v!r}")
+    _check(isinstance(raw.get("claims_builtin", True), bool), "claims_builtin",
+           "expected true or false")
+    ci = raw.get("claims_ignore") or []
+    _check(isinstance(ci, list), "claims_ignore",
+           "expected a list of exe names or path globs, e.g. [wallpaper64.exe]")
+    for i, s in enumerate(ci):
+        _check(isinstance(s, str) and s.strip(), f"claims_ignore[{i}]",
+               "expected a non-empty string (an exe name or a path glob)")
+    cl = raw.get("claims") or []
+    _check(isinstance(cl, list), "claims", "expected a list of {name, path, parent, note} rules")
+    for i, r in enumerate(cl):
+        where = f"claims[{i}]"
+        _check(isinstance(r, dict) and r, where, "expected a mapping with some of name, path, parent, note")
+        bad = set(r) - {"name", "path", "parent", "note"}
+        _check(not bad, where, f"unknown key(s): {', '.join(sorted(bad))}")
+        _check(any(r.get(k) for k in ("name", "path", "parent")), where,
+               "needs at least one of name, path, parent")
+        for k in ("name", "path", "parent", "note"):
+            if k in r:
+                _check(isinstance(r[k], str) and r[k], f"{where}.{k}", "expected a non-empty string")
+    for k in ("currency", "note"):
+        if k in power:
+            _check(isinstance(power[k], str), f"power.{k}", "expected text")
 
     patches = raw.get("patches") or []
     _check(isinstance(patches, list), "patches", "expected a list of {name, file, marker}")
@@ -163,6 +197,17 @@ def validate(raw) -> dict:
             _check(isinstance(gate["status"], str) and gate["status"].startswith(("http://", "https://")),
                    f"{where}.gate.status", "expected the proxy's http://…/_vhotseat/status URL")
         if driver == "http":
+            hdr = w.get("headers") or {}
+            _check(isinstance(hdr, dict) and all(isinstance(k, str) and isinstance(v, str) and k and v
+                                                for k, v in hdr.items()),
+                   f"{where}.headers", "expected names and values as strings, "
+                                       'e.g. {Authorization: "Bearer ${SOME_KEY}"}')
+            for k, v in hdr.items():
+                _check(not any(n in v for n in ("\r", "\n")), f"{where}.headers.{k}",
+                       "a header value can't contain a newline")
+            body = w.get("body")
+            _check(body is None or isinstance(body, dict), f"{where}.body",
+                   "expected a mapping of field to value (strings may use {model} or {wait})")
             _request(w.get("resident"), f"{where}.resident", needs_path=True)
             if "busy" in w:
                 _request(w["busy"], f"{where}.busy", needs_path=True)
@@ -177,6 +222,24 @@ def validate(raw) -> dict:
                 _request(w["load"], f"{where}.load")
             if "model" in w:
                 _request(w["model"], f"{where}.model", needs_path=True)
+            if "estimate" in w:
+                est = w["estimate"]
+                _check(isinstance(est, dict), f"{where}.estimate",
+                       "expected {from: …, post: /…, body: {…}, path: field}: ask the server what a model costs")
+                _check(isinstance(est.get("post"), str) and est["post"], f"{where}.estimate.post",
+                       "expected the request path that does the sizing")
+                _check(isinstance(est.get("body"), dict)
+                       and all(isinstance(k, str) and k
+                               and isinstance(v, (str, int, float, bool)) for k, v in est["body"].items()),
+                       f"{where}.estimate.body",
+                       "expected field: value, where a value may name a {placeholder} from `from:`")
+                _check(isinstance(est.get("path"), str) and est["path"], f"{where}.estimate.path",
+                       "expected the response field holding the byte count")
+                if "from" in est:
+                    _request(est["from"], f"{where}.estimate.from")
+                if "ctx" in est:
+                    _check(isinstance(est["ctx"], int) and est["ctx"] > 0, f"{where}.estimate.ctx",
+                           "expected a token count")
             conf = w.get("confirm") or {}
             _check(isinstance(conf, dict), f"{where}.confirm", "expected a mapping")
             _int(conf, "vram_at_most", f"{where}.confirm")
@@ -196,7 +259,7 @@ def parse(text: str) -> dict:
 
 def load(path: Path) -> dict:
     try:
-        return parse(path.read_text())
+        return parse(path.read_text(encoding="utf-8"))
     except OSError as e:
         raise ConfigError(f"{path}: {e.strerror}") from None
     except ConfigError as e:

@@ -72,7 +72,9 @@ Per request:
    error body in the server's own format (`{"error": "GPU busy: …"}` for Ollama).
 3. **Fast path:** `if seat.owns(NAME)`: forward. While nothing has changed hands
    since it last checked, this is a small file read: no lock, no `nvidia-smi`,
-   no HTTP. **On a cache miss it probes every workload, including this one, so it
+   no HTTP. `acquire()` also marks the card as this workload's in the seat, so `owns()`
+   keeps answering yes through the window where a server that loads on request shows nothing
+   on the card yet: a burst of gated requests is one handover, not one per request. **On a cache miss it probes every workload, including this one, so it
    calls your own `/_vhotseat/status`**: never call `owns()` (or `acquire()`)
    while holding a lock your status handler needs, and run the HTTP server
    threaded, or a cold request waits on itself.
@@ -226,6 +228,12 @@ Every item must pass; each one is a real failure seen in this kind of setup.
 - **A client still on the internal port** bypasses the gate entirely. After
   step 2, look for anything configured with the old port number (`grep` the
   configs of your agents and UIs).
+- **A desktop app that starts its own backend on a fixed port cannot be fronted**: it is its
+  own client, and it binds the port you would have taken (Unsloth Studio's desktop app does:
+  `unsloth-studio.exe` launches its backend with `-p 8888`, no port setting, no fallback).
+  Gate what you can route through the proxy — agents and scripts — and let the GPU
+  attribution cover the rest: vhotseat names whose processes the card's memory belongs to, so
+  a load that walked past the gate is visible the moment it starts.
 - **The server unloads on its own timer** (`OLLAMA_KEEP_ALIVE`): harmless, but
   the model reloads on the next request through the proxy; set it to forever so
   vhotseat decides.

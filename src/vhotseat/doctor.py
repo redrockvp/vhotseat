@@ -28,12 +28,13 @@ def _gate_hook(w, gate: dict) -> list:
         return [(WARN, f"{w.name}: gate", "no gate.config set, so the hook can't be checked")]
     p = Path(path).expanduser()
     try:
-        cfg = json.loads(p.read_text())
+        cfg = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         return [(FAIL, f"{w.name}: gate", f"can't read {p}: {e}")]
     cmd = cfg.get("before_load")
     cmd = cmd.split() if isinstance(cmd, str) else cmd or []
-    calls_us = len(cmd) >= 3 and Path(cmd[0]).name == "vhotseat" and cmd[1:3] == ["gate", w.name]
+    calls_us = (len(cmd) >= 3 and Path(cmd[0]).name.lower() in ("vhotseat", "vhotseat.exe")
+                and cmd[1:3] == ["gate", w.name])
     if not calls_us:
         out.append((FAIL, f"{w.name}: gate", f"{p} before_load is {cmd or 'unset'}: "
                     f"loads aren't guarded; set it to [\"vhotseat\", \"gate\", \"{w.name}\"]"))
@@ -82,7 +83,7 @@ def _version_tuple(v: str) -> tuple:
 def _installed_version(path: Path) -> str | None:
     """`version = "X.Y.Z"` (pyproject.toml and the like), or None."""
     try:
-        m = re.search(r"""^\s*version\s*=\s*["']([^"']+)["']""", path.read_text(), re.MULTILINE)
+        m = re.search(r"""^\s*version\s*=\s*["']([^"']+)["']""", path.read_text(encoding="utf-8"), re.MULTILINE)
     except OSError:
         return None
     return m.group(1) if m else None
@@ -98,7 +99,7 @@ def check_patches(cfg: dict | None) -> list:
         where = f"patch: {p['name']}"
         f = Path(p["file"]).expanduser()
         try:
-            present = p["marker"] in f.read_text()
+            present = p["marker"] in f.read_text(encoding="utf-8")
         except OSError as e:
             out.append((FAIL, where, f"can't read {f}: {e.strerror}"))
             continue
@@ -130,8 +131,11 @@ def checks(arbiter, cfg: dict | None) -> list:
         # hand outside its service, which no gate protects (seen 2026-10-17: a trial
         # llama-server left running outside its unit). Admission can't see it coming.
         if g["other_mib"] > OTHER_WARN_MIB:
-            out.append((WARN, "gpu: other", f"{g['other_mib']} MiB held by processes that aren't a configured "
-                        "workload; nothing gates them. `nvidia-smi` shows which."))
+            unclaimed = [r for r in arbiter.holders() if not r["workload"]][:4]
+            who = ", ".join(f"{r['name'] or r['pid']} {r['mib']}" for r in unclaimed)
+            detail = f"workload ({who}); nothing gates them" if who else \
+                "workload; nothing gates them. `nvidia-smi` shows which"
+            out.append((WARN, "gpu: other", f"{g['other_mib']} MiB held by processes that aren't a configured " + detail))
     ram = arbiter.machine_ram()
     out += check_patches(cfg)
     out.append((FAIL, "ram", ram["error"]) if "error" in ram else
@@ -143,9 +147,42 @@ def checks(arbiter, cfg: dict | None) -> list:
                         f"{w.service.unit} {'active' if active else 'stopped (started on demand)'}"))
             if not active:
                 continue
-        code, _ = util.http("GET", w.url + w.health_path)
-        out.append((OK if code == 200 else FAIL, f"{w.name}: api",
-                    f"{w.url}{w.health_path} answered {code}" if code else f"{w.url} not answering"))
+        code, _ = w.health_call()
+        held = w.vram_mib()
+        # Can the GPU counters attribute this workload at all? That is what makes an
+        # unanswerable API safe to read as stopped instead of busy, so ask the config,
+        # not the driver (the driver keeps its own parsed subset).
+        selector = (((cfg or {}).get("workloads") or {}).get(w.name) or {}).get("vram", {}).get("process")
+        blind = not getattr(w.service, "can_start", True) and not selector
+        if code == 200:
+            out.append((OK, f"{w.name}: api", f"{w.url}{w.health_path} answered 200"))
+        elif code in (401, 403):
+            # Answering and refusing is a different fault from being down, and the fix is
+            # the key rather than the server.
+            miss = getattr(w, "headers_missing", [])
+            out.append((FAIL, f"{w.name}: api",
+                        f"{w.url}{w.health_path} answered {code}: it wants a key vhotseat isn't "
+                        f"sending - fix `headers:`"
+                        + (f" (${' , $'.join(miss)} not in the environment)" if miss else "")))
+        elif held <= w.idle_vram_mib and not blind:
+            # Off the card and not answering: it is switched off, which is a normal way
+            # to leave the GPU free, not a fault - nothing here can start it back up.
+            out.append((WARN, f"{w.name}: api", f"{w.url} not answering and it holds nothing on the GPU: "
+                        "treated as stopped"))
+        else:
+            out.append((FAIL, f"{w.name}: api",
+                        f"{w.url} not answering" + (f"; it still holds {held} MiB on the GPU" if held > w.idle_vram_mib else "")))
+        if blind:
+            out.append((WARN, f"{w.name}: vram", "no service and no vram.process: vhotseat can neither ask it "
+                        "nor see it on the GPU, so an API that isn't answering counts as busy and can block a "
+                        "handover"))
+        # A selector that stopped matching (the process moved, or now runs elevated and its
+        # path can't be read) leaves its VRAM in `other`, where nothing can act on it.
+        if w.vram_selector[1] and code == 200 and held <= w.idle_vram_mib \
+                and g.get("other_mib", 0) > OTHER_WARN_MIB and w.probe(g).get("loaded"):
+            out.append((WARN, f"{w.name}: vram", f"it says a model is loaded but the GPU attributes it nothing, "
+                        f"while {g['other_mib']} MiB is unattributed: its `vram:` selector may no longer match "
+                        "the process holding it (it moved, or now runs elevated, which hides its path)"))
         kind = w.gate.get("kind")
         if kind == "hook":
             out += _gate_hook(w, w.gate)

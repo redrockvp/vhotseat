@@ -46,10 +46,13 @@ class _Server:
                 self.wfile.write(raw)
 
             def do_GET(self):
+                outer.last_headers = {k.lower(): v for k, v in self.headers.items()}
                 outer.route(self, "GET", self._url(), None)
 
             def do_POST(self):
-                outer.route(self, "POST", self._url(), self._body())
+                outer.last_headers = {k.lower(): v for k, v in self.headers.items()}
+                outer.last_body = self._body()
+                outer.route(self, "POST", self._url(), outer.last_body)
 
             def _url(self):
                 u = urlsplit(self.path)
@@ -59,6 +62,9 @@ class _Server:
         self.httpd.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         self.calls: list[str] = []
+        self.last_headers: dict[str, str] = {}     # what the last request sent, and
+        self.last_body = None                      # what it carried, for auth/body tests
+        self.want_header: str | None = None        # answer 401 unless this arrives
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
     def close(self):
@@ -76,6 +82,8 @@ class FakeStrata(_Server):
         self.model = "qwen3.8-flash-next-iq3_xxs"
         self.answering = 0          # requests being answered
         self.load_s = 0.05
+        self.estimate_calls = 0
+        self.down = False               # the API is up but answering nothing useful
         self.on_load = lambda: True
         super().__init__()
 
@@ -119,10 +127,23 @@ class FakeStrata(_Server):
     def route(self, h, method, url, body):
         path, q = url
         self.calls.append(f"{method} {path}")
+        if self.down:
+            return h.send_json(503, {"error": "loading"})
         if path == "/health":
+            if self.want_header and self.last_headers.get("authorization") != self.want_header:
+                return h.send_json(401, {"error": "unauthorized"})
             return h.send_json(200, {"status": "ok", "loaded": self.loaded, "model": self.model})
         if path == "/_vram":  # for a gpu-workload running in a subprocess (tests/run_cli.py)
             return h.send_json(200, {"vram": self.vram})
+        if path == "/last-model":
+            return h.send_json(200, {"id": self.model, "gguf_variant": "Q4_K_XL"})
+        if path == "/loaded-list":      # the shape some servers use: a list, empty when idle
+            return h.send_json(200, {"data": [{"id": self.model}] if self.loaded else []})
+        if path == "/estimate" and method == "POST":
+            # What the server says a model costs on the card, at the context it was asked for.
+            self.estimate_calls += 1
+            return h.send_json(200, {"available": True, "weights_bytes": 8 * 2**30,
+                                     "gpu_bytes": 19 * 2**30, "n_ctx": (body or {}).get("n_ctx")})
         if path == "/unload" and method == "POST":
             wait = float(q.get("wait", 0))
             deadline = time.monotonic() + wait
@@ -136,6 +157,24 @@ class FakeStrata(_Server):
             if not self._load():
                 return h.send_json(503, {"error": "before_load refused"})
             return h.send_json(200, {"status": "loaded"})
+        if path == "/v1/chat/completions" and method == "POST":
+            # A completion naming the model loads it, as it does on any OpenAI-compatible
+            # server: this is the request a gate has to treat as a load.
+            self.answering += 1
+            try:
+                if not self._load():
+                    return h.send_json(503, {"error": "before_load refused"})
+                h.send_response(200)
+                h.send_header("Content-Type", "text/event-stream")
+                h.end_headers()
+                h.wfile.write(b"data: a token\n\n")
+                h.wfile.flush()
+                h.close_connection = True
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                self.answering -= 1
+            return
         h.send_json(404, {"error": path})
 
 
@@ -164,6 +203,8 @@ class FakeComfy(_Server):
         self.guard = None
         self.lose_history = False
         self.models_dir = "/comfy/models/checkpoints"
+        self.custom_nodes_dir = "/comfy/custom_nodes"
+        self.extra_model_dirs: list[str] = []   # extra_model_paths.yaml: other drives, listed first
         self.sockets: dict[str, list] = {}      # client_id -> [socket]
         self._work = threading.Event()
         super().__init__()
@@ -258,7 +299,9 @@ class FakeComfy(_Server):
         if path == "/_vram":
             return h.send_json(200, {"vram": self.vram})
         if path == "/internal/folder_paths":
-            return h.send_json(200, {"checkpoints": [self.models_dir, "/comfy/output/checkpoints"]})
+            return h.send_json(200, {"checkpoints": self.extra_model_dirs
+                                     + [self.models_dir, "/comfy/output/checkpoints"],
+                                     "custom_nodes": [self.custom_nodes_dir]})
         if path == "/queue":
             if self.down:
                 return h.send_json(500, {"error": "down"})
@@ -329,8 +372,28 @@ class FakeGpu:
             used = {"strata_mib": self.strata.vram, "comfy_mib": self.comfy.vram, "other_mib": self.other}
         return {"total_mib": 16303, "free_mib": 16303 - sum(used.values()), **used}
 
+    def read_all(self, selectors: dict, limit: int = 8) -> tuple[dict, list]:
+        """The same sums, as named processes: what a workload holds, and what nothing
+        manages. Each fake server is one process here."""
+        snap = self.snapshot(selectors)
+        if "error" in snap:
+            return snap, []
+        rows = []
+        if self.strata.vram:
+            lost = getattr(self, "strata_as_other", False)
+            rows.append({"pid": 1111, "mib": self.strata.vram, "name": "strata.exe",
+                         "workload": None if lost else "strata"})
+        if self.comfy.vram:
+            rows.append({"pid": 2222, "mib": self.comfy.vram, "name": "python.exe", "workload": "comfy"})
+        if self.other:
+            rows.append({"pid": 3333, "mib": self.other, "name": "Xorg", "workload": None})
+        rows.sort(key=lambda r: -r["mib"])
+        return snap, rows[:limit]
+
 
 class _FakeService:
+    can_start = True
+
     def __init__(self, host, name):
         self.host, self.name, self.unit = host, name, f"{name}.service"
 

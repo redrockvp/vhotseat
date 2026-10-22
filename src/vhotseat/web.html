@@ -99,6 +99,20 @@ tr.hl td { background: var(--wash); }
 .notice { color: var(--ink-2); font-size: 13px; margin: 0 0 14px; }
 .notice code, td code { font-size: 12px; background: var(--wash); padding: 1px 5px; border-radius: 4px; }
 .workloads { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.holders { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px 18px; margin-top: 4px; }
+.who.claim { color: var(--critical); }
+.whys { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px 18px; }
+.why { font-size: 13px; }
+.why .whyhead { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+.chip { font-size: 11px; font-weight: 650; padding: 2px 8px; border-radius: 999px; color: #fff; }
+.why ul { margin: 0; padding-left: 18px; color: var(--ink-2); }
+.why li { margin: 3px 0; }
+.hrow { font-size: 13px; }
+.hrow .top { display: flex; justify-content: space-between; gap: 8px; color: var(--ink-2); }
+.hrow .top b { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+.hrow .bar { height: 6px; border-radius: 3px; background: var(--wash); margin-top: 5px; overflow: hidden; }
+.hrow .bar i { display: block; height: 100%; border-radius: 3px; }
+.hrow .who { color: var(--muted); font-size: 12px; margin-top: 3px; }
 .owner-now { font-size: 30px; font-weight: 650; display: flex; align-items: center; gap: 10px; }
 .owner-now .key { width: 14px; height: 14px; border-radius: 3px; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -161,6 +175,11 @@ td.nw { color: var(--ink); }
     <div class="chart" id="modeChart"></div>
   </section>
 
+  <section class="card" id="holders-card">
+    <div class="head"><h2>Holders</h2><span class="right" id="holdersNote"></span></div>
+    <div class="holders" id="holders"></div>
+  </section>
+
   <section class="card" id="gpu">
     <div class="head"><h2>GPU load</h2><span class="right" id="gpuName"></span></div>
     <div class="tiles" id="gpuTiles"></div>
@@ -169,6 +188,17 @@ td.nw { color: var(--ink); }
       <div class="seg small" id="gpuMetric" role="group" aria-label="GPU chart"></div>
     </div>
     <div class="chart" id="gpuChart"></div>
+  </section>
+
+  <section class="card" id="why-card">
+    <div class="head"><h2>Next handover</h2><span class="right" id="whyNote"></span></div>
+    <div class="whys" id="whys"></div>
+  </section>
+
+  <section class="card" id="cost-card" hidden>
+    <div class="head"><h2>Power cost</h2><span class="right" id="costNote"></span></div>
+    <div class="tiles" id="costTiles"></div>
+    <p class="notice" id="costCaveat" style="margin-top:10px"></p>
   </section>
 
   <section class="card" id="vram">
@@ -234,7 +264,10 @@ const el = (tag, attrs = {}, text) => {
   const ns = ["svg", "path", "line", "rect", "text", "g"].includes(tag) ? "http://www.w3.org/2000/svg" : null;
   const e = ns ? document.createElementNS(ns, tag) : document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
-  if (text !== undefined) e.textContent = text;
+  // A node passed here means a node child, not its toString(): twice now a panel has
+  // rendered "[object HTMLElement]" because a caller passed an element by mistake.
+  if (text instanceof Node) e.append(text);
+  else if (text !== undefined) e.textContent = text;
   return e;
 };
 const gib = (mib) => mib == null ? "–" : (mib / 1024).toFixed(1);
@@ -274,12 +307,14 @@ async function refresh() {
     const until = Date.now() / 1000, since = until - state.range;
     const width = document.querySelector("main").clientWidth || 1000;
     const q = `since=${since}&until=${until}`;
-    const [samples, events, logs] = await Promise.all([
+    const [samples, events, logs, cost, why] = await Promise.all([
       getJSON(`/api/history?${q}&points=${Math.max(120, Math.round(width / 2))}`),
       getJSON(`/api/events?${q}&limit=2000`),
       getJSON(`/api/logs?${q}&limit=2000`),
+      getJSON(`/api/cost?${q}`).catch(() => ({ error: "no power.price_per_kwh in the config" })),
+      getJSON("/api/why").catch(() => null),
     ]);
-    Object.assign(state, { samples, events, logs, since, until, error: null });
+    Object.assign(state, { samples, events, logs, cost, why, since, until, error: null });
   } catch (e) {
     state.error = String(e.message || e);
   }
@@ -652,6 +687,44 @@ function renderOwner() {
   modeChart();
 }
 
+function renderHolders() {
+  const s = state.status, g = s.gpu || {}, box = $("holders"), rows = s.holders || [];
+  const claims = s.claims || [];
+  const groups = {};
+  for (const c of claims) {
+    const g = groups[c.name + "\u0000" + c.note] || (groups[c.name + "\u0000" + c.note] = { name: c.name, note: c.note, n: 0 });
+    g.n++;
+  }
+  const named = Object.values(groups).map((g) => g.name + (g.n > 1 ? ` x${g.n}` : "") + ` (${g.note})`);
+  $("holdersNote").textContent = claims.length
+    ? `the card is claimed by ${named.slice(0, 3).join(", ")}` +
+      (named.length > 3 ? ` and ${named.length - 3} more` : "") + ": nothing new loads while it runs"
+    : (g.error ? "" : `${gib(g.other_mib)} GiB held by processes vhotseat doesn't manage`);
+  if (g.error) {
+    box.replaceChildren(el("p", { class: "notice" }, `can't read the card: ${g.error}`));
+    return;
+  }
+  if (!rows.length) {
+    box.replaceChildren(el("p", { class: "notice" },
+      "this backend reports no per-process memory, so holders can't be named"));
+    return;
+  }
+  const used = Math.max(1, (g.total_mib || 0) - (g.free_mib || 0));
+  box.replaceChildren(...rows.map((r) => {
+    const row = el("div", { class: "hrow" });
+    const top = el("div", { class: "top" });
+    top.append(el("b", {}, r.name || `pid ${r.pid}`), el("span", {}, `${gib(r.mib)} GiB`));
+    const bar = el("div", { class: "bar" }), fill = el("i");
+    fill.style.width = `${Math.min(100, Math.round(100 * r.mib / used))}%`;
+    fill.style.background = r.workload ? colorOf(r.workload) : "var(--muted)";
+    const c = (s.claims || []).find((x) => x.pid === r.pid);
+    row.append(top, bar, el("div", { class: c ? "who claim" : "who" },
+                            c ? `owns the card: ${c.note}`
+                              : (r.workload ? labelOf(r.workload) : "unmanaged")));
+    return row;
+  }));
+}
+
 function renderGpu() {
   const s = state.status, h = s.gpu_health || {}, g = s.gpu;
   $("gpuName").textContent = (h.name || "").replace(/^NVIDIA /, "") || (h.error ? `can't read the card: ${h.error}` : "");
@@ -671,6 +744,56 @@ function renderGpu() {
   const m = GPU_METRICS[state.gpuMetric];
   $("gpuMetricTitle").textContent = m.key === "gpu_power_w" ? "Power (dashed: limit)" : m.label;
   lineChart("gpuChart", m);
+}
+
+const WHY = { ready: ["could take it now", "var(--good)"], waiting: ["would have to wait", "var(--warning)"],
+              blocked: ["blocked", "var(--critical)"] };
+
+function renderWhy() {
+  const w = state.why, box = $("whys");
+  if (!w || !w.targets) {
+    box.replaceChildren(el("p", { class: "notice" }, "the dry run didn't answer"));
+    return;
+  }
+  $("whyNote").textContent = "what each workload would have to give up, and what stands in the way";
+  box.replaceChildren(...Object.values(w.targets).map((t) => {
+    const d = el("div", { class: "why" });
+    const chip = el("span", { class: "chip" }, (WHY[t.would] || WHY.ready)[0]);
+    chip.style.background = (WHY[t.would] || WHY.ready)[1];
+    const head = el("div", { class: "whyhead" });
+    head.append(el("b", {}, labelOf(t.target)), chip);
+    const ul = el("ul");
+    if (!t.notes.length) ul.append(el("li", {}, t.resident ? "nothing to do: it holds the card" : "nothing in the way"));
+    for (const n of t.notes) ul.append(el("li", {}, n));
+    d.append(head, ul);
+    return d;
+  }));
+}
+
+function renderCost() {
+  const c = state.cost, card = $("cost-card");
+  if (!c || c.error) { card.hidden = true; return; }
+  card.hidden = false;
+  const unit = c.currency || "";
+  const money = (v) => `${unit}${(v == null ? 0 : v).toFixed(2)}`;
+  $("costNote").textContent = c.note || `${money(c.price)} a kWh`;
+  const tiles = [
+    tile("Cost in range", money(c.cost), "", `${(c.kwh || 0).toFixed(2)} kWh at ${money(c.price)} a kWh`),
+    tile("Card now", num(c.w_now), "W",
+         c.w_now == null ? "" : `${money(c.w_now / 1000 * c.price)} an hour`),
+    tile("In the range", (c.window_s / 3600).toFixed(1), "h", `${(c.hours || 0).toFixed(1)} h sampled`),
+  ];
+  for (const [mode, cell] of Object.entries(c.by_mode || {}).sort((a, b) => b[1].kwh - a[1].kwh)) {
+    const free = mode === "none";
+    tiles.push(tile(free ? "Free" : labelOf(mode), money(cell.cost), "",
+                    `${cell.kwh} kWh · ${cell.hours} h`, free ? null : colorOf(mode)));
+  }
+  $("costTiles").replaceChildren(...tiles);
+  const sparse = c.hours != null && c.hours < c.window_s / 3600 * 0.9;
+  $("costCaveat").textContent =
+    (sparse ? `only ${(c.hours || 0).toFixed(1)} h of this range has power samples in it, so this is a floor: `
+            : "") +
+    "the card's own draw - the rest of the machine, and what the PSU burns getting it there, aren't in it";
 }
 
 function renderVram() {
@@ -702,7 +825,10 @@ function renderCharts() {
   if (!s) return;
   hovers.length = 0;
   renderOwner();
+  renderHolders();
+  renderWhy();
   renderGpu();
+  renderCost();
   renderVram();
   renderRam();
 

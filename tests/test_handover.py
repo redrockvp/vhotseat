@@ -12,6 +12,10 @@ import time
 from pathlib import Path
 
 import pytest
+from conftest import cli_bin
+from fakes import COMFY_CONTEXT_VRAM
+
+from vhotseat import claims, host
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -36,10 +40,11 @@ def test_status_json_shape_is_unchanged(rig, capsys):
     """A dashboard reads these keys: they are the --json contract."""
     assert rig.cli("status", "--json") == 0
     s = json.loads(capsys.readouterr().out)
-    assert set(s) == {"mode", "strata", "comfy", "gpu", "ram", "last_event"}
+    assert set(s) == {"mode", "strata", "comfy", "gpu", "holders", "claims", "ram", "last_event"}
     assert set(s["strata"]) == {"service", "reachable", "loaded"}
     assert set(s["comfy"]) == {"service", "reachable", "running", "pending", "holds_models"}
     assert set(s["gpu"]) == {"total_mib", "free_mib", "strata_mib", "comfy_mib", "other_mib"}
+    assert set(s["holders"][0]) == {"pid", "mib", "name", "workload"}
     assert set(s["ram"]) >= {"total_mib", "available_mib", "strata", "comfy"}
 
 
@@ -51,6 +56,8 @@ def test_status_text(rig, capsys):
     assert out[1] == "strata: model loaded"
     assert out[2] == "comfy:  no models loaded, 0 running / 0 queued"
     assert out[3].startswith("gpu:    1903 of 16303 MiB free (strata 14000, comfy 400, other 0)")
+    # who actually holds it, by name: the workloads and anything nothing manages
+    assert out[4] == "holds:  strata.exe 14000 (strata)  python.exe 400 (comfy)"
 
 
 # --- switch --------------------------------------------------------------------
@@ -97,6 +104,86 @@ def test_switch_comfy_refused_while_strata_answers(rig, capsys):
     t.join()
 
 
+def test_switch_closed_workload_does_not_block_the_other(rig):
+    """A workload that is simply switched off - API dead, nothing on the card, and no
+    service vhotseat could start - must not stall or refuse the other one's handover.
+    Closing it by hand is a normal way to free the GPU (seen 2026-10-19: a ComfyUI job
+    refused because switching to comfy waited 60s on a dead Strata port)."""
+    rig.strata.close()
+    started = time.monotonic()
+    assert rig.cli("switch", "comfy", "--wait", "5") == 0
+    assert time.monotonic() - started < 30, "stalled on a port nobody owns (a dead probe costs ~2s here)"
+    w = rig.arb.workloads["strata"]
+    assert w.busy() is None                       # off the card: idle, not "unknown"
+    assert w.release(0, 5) == []                  # nothing to release, nothing to wait for
+    # ComfyUI is lazy: with its models not loaded yet the mode stays "none"; the
+    # handover is done once nothing else is holding the card.
+    assert rig.arb.probe()["mode"] == "none"
+
+
+def test_switch_closed_but_still_on_the_card_is_refused(rig):
+    """Unanswerable is only safe when the GPU counters can see it holding nothing. A
+    process that keeps its VRAM after its API dies still blocks, and says what to do."""
+    rig.strata.loaded = True
+    rig.strata.close()
+    assert rig.cli("switch", "comfy", "--wait", "5") == 1
+    assert "still holds" in last(rig, "switch")["error"] and "MiB on the GPU" in last(rig, "switch")["error"]
+
+
+def test_switch_no_service_and_dead_api_fails_fast(rig, capsys):
+    """With no service to start it, a dead API is a dead end, not a slow boot: name the
+    fix at once instead of waiting out the timeout."""
+    from vhotseat import host
+    rig.strata.close()
+    rig.arb.workloads["strata"].service = host.NoService()
+    started = time.monotonic()
+    assert rig.cli("switch", "strata", "--json") == 1
+    assert time.monotonic() - started < 30, "stalled instead of naming the fix"
+    assert "no service configured" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_doctor_treats_a_switched_off_workload_as_stopped(rig):
+    """doctor: off the card and not answering is a warn with the reason, not a fail."""
+    from vhotseat import doctor, host
+    rig.strata.close()
+    found = [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: api"]
+    assert found and found[0][0] == "warn" and "treated as stopped" in found[0][2]
+    assert not [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: vram"]
+    rig.strata.loaded = True                               # now it is a stuck process
+    found = [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: api"]
+    assert found and found[0][0] == "fail" and "still holds" in found[0][2]
+
+
+def test_doctor_spots_attribution_that_stopped_working(rig):
+    """When a workload's vram selector stops matching its process, its VRAM lands in
+    `other` where nothing can act on it; doctor says so instead of staying silent."""
+    from vhotseat import doctor
+    rig.gpu.strata_as_other = True
+    rig.gpu.other = 4000
+    rig.strata.loaded = True
+    found = [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: vram"
+             and "attributes it nothing" in c[2]]
+    assert found and found[0][0] == "warn"
+    rig.gpu.strata_as_other = False
+    assert not [c for c in doctor.checks(rig.arb, rig.cfg) if "attributes it nothing" in c[2]]
+
+
+def test_doctor_blind_workload_stays_busy(rig):
+    """No service and no vram.process: vhotseat can neither ask it nor see it, so an
+    unanswerable API must stay busy, and doctor says which blind spot caused it."""
+    from vhotseat import doctor, host
+    rig.strata.close()
+    rig.arb.workloads["strata"].service = host.NoService()
+    rig.cfg["workloads"]["strata"].pop("vram", None)
+    found = [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: vram"]
+    assert found and found[0][0] == "warn" and "can block a handover" in found[0][2]
+    found = [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: api"]
+    assert found and found[0][0] == "fail"
+    rig.cfg["workloads"]["strata"]["vram"] = {"process": "strata.exe"}   # now it is attributable
+    assert not [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: vram"]
+    assert [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: api"][0][0] == "warn"
+
+
 def test_switch_comfy_waits_for_strata_answer(rig):
     """An answer is never interrupted: --wait lets it finish, then unloads."""
     rig.strata.loaded = True
@@ -128,6 +215,125 @@ def test_stopped_strata_holding_vram_is_reported(rig):
 
 
 # --- Strata's hook (a request wakes the lazy model) ------------------------------
+
+
+def test_why_says_what_a_handover_would_have_to_do(rig):
+    """`why` is the switch decision read out loud, with nothing switched: what would be
+    released, and whether anything stands in the way."""
+    rig.strata.loaded = True
+    why = rig.arb.why_all()
+    assert why["comfy"]["would"] == "ready"
+    assert "Strata holds 14000 MiB and would be asked to release it" in why["comfy"]["notes"]
+    assert why["strata"]["would"] == "ready"
+    assert "it holds the card now" in why["strata"]["notes"]
+    assert not [c for c in rig.strata.calls if c.startswith("POST")]   # a dry run only reads
+
+
+def test_why_waits_behind_running_work(rig):
+    rig.comfy.running = ["job1"]
+    why = rig.arb.why_all()
+    assert why["strata"]["would"] == "waiting"
+    assert any(n.startswith("ComfyUI is busy") for n in why["strata"]["notes"])
+
+
+def test_why_names_the_workload_it_cannot_release(rig):
+    """A dead API with VRAM still on the card is what makes a handover fail. `why` says
+    so before anything tries, and says what to do about it."""
+    rig.strata.loaded = True
+    rig.strata.close()
+    why = rig.arb.why_all()
+    assert why["comfy"]["would"] == "blocked"
+    assert any("isn't answering and still holds 14000 MiB" in n for n in why["comfy"]["notes"])
+
+
+def test_why_shows_the_admission_arithmetic_and_blames_the_right_memory(rig):
+    """The admission floor refuses loads, and it refuses them over memory vhotseat can't
+    free. Showing the arithmetic is the difference between a mystery and a diagnosis."""
+    rig.gpu.other = 15000
+    why = rig.arb.why_all()
+    assert why["strata"]["would"] == "blocked"
+    assert any("only loads with 14000 MiB free" in n for n in why["strata"]["notes"])
+    assert any("processes vhotseat doesn't manage" in n for n in why["strata"]["notes"])
+
+
+def test_a_claim_refuses_a_load_nobody_chose(rig, monkeypatch, capsys):
+    """While a game owns the card, a model may not be loaded on top of it. The gate is
+    what decides that, so the agent's request comes back as "GPU busy" rather than
+    running the game off the machine."""
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: [
+        {"pid": 4242, "name": "game.exe", "exe": None, "note": "a Steam game", "by": "game.exe"}])
+    assert rig.arb.gate("strata") is False
+    assert "claimed by game.exe (a Steam game)" in capsys.readouterr().err
+    assert last(rig, "strata-load")["allowed"] is False
+
+
+def test_a_requested_switch_is_refused_while_a_game_runs(rig, monkeypatch):
+    """ComfyUI's guard asks for the card on the queue's behalf: a claim refuses it, so
+    a job never loads a 20 GB model over somebody's game."""
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: [
+        {"pid": 4242, "name": "game.exe", "exe": None, "note": "a Steam game", "by": "game.exe"}])
+    r = rig.arb.switch("comfy", 0, request=True)
+    assert r["ok"] is False and "claimed by game.exe" in r["error"]
+    assert rig.comfy.vram == COMFY_CONTEXT_VRAM       # nothing loaded, just its CUDA context
+
+
+def test_a_switch_somebody_typed_is_still_an_order(rig, monkeypatch):
+    """The claim rule is about loads nobody chose. `vhotseat switch comfy` at a terminal
+    is a decision, and vhotseat doesn't second-guess it."""
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: [
+        {"pid": 4242, "name": "game.exe", "exe": None, "note": "a Steam game", "by": "game.exe"}])
+    assert rig.arb.switch("comfy", 0)["ok"] is True
+    assert rig.comfy.vram > 0
+
+
+def test_a_requested_switch_that_would_load_nothing_is_not_refused(rig, monkeypatch):
+    """A batch mid-flight keeps its next job: the model is already on the card, so the
+    next prompt loads nothing, and "never interrupt" outranks a game that started
+    between clips. The job that would have *loaded* the model is still refused."""
+    game = [{"pid": 4242, "name": "game.exe", "exe": None, "note": "a Steam game", "by": "game.exe"}]
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: game)
+    # ComfyUI is lazy: with no model loaded, its first job is a load, so it's refused.
+    assert rig.arb.switch("comfy", 0, request=True)["ok"] is False
+    rig.arb.switch("comfy", 0)                       # a person's order: card and model
+    rig.comfy.vram = 7000                            # model resident, queue empty between clips
+    assert rig.arb.switch("comfy", 0, request=True)["ok"] is True
+
+
+def test_why_blames_the_claim(rig, monkeypatch):
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: [
+        {"pid": 4242, "name": "game.exe", "exe": None, "note": "a Steam game", "by": "game.exe"}])
+    why = rig.arb.why_all()
+    assert why["comfy"]["would"] == "blocked"
+    assert any("claimed by game.exe (a Steam game)" in n for n in why["comfy"]["notes"])
+
+
+def test_status_says_who_owns_the_card_by_right(rig, monkeypatch):
+    """The whole path, not a patched answer: a rule, a process table, and the line a
+    person reads in `status`. Twenty pids of one game come out as one grouped line."""
+    monkeypatch.setattr(rig.arb, "claim_rules",
+                        claims.rules([{"name": "game.exe", "note": "a Steam game"}], builtin=False))
+    monkeypatch.setattr(host, "processes", lambda: {
+        n: {"pid": n, "ppid": 1, "name": "game.exe", "exe": None} for n in (1, 2, 3)})
+    s = rig.arb.probe()
+    assert len(s["claims"]) == 3
+    assert "claims:" in rig.arb.describe(s)
+    assert "game.exe x3 (a Steam game)" in rig.arb.describe(s)
+
+
+def test_cli_claims_lists_what_matches_and_the_rules(rig, monkeypatch, capsys):
+    monkeypatch.setattr(rig.arb, "claim_rules",
+                        claims.rules([{"name": "game.exe", "note": "the game I play"}], builtin=False))
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: [
+        {"pid": 4242, "name": "game.exe", "exe": r"D:\Games\game.exe", "note": "the game I play",
+         "by": "game.exe (D:\\Games\\game.exe)"}])
+    assert rig.cli("claims", "--json") == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["hits"][0]["name"] == "game.exe"
+    assert out["rules"] == [{"name": "game.exe", "note": "the game I play"}]
+    assert rig.cli("claims") == 0
+    text = capsys.readouterr().out
+    assert "the card is claimed by game.exe (the game I play)" in text
+    assert "- name game.exe  (the game I play)" in text      # what's in force, and why
 
 
 def test_hook_allows_when_comfy_idle(rig):
@@ -202,8 +408,11 @@ def test_race_job_after_hook_allowed(rig):
     """§3.1, second half: a job queued after Strata loaded waits (--wait) for
     Strata's answer, then unloads it, then runs."""
     t = rig.strata.request_async(0.3)
-    time.sleep(0.1)
-    assert rig.strata.loaded
+    # The gated load takes ~0.15 s on Windows (its first HTTPS-capable opener, slower file writes).
+    deadline = time.monotonic() + 2
+    while not rig.strata.loaded and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert rig.strata.loaded and t.is_alive()
     assert rig.cli("switch", "comfy", "--wait", "5") == 0
     t.join()
     assert t.result == 200 and not rig.strata.loaded
@@ -262,6 +471,19 @@ def test_hold_takes_options_before_the_command(rig):
     taken for the command."""
     assert rig.cli("hold", "comfy", "--wait", "5", "--", sys.executable, "-c", "raise SystemExit(7)") == 7
     assert rig.cli("hold", "--wait", "5", "comfy", "--", sys.executable, "-c", "raise SystemExit(7)") == 7
+
+
+def test_hold_waits_for_strata_answering(rig):
+    """`hold comfy --wait N` while Strata answers: waits for the answer, then holds.
+    The command's REMAINDER argument used to swallow `--wait N` after NAME, so the
+    hold failed at once with "Strata is answering" (seen 2026-10-19, comfy-render --hold)."""
+    rig.strata.loaded = True
+    t = rig.strata.request_async(1.0)
+    time.sleep(0.1)
+    assert rig.cli("hold", "comfy", "--wait", "30", "--", sys.executable, "-c", "pass") == 0
+    t.join()
+    assert t.result == 200 and not rig.strata.loaded
+    assert [e["event"] for e in rig.events() if e["event"].startswith("hold")] == ["hold", "hold-end"]
 
 
 def test_hold_exit_code_is_the_commands(rig):
@@ -375,7 +597,7 @@ def _guard(rig, monkeypatch):
     """The real guard node's take_gpu(), running vhotseat as a subprocess
     (tests/run_cli.py: the real CLI with GPU and services read from the fakes)."""
     sys.path.insert(0, str(ROOT / "integrations" / "comfyui"))
-    monkeypatch.setenv("VHOTSEAT_BIN", str(ROOT / "tests" / "run_cli.py"))
+    monkeypatch.setenv("VHOTSEAT_BIN", cli_bin(rig.state.parent))
     monkeypatch.setenv("STRATA_URL", rig.strata.url)
     monkeypatch.setenv("COMFY_URL", rig.comfy.url)
     monkeypatch.setenv("XDG_STATE_HOME", str(rig.state.parent))
@@ -403,6 +625,32 @@ def test_guard_reports_why_gpu_is_busy(rig, monkeypatch):
     with pytest.raises(guard.GpuBusy, match="Strata is answering or loading"):
         guard.take_gpu()
     t.join()
+
+
+def test_the_guard_falls_back_when_vhotseat_doesnt_know_request(rig, monkeypatch):
+    """An installed vhotseat from before claims rejects --request outright. Every job used to
+    fail with argparse's message; it gets the typed switch instead - the weaker one, since a
+    claim won't refuse it - and says so once, then stops paying for the failed run."""
+    guard = _guard(rig, monkeypatch)
+    calls = []
+
+    class Res:
+        def __init__(self, code, err):
+            self.returncode, self.stderr, self.stdout = code, err, ""
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if "--request" in cmd:
+            return Res(2, "usage: vhotseat switch [-h] ...: error: unrecognized arguments: --request")
+        return Res(0, "")
+
+    monkeypatch.setattr(guard, "REQUEST_OK", True)
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    guard.take_gpu()
+    assert "--request" in calls[0] and "--request" not in calls[1]
+    guard.take_gpu()
+    assert len(calls) == 3 and "--request" not in calls[2]
+    assert guard.REQUEST_OK is False
 
 
 def test_switch_with_wait_lets_a_comfy_batch_finish(rig):

@@ -11,12 +11,44 @@ for the lock can still decide what to do:
   already put the GPU on X and keeps it there. Waiting would deadlock when the
   held command waits on the switch's caller (a ComfyUI job, whose guard runs
   `switch comfy`).
+
+On Windows the flock is a byte-range lock (msvcrt). Those are mandatory, so it
+locks one byte far past the note: the note itself stays readable by everyone.
 """
 
-import fcntl
+import os
 from pathlib import Path
 
 from . import util
+
+if os.name == "nt":
+    import msvcrt
+
+    LOCK_AT = 2**30   # well past any note; Windows lets a lock lie beyond the end of the file
+
+    def _try_lock(f) -> bool:
+        os.lseek(f.fileno(), LOCK_AT, os.SEEK_SET)
+        try:
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+
+    def _unlock(f) -> None:
+        os.lseek(f.fileno(), LOCK_AT, os.SEEK_SET)
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _try_lock(f) -> bool:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+    def _unlock(f) -> None:
+        pass  # closing the file releases a flock
 
 
 class Held:
@@ -38,6 +70,7 @@ class Held:
     def __exit__(self, *exc):
         try:
             self.mark("")
+            _unlock(self._f)
         finally:
             self._f.close()
 
@@ -63,7 +96,7 @@ class GpuLock:
         n = self.generation() + 1
         tmp = self.generation_path.with_suffix(".tmp")
         tmp.write_text(str(n))
-        tmp.replace(self.generation_path)
+        util.replace(tmp, self.generation_path)
         return n
 
     def holder(self) -> str:
@@ -71,17 +104,15 @@ class GpuLock:
         when the lock is free (releasing it clears the note). A plain read: the
         lock isn't touched."""
         try:
-            return self.path.read_text().strip()
+            return self.path.read_text(encoding="utf-8").strip()
         except OSError:
             return ""
 
     def try_take(self, holder: str) -> Held | str:
         """Take the lock if it's free; otherwise return the current holder's note."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        f = open(self.path, "a+")
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        f = open(self.path, "a+", encoding="utf-8")
+        if not _try_lock(f):
             f.seek(0)
             current = f.read().strip()
             f.close()

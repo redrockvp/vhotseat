@@ -27,7 +27,9 @@ A worked example, from diagnosis to an upstream fix:
 
 ## 1. Pin down the trigger
 
-From `~/.local/state/vhotseat/events.jsonl` and `vhotseat status`, find what
+From `~/.local/state/vhotseat/events.jsonl` and `vhotseat status` - whose `holds:`
+line names every process holding card memory and marks the ones vhotseat doesn't
+manage - find what
 was held after release (MiB) and what ran just before. Then, from a freshly
 restarted workload, run one job of each kind the user runs, release after each
 (`vhotseat switch none`), and note the VRAM. The job after which it stays high

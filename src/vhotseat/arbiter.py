@@ -18,7 +18,7 @@ import signal
 import subprocess
 import time
 
-from . import host, util
+from . import claims, host, util
 from .drivers.base import Workload
 from .errors import Busy, ReleaseFailed, SwitchError
 from .events import EventLog
@@ -33,7 +33,8 @@ HOLD_ENV = "VHOTSEAT_HOLD"
 class Arbiter:
     def __init__(self, workloads: list[Workload], gpu, lock: GpuLock, events: EventLog, *,
                  gate_release_timeout_s: float = 20, release_timeout_s: float = 60,
-                 machine_ram=host.machine_ram, telemetry=None):
+                 machine_ram=host.machine_ram, telemetry=None, power: dict | None = None,
+                 claim_rules: list | None = None, claim_ignore=()):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
         self.lock = lock
@@ -45,9 +46,27 @@ class Arbiter:
         self.machine_ram = machine_ram
         # Every probe is kept as a sample, for `vhotseat web`'s history.
         self.telemetry = telemetry
+        # What a unit of electricity costs where this machine is (config `power:`).
+        self.power = power or {}
+        # What owns the card by right rather than by arrangement (a game): see claims.py.
+        self.claim_rules = claim_rules if claim_rules is not None else claims.rules([])
+        # Names and path globs the built-in rules won't claim (Wallpaper Engine, a VR runtime).
+        self.claim_ignore = claims.ignores(claim_ignore)
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
+
+    def snapshot_all(self) -> tuple[dict, list]:
+        """One read of the card: the attribution sums and the named processes behind them.
+        A backend that can't name processes gives the sums and an empty list."""
+        sel = {n: w.vram_selector for n, w in self.workloads.items()}
+        fn = getattr(self.gpu, "read_all", None)
+        return fn(sel) if fn else (self.gpu.snapshot(sel), [])
+
+    def holders(self, limit: int = 8) -> list[dict]:
+        """Who holds the card's memory, biggest first, by name: the workloads vhotseat
+        manages and, with workload None, the ones nothing manages (a desktop, a game)."""
+        return self.snapshot_all()[1][:limit]
 
     def gpu_health(self) -> dict:
         """The card's model, load, temperature and power; not part of `status`."""
@@ -59,13 +78,14 @@ class Arbiter:
     # --- status --------------------------------------------------------------
 
     def probe(self) -> dict:
-        gpu = self.snapshot()
+        gpu, held = self.snapshot_all()
         states = {n: w.probe(gpu) for n, w in self.workloads.items()}
         active = [n for n, w in self.workloads.items() if w.active(states[n], gpu)]
         mode = "conflict" if len(active) > 1 else active[0] if active else NONE
         ram = self.machine_ram()
         ram.update({n: w.memory() for n, w in self.workloads.items()})
-        status = {"mode": mode, **states, "gpu": gpu, "ram": ram, "last_event": self.events.last()}
+        status = {"mode": mode, **states, "gpu": gpu, "holders": held, "claims": self._claims_in(held),
+                  "ram": ram, "last_event": self.events.last()}
         if self.telemetry is not None:
             self.telemetry.sample(status, self.gpu_health)
         return status
@@ -78,6 +98,13 @@ class Arbiter:
         shares = ", ".join(f"{n} {g[f'{n}_mib']}" for n in self.workloads)
         lines.append(f"{'gpu:':<{width}}" + (g["error"] if "error" in g else
                      f"{g['free_mib']} of {g['total_mib']} MiB free ({shares}, other {g['other_mib']})"))
+        if rows := s.get("holders"):
+            shown = "  ".join(f"{r['name'] or r['pid']} {r['mib']}" + (f" ({r['workload']})" if r["workload"] else "")
+                              for r in rows[:5])
+            lines.append(f"{'holds:':<{width}}{shown}")
+        if hits := s.get("claims"):
+            lines.append(f"{'claims:':<{width}}the card is claimed by {claims.describe(hits)}: nothing new "
+                         "loads while it runs")
         lines.append(f"{'ram:':<{width}}" + self._describe_ram(s["ram"]))
         if ev := s.get("last_event"):
             detail = ", ".join(f"{k}={v}" for k, v in ev.items() if k not in ("time", "event"))
@@ -115,7 +142,14 @@ class Arbiter:
             if have is None or have < need:
                 return f"{who} needs {need} MiB of available RAM, {have} MiB is available"
         if (need := adm.get("min_free_vram_mib")) is not None:
-            have = self.snapshot().get("free_mib")
+            snap = self.snapshot()
+            have = snap.get("free_mib")
+            # What x already has on the card is not room it still has to find: a model that
+            # is loaded, or landing right now, has paid for itself. Without this, a second
+            # request arriving while the first one's weights stream in reads the target's own
+            # 20 GB as the blocker and refuses the very load that put it there.
+            if have is not None:
+                have += max(0, x.vram_mib() - x.idle_vram_mib)
             if have is None or have < need:
                 return f"{who} needs {need} MiB of free VRAM, {have} MiB is free"
         return None
@@ -133,8 +167,19 @@ class Arbiter:
         for y in others:
             try:
                 if y.service_active():
-                    if ensure:
-                        y.ensure_running()
+                    # "A server still coming up must not be walked over" and "a workload closed by
+                    # hand must not block the others" are the same question: is there something to
+                    # bring up? Holding its port, or holding no more than its idle weight, yes: it
+                    # gets the chance to come up and unload politely. Answering nothing *while*
+                    # holding the card is the other case - a process that died with its VRAM stuck -
+                    # and starting a program can't free that memory, so there it goes straight to
+                    # the wait below, which says so by MiB and names what to do instead.
+                    if ensure and (y.listening() or y.vram_mib() <= y.idle_vram_mib):
+                        try:
+                            y.ensure_running(timeout=min(self.release_timeout_s, max(1.0, timeout)))
+                        except Exception as exc:
+                            util.log(f"{y.name}: can't be started to unload from ({exc}); "
+                                     "waiting for its GPU memory to drop")
                     try:
                         done += y.release(wait, timeout)
                     except ReleaseFailed as e:
@@ -200,6 +245,115 @@ class Arbiter:
             raise SwitchError(f"{what}, but the mode is {mode}, not {name}; run `vhotseat status`")
         return done
 
+    def _claims_in(self, held: list[dict]) -> list[dict]:
+        procs = host.processes()
+        # Every pid of a configured workload, not just the ones holding enough memory to make
+        # the holder list. A workload installed under D:\Games\ matches the built-in rule for a
+        # game in a Games folder: while it is idle it isn't in that list, and it would then
+        # claim the card against its own loads.
+        owned = {r["pid"] for r in held if r["workload"]}
+        for w in self.workloads.values():
+            sel = w.vram_selector
+            if not sel or sel[0] != "process":
+                continue
+            needle = sel[1].lower()
+            for pid, p in procs.items():
+                if needle in f"{p.get('exe') or ''} {p.get('name') or ''}".lower():
+                    owned.add(pid)
+        return claims.matching(self.claim_rules, procs, owned, self.claim_ignore)
+
+    def claim_hits(self) -> list[dict]:
+        """Processes that own the card right now - a game, or whatever a `claims:` rule
+        matches. Never a pid already credited to a workload: the thing holding the card
+        for vhotseat is not also the thing that owns it. Cheap enough to ask at every
+        decision (a machine-wide scan is tens of milliseconds), which is what keeps
+        vhotseat stateless: no daemon has to notice a game for the rule to hold."""
+        return self._claims_in(self.snapshot_all()[1])
+
+    def why_all(self) -> dict:
+        """For each workload: could it take the card right now, and what stands in the
+        way. It reads the same state `switch` would act on and touches nothing - no
+        release, no load, no restart. What it's for is the question a dashboard can't
+        otherwise answer: not who holds the card, but why the next job can't have it."""
+        s = self.probe()
+        gpu, ram = s["gpu"], s["ram"]
+        hits = self.claim_hits()
+        out = {}
+        for name, x in self.workloads.items():
+            notes: list[str] = []
+            would, freed = "ready", 0
+            resident = x.active(s[name], gpu)
+            if s["mode"] == name:
+                notes.append("it holds the card now")
+            if s["mode"] == "conflict":
+                notes.append("two workloads are on the card at once: asking for it will release the other")
+            for y in self._others(name):
+                held = y.vram_mib()
+                if not y.service_active():
+                    if held > y.idle_vram_mib:
+                        would, why = "blocked", f"a {y.label} process holds {held} MiB but its service is stopped"
+                        notes.append(f"{why}: kill it by hand")
+                    continue
+                if not y.reachable():
+                    if held > y.idle_vram_mib:
+                        would = "blocked"
+                        notes.append(f"{y.label} isn't answering and still holds {held} MiB: start it so "
+                                     "vhotseat can release it, or kill the process")
+                    else:
+                        notes.append(f"{y.label} isn't answering and holds nothing on the card: treated as stopped")
+                    continue
+                if busy := y.busy():
+                    if would == "ready":
+                        would = "waiting"
+                    notes.append(f"{y.label} is busy: {busy}; a handover waits for it to finish")
+                elif held > y.idle_vram_mib:
+                    freed += held
+                    notes.append(f"{y.label} holds {held} MiB and would be asked to release it")
+            adm, model = x.admission_for()
+            who = f"{x.label} ({model})" if model else x.label
+            if hits:
+                if resident:
+                    notes.append(f"the card is claimed by {claims.describe(hits)}: it keeps what it has, "
+                                 "but reloading it would be refused")
+                else:
+                    would, why = "blocked", (f"the card is claimed by {claims.describe(hits)}: "
+                                             "nothing new loads while it runs")
+                    notes.insert(0, why)
+            if (need := (adm or {}).get("min_free_vram_mib")) and not resident:
+                free = gpu.get("free_mib") or 0
+                have = free + freed
+                if have < need:
+                    would = "blocked"
+                    notes.append(f"{who} only loads with {need} MiB free: releasing the others gets {have} MiB "
+                                 f"({free} free now)")
+                    if gpu.get("other_mib"):
+                        unmanaged = ", ".join(f"{r['name'] or r['pid']} {r['mib']}" for r in s["holders"]
+                                              if not r["workload"])[:160]
+                        notes.append(f"{gpu['other_mib']} MiB is held by processes vhotseat doesn't manage"
+                                     + (f" ({unmanaged})" if unmanaged else "") + ": nothing here frees it")
+            if (need := (adm or {}).get("min_available_ram_mib")) and not resident:
+                have = ram.get("available_mib")
+                if have is not None and have < need:
+                    if would == "ready":
+                        would = "waiting"
+                    notes.append(f"{who} wants {need} MiB of available RAM, {have} MiB is free; getting it back "
+                                 "from a workload means restarting it")
+            sized = (s[name] or {}).get("sized") or {}
+            if sized.get("bytes"):
+                # Reported, not enforced: the server may still fit it by shrinking its context
+                # or spilling into RAM. The number is for seeing that before the weights land.
+                note = (f"{(sized.get('model') or x.label).rsplit('/', 1)[-1]} sizes at "
+                        f"{sized['bytes'] // 2**20} MiB")
+                if sized.get("n_ctx"):
+                    note += f" at {sized['n_ctx']} ctx"
+                card = gpu.get("total_mib")
+                if card and sized["bytes"] // 2**20 > card:
+                    note += f", more than the card's {card} MiB: only part of it can be resident"
+                notes.append(note)
+            out[name] = {"target": name, "label": x.label, "would": would, "holder": s["mode"],
+                         "free_mib": gpu.get("free_mib"), "resident": resident, "notes": notes}
+        return out
+
     def gate(self, name: str) -> bool:
         """Run inside `name`'s own load (Strata's before_load): may it load?
 
@@ -232,7 +386,11 @@ class Arbiter:
         deadline = time.monotonic() + x.gate["timeout"] * util.SCALE if x.gate.get("timeout") else None
         with got:
             gpu = self.snapshot()
-            reason = gpu.get("error") or next((r for y in others if (r := y.busy())), None)
+            hits = self.claim_hits()
+            reason = (gpu.get("error")
+                      or (f"the card is claimed by {claims.describe(hits)}: nothing new loads while it runs"
+                          if hits else None)
+                      or next((r for y in others if (r := y.busy())), None))
             if not reason:
                 # Already loaded (a hook fired again, or `vhotseat gate` run by hand):
                 # its own memory isn't a shortfall, so don't restart anyone for it.
@@ -279,14 +437,22 @@ class Arbiter:
         unless = (lambda h: h == f"hold {name}") if skip_if_held else None
         return self.lock.take(f"switch {name}", unless=unless, on_wait=waiting)
 
-    def switch(self, name: str, wait: float, load: bool = True) -> dict:
+    def switch(self, name: str, wait: float, load: bool = True, request: bool = False) -> dict:
         """Move the GPU to `name` (or free it, for "none") under the lock. Returns
         {"ok": …} plus "held" or "error"; the caller prints status.
 
         While a `hold name` owns the lock, the GPU is already `name`'s and stays
         so: return at once. That's how a ComfyUI job queued by a held script gets
         past its guard; before, the guard waited on the hold, which was waiting
-        on the job."""
+        on the job.
+
+        `request` marks a switch a workload asked for on somebody's behalf - ComfyUI's
+        guard node - rather than one a person typed. A claimed process refuses the
+        request and not the typed command: "don't load on top of the game" is a rule
+        about loads nobody chose, and someone who types `vhotseat switch` has already
+        decided. A request that changes nothing (the workload already holds the card,
+        so nothing new would load) is not refused either: a batch mid-flight carries on,
+        which is the same promise the guard makes to a render in flight."""
         held = os.environ.get(HOLD_ENV)
         if held:
             # Inside `hold`: our parent owns the lock, so taking it would deadlock.
@@ -294,6 +460,11 @@ class Arbiter:
                 util.log(f"can't switch to {name} inside `hold {held}`")
                 return {"ok": False, "error": f"inside hold {held}", "inside_hold": held}
             return {"ok": True, "held": held}
+        if request and (hits := self.claim_hits()) and self.probe()["mode"] != name:
+            why = f"the card is claimed by {claims.describe(hits)}: nothing new loads while it runs"
+            self.events.record("switch", to=name, ok=False, error=why)
+            util.log(f"switch to {name} refused: {why}")
+            return {"ok": False, "error": why}
         # Wait for the others' running work *without* the lock: a ComfyUI job's guard
         # needs the lock to start, so holding it while waiting for ComfyUI's queue
         # to drain would stop the queue (it did, until 2026-10-17: the batch stalled
@@ -358,8 +529,15 @@ class Arbiter:
                 util.log(f"could not run {command[0]}: {e}")
                 return 1
             # Pass termination on, so the lock is never released under a running render.
-            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-                signal.signal(sig, lambda signum, _frame: proc.send_signal(signum))
+            if os.name == "nt":
+                # The console sends Ctrl+C / Ctrl+Break to the command too: just wait for it.
+                # A SIGTERM can only be passed on as TerminateProcess.
+                for sig in (signal.SIGINT, signal.SIGBREAK):
+                    signal.signal(sig, lambda _signum, _frame: None)
+                signal.signal(signal.SIGTERM, lambda _signum, _frame: proc.terminate())
+            else:
+                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                    signal.signal(sig, lambda signum, _frame: proc.send_signal(signum))
             code = proc.wait()
             self.events.record("hold-end", mode=name, exit=code)
             return code

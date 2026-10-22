@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 
 from . import config as cfgmod
-from . import host
+from . import claims, host
 from .arbiter import Arbiter
 from .drivers.base import Context
 from .events import EventLog
@@ -45,6 +45,9 @@ def build(cfg: dict, *, env=os.environ, gpu=None, machine_ram=None, **arbiter_ar
         # shares the lock with anything still on vhotseat.
         GpuLock(state / ("switch.lock" if index == 0 else f"gpu{index}.lock")),
         EventLog(state / "events.jsonl", keep=(cfg.get("events") or {}).get("keep", 500), telemetry=telemetry),
-        machine_ram=machine_ram or host.machine_ram, telemetry=telemetry, **arbiter_args,
+        machine_ram=machine_ram or host.machine_ram, telemetry=telemetry, power=cfg.get("power") or {},
+        claim_rules=claims.rules(cfg.get("claims") or [], cfg.get("claims_builtin", True)),
+        claim_ignore=cfg.get("claims_ignore") or [],
+        **arbiter_args,
     )
     return arbiter

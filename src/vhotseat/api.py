@@ -38,6 +38,7 @@ class Seat:
     def __init__(self, arbiter: Arbiter):
         self.arbiter = arbiter
         self._cache: tuple[int, str] | None = None   # (generation, owner)
+        self._acquired: tuple[int, str] | None = None   # (generation, name) we took
 
     def generation(self) -> int:
         return self.arbiter.lock.generation()
@@ -58,6 +59,12 @@ class Seat:
         if holder and holder not in (f"switch {name}", f"hold {name}"):
             return False
         gen = self.generation()
+        if self._acquired and self._acquired == (gen, name):
+            # We took the card and nothing has changed hands since. For a server that loads
+            # on request this is the window where its weights are still landing: a probe
+            # would say nobody holds the GPU, and a burst of gated requests would each take
+            # the handover again. The seat remembers who it just gave it to.
+            return True
         if self._cache and self._cache[0] == gen:
             return self._cache[1] == name
         owner = self.owner()
@@ -77,10 +84,17 @@ class Seat:
         return self._switch(NONE, wait)
 
     def _switch(self, name: str, wait: float) -> list[str]:
-        result = self.arbiter.switch(name, wait, load=False)
+        # A gate asking through the Seat API is a load nobody explicitly chose, so it is a
+        # request and claims refuse it: a proxy must not put weights on the card under a game.
+        # A typed `vhotseat switch` is an order, and goes through switch() without this flag.
+        # Letting go of the card is not a load: a claim must never stop work getting *off* the
+        # card, which is also the door the release-on-claim-start (phase 1) goes through.
+        result = self.arbiter.switch(name, wait, load=False, request=(name != NONE))
         self._cache = None
+        self._acquired = None
         if not result["ok"]:
             raise result.get("exception") or SwitchError(result["error"])
+        self._acquired = (self.generation(), name)
         return result.get("done", [])
 
 

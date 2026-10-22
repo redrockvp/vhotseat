@@ -5,6 +5,9 @@ The page (web.html) polls a small JSON API:
 
   GET /api/status                    the live status (`status --json`), plus the workloads' order and
                                      the card's model, load, temperature and power
+  GET /api/why                       for each workload: could it take the card now, and what stands in
+                                     the way (`why`'s dry run: it releases nothing)
+  GET /api/cost?since=&until=        kWh and money over that window, per holder (needs power.price)
   GET /api/history?since=&until=     samples between two Unix times, averaged into at most `points` buckets
   GET /api/events?since=&until=      events, newest first
   GET /api/logs?since=&until=        vhotseat's log lines from every process, newest first
@@ -13,6 +16,7 @@ It only reads: nothing here switches or releases anything. While it runs it
 also records samples, like `vhotseat record`.
 """
 
+import contextlib
 import json
 import signal
 import threading
@@ -22,10 +26,12 @@ from importlib import resources
 from urllib.parse import parse_qs, urlparse
 
 from . import util
-from .telemetry import Sampler
+from .telemetry import Sampler, cost
 
 # Probing calls every workload's API; several open tabs share one probe a second.
 STATUS_TTL_S = 1.0
+# `why` probes again (busy(), reachability): share it between tabs the same way.
+WHY_TTL_S = 3.0
 
 
 def bucket(samples: list[dict], points: int) -> list[dict]:
@@ -64,6 +70,8 @@ class Dashboard:
         self.telemetry = arbiter.telemetry
         self._status = (0.0, None)
         self._status_lock = threading.Lock()
+        self._why = (0.0, None)
+        self._why_lock = threading.Lock()
 
     def status(self) -> dict:
         with self._status_lock:
@@ -76,12 +84,23 @@ class Dashboard:
                     cached["retention_hours"] = self.telemetry.retention_s / 3600
                     cached["interval_s"] = self.telemetry.interval_s
                     cached["oldest"] = self.telemetry.oldest()
+                claim_transitions(self.arbiter.events, cached.get("claims", []))
                 self._status = (time.monotonic(), cached)
+            return cached
+
+    def why(self) -> dict:
+        with self._why_lock:
+            at, cached = self._why
+            if cached is None or time.monotonic() - at > WHY_TTL_S:
+                cached = {"now": time.time(), "targets": self.arbiter.why_all()}
+                self._why = (time.monotonic(), cached)
             return cached
 
     def api(self, path: str, query: dict) -> tuple[int, object]:
         if path == "/api/status":
             return 200, self.status()
+        if path == "/api/why":
+            return 200, self.why()
         if self.telemetry is None:
             return 404, {"error": "telemetry is off (telemetry.enabled: false in the config)"}
         now = time.time()
@@ -92,6 +111,13 @@ class Dashboard:
             limit = max(1, min(10000, int(query.get("limit", [1000])[0])))
         except ValueError:
             return 400, {"error": "since, until, points and limit are numbers"}
+        if path == "/api/cost":
+            price = self.arbiter.power.get("price_per_kwh")
+            if not price:
+                return 404, {"error": "no power.price_per_kwh in the config"}
+            report = cost(self.telemetry.samples(since, until), price)
+            extra = {k: v for k, v in self.arbiter.power.items() if k != "price_per_kwh"}
+            return 200, {"price": price, "window_s": until - since, **extra, **report}
         if path == "/api/history":
             return 200, bucket(self.telemetry.samples(since, until), points)
         if path == "/api/events":
@@ -151,6 +177,88 @@ def serve(arbiter, host: str, port: int) -> int:
         finally:
             server.server_close()
     return 0
+
+
+def watch(arbiter, polls: int | None = None) -> int:
+    """`vhotseat watch`: sample the telemetry and record when a claim starts and ends.
+
+    Nothing depends on this process to defend a game's card: every gate and guard asks
+    who owns the card at the moment it decides, so a load is refused whether or not
+    watch runs. What watch adds is the record - `claim` and `claim-end` in the event log,
+    with the process and what matched it - so the dashboard can show when the card was
+    somebody else's, and a refusal can be read back weeks later. It is also the cheapest
+    always-on sampler, which is what `vhotseat autostart install --command watch` starts.
+
+    `polls` stops it after that many polls: what the tests use, and what a scheduled
+    claim log can use instead of a resident process.
+    """
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(ValueError):       # not the main thread: no handlers to set
+            signal.signal(sig, lambda *_: stop.set())
+    if arbiter.telemetry is None:
+        util.log("telemetry is off in the config: watch records claim events and no samples")
+    interval = arbiter.telemetry.interval_s if arbiter.telemetry else 5
+    with Sampler(arbiter) if arbiter.telemetry else contextlib.nullcontext():
+        while polls is None or polls > 0:
+            polls = None if polls is None else polls - 1
+            claim_transitions(arbiter.events, arbiter.claim_hits())
+            if polls is not None and polls <= 0:
+                break
+            stop.wait(interval)
+    return 0
+
+
+def open_claims(events, limit: int = 500) -> dict:
+    """Which claims the record already shows as open, read back from the tail of the event log.
+
+    The log is the record, so it's what says whether a claim has been written: `watch`
+    restarting does not re-open a claim that is still running, and `web` and `watch` running
+    together write the row once rather than twice. The trade is that a claim older than the
+    retained log (`events.keep` lines) is forgotten, and recording it again is honest."""
+    out: dict[tuple, dict] = {}
+    for e in events.tail(limit):
+        if e.get("event") not in ("claim", "claim-end"):
+            continue
+        key = (e.get("name"), e.get("note"))
+        if e.get("event") == "claim":
+            out[key] = e
+        else:
+            out.pop(key, None)
+    return out
+
+
+def claim_transitions(events, hits: list[dict]) -> None:
+    """Record a `claim` / `claim-end` row as the set of claims changes. What's already open comes
+    from the log (see open_claims), not from this process's memory.
+
+    A claim is a kind of process, not a pid: one game is twenty processes, and when one of them
+    exits the other nineteen still hold the card, so that is not the card opening again."""
+    now = _groups(h for h in hits)
+    was = open_claims(events)
+    for (name, note), group in now.items():
+        if (name, note) in was:
+            continue
+        events.record("claim", source="watch", pid=group[0]["pid"], name=name, note=note,
+                      by=group[0]["by"], processes=len(group))
+        util.log(f"{name}" + (f" x{len(group)}" if len(group) > 1 else "") +
+                 f" claims the card ({note}): nothing new loads while it runs")
+    for (name, note), row in was.items():
+        if (name, note) in now:
+            continue
+        n = row.get("processes") or 1
+        events.record("claim-end", source="watch", pid=row.get("pid"), name=name, note=note,
+                      processes=n)
+        util.log(f"{name}" + (f" x{n}" if n > 1 else "") +
+                 " is gone: the card is open to loads again")
+
+
+def _groups(hits):
+    """Group claim hits by (process name, what claimed them), keeping their pids."""
+    out: dict[tuple, list] = {}
+    for h in hits:
+        out.setdefault((h["name"], h["note"]), []).append(h)
+    return out
 
 
 def record(arbiter) -> int:

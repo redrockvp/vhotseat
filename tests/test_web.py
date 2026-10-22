@@ -10,7 +10,7 @@ import urllib.request
 
 import pytest
 
-from vhotseat import config, telemetry, util, web
+from vhotseat import claims, config, host, telemetry, util, web
 from vhotseat.telemetry import Telemetry
 
 
@@ -135,6 +135,58 @@ def test_web_serves_the_page_and_history_recorded_before_it_started(rig, server)
     assert code == 200 and icon.startswith(b"<svg") and b'href="/favicon.svg"' in page
 
 
+def test_the_dashboard_is_the_claim_recorder_wherever_it_runs(rig, server, monkeypatch):
+    """A box that runs `vhotseat web` already has something probing the machine every few
+    seconds. It should record the claims itself rather than needing a second process."""
+    monkeypatch.setattr(rig.arb, "claim_rules",
+                        claims.rules([{"name": "game.exe", "note": "a Steam game"}], builtin=False))
+    monkeypatch.setattr(host, "processes", lambda: {1: {"pid": 1, "ppid": 1, "name": "game.exe", "exe": None}})
+    get(f"{server}/api/status")
+    monkeypatch.setattr(host, "processes", lambda: {})
+    time.sleep(1.1)                       # the status cache's second
+    get(f"{server}/api/status")
+    rows = [e for e in rig.events() if e["event"] in ("claim", "claim-end")]
+    assert [(e["event"], e["name"], e["source"]) for e in rows] == [
+        ("claim", "game.exe", "watch"), ("claim-end", "game.exe", "watch")]
+
+
+def test_watch_records_one_claim_row_per_kind_of_process(rig, monkeypatch):
+    """One game is twenty processes, and a browser or an anti-cheat helper is more. The
+    log should say the card was claimed - once - and when it came back."""
+    polls = {"n": 0}
+
+    def hits():
+        polls["n"] += 1
+        if polls["n"] > 2:
+            return []                                  # the game closed
+        return [{"pid": n, "name": "game.exe", "exe": None, "note": "a Steam game",
+                 "by": "game.exe"} for n in (11, 12)]
+
+    monkeypatch.setattr(rig.arb, "claim_hits", hits)
+    monkeypatch.setattr(rig.arb.telemetry, "interval_s", 0.02)
+    assert web.watch(rig.arb, polls=3) == 0
+    rows = [e for e in rig.events() if e["event"] in ("claim", "claim-end")]
+    assert [(e["event"], e["name"], e.get("processes")) for e in rows] == [
+        ("claim", "game.exe", 2), ("claim-end", "game.exe", 2)]
+
+
+def test_claim_events_are_per_claim_not_per_process(rig):
+    """One game is twenty processes. When one of them exits the other nineteen still own the
+    card, so the log must not say the card is open again. And the state is read from the log,
+    not from a process's memory: `web` and `watch` recording together write the row once, and
+    `watch` restarting doesn't re-open a claim that is still running."""
+    hits = [{"pid": 10, "name": "eldenring.exe", "exe": None, "note": "a Steam game", "by": "path x"},
+            {"pid": 11, "name": "eldenring.exe", "exe": None, "note": "a Steam game", "by": "path x"}]
+    web.claim_transitions(rig.arb.events, hits)
+    web.claim_transitions(rig.arb.events, hits)        # a second recorder, same claim
+    web.claim_transitions(rig.arb.events, hits[:1])    # one of the game's processes exited
+    rows = [e for e in rig.arb.events.tail() if e["event"].startswith("claim")]
+    assert [e["event"] for e in rows] == ["claim"] and rows[0]["processes"] == 2
+    web.claim_transitions(rig.arb.events, [])          # the game is gone
+    rows = [e for e in rig.arb.events.tail() if e["event"].startswith("claim")]
+    assert [e["event"] for e in rows] == ["claim", "claim-end"]
+
+
 def test_sampler_samples_in_the_background(rig, monkeypatch):
     monkeypatch.setattr(rig.arb.telemetry, "interval_s", 1)
     with telemetry.Sampler(rig.arb):
@@ -166,6 +218,68 @@ def test_gpu_load_temperature_and_power_are_recorded_and_served(rig, server):
     assert st["gpu_health"]["name"] == "NVIDIA GeForce RTX 5070 Ti"
     # `status --json` itself is unchanged: health is the dashboard's.
     assert "gpu_health" not in rig.arb.probe()
+
+
+def test_web_serves_the_handover_dry_run(rig, server):
+    """The page's answer to "why can't this job have the card?" comes from the same dry
+    run the CLI prints, not a guess made in the page."""
+    rig.strata.loaded = True
+    code, body = get(f"{server}/api/why")
+    assert code == 200
+    why = json.loads(body)["targets"]
+    assert why["comfy"]["would"] == "ready"
+    assert "Strata holds 14000 MiB and would be asked to release it" in why["comfy"]["notes"]
+
+
+def test_cost_integrates_the_cards_wattage_per_holder():
+    """kWh and cost over the sampled gaps, charged to whoever held the card at the gap's
+    start. A stretch with no samples - or no wattage - is no data, not a card that drew
+    nothing, so it is skipped rather than counted as free."""
+    samples = [{"t": 0, "mode": "strata", "gpu_power_w": 200},
+               {"t": 60, "mode": "strata", "gpu_power_w": 200},
+               {"t": 120, "mode": "strata", "gpu_power_w": 200},
+               {"t": 180, "mode": "comfy"},                              # the driver didn't say
+               {"t": 1260, "mode": "comfy", "gpu_power_w": 400},         # a 18-minute hole
+               {"t": 1320, "mode": "comfy", "gpu_power_w": 400}]
+    out = telemetry.cost(samples, 4.0)
+    assert out["kwh"] == 0.013 and out["cost"] == 0.05 and out["w_now"] == 400
+    assert out["by_mode"]["strata"] == {"kwh": 0.007, "cost": 0.03, "hours": 0.03}
+    assert out["by_mode"]["comfy"] == {"kwh": 0.007, "cost": 0.03, "hours": 0.02}
+
+
+def test_cost_reports_what_the_price_buys(rig, capsys):
+    """Without a price it says what's missing; with one, it prices the history per holder."""
+    rig.gpu.health = lambda: {"power_w": 300.0}
+    rig.arb.power = {}
+    assert rig.cli("cost", "--since", "1h") == 2
+    assert "price_per_kwh" in capsys.readouterr().err
+    rig.arb.power = {"price_per_kwh": 4.0, "currency": "R"}
+    rig.strata.loaded = True                                              # charge the watts to Strata
+    rig.cli("status")
+    time.sleep(1.1)                                                       # one sample a second
+    rig.cli("status")
+    capsys.readouterr()
+    assert rig.cli("cost", "--since", "1h", "--json") == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["price"] == 4.0 and out["w_now"] == 300.0 and "strata" in out["by_mode"]
+    assert rig.cli("cost", "--since", "yesterday") == 2
+
+
+def test_web_serves_the_power_cost(rig, server):
+    """The page's Power cost card reads /api/cost; no price is a 404 the page turns into
+    a note, not a broken panel."""
+    rig.gpu.health = lambda: {"power_w": 250.0}
+    rig.arb.power = {}
+    rig.cli("status")
+    time.sleep(1.1)
+    rig.cli("status")
+    code, body = get(server + "/api/cost")
+    assert code == 404 and "price_per_kwh" in json.loads(body)["error"]
+    rig.arb.power = {"price_per_kwh": 4.0, "currency": "R", "note": "home tariff"}
+    code, body = get(server + "/api/cost?since=0&until=99999999999")
+    out = json.loads(body)
+    assert code == 200 and out["currency"] == "R" and out["note"] == "home tariff"
+    assert out["w_now"] == 250.0 and out["by_mode"]
 
 
 def test_a_backend_without_health_still_records(rig):

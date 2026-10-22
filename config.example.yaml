@@ -16,7 +16,8 @@ workloads:
     service: {systemd-user: strata}   # started when stopped; restarted when allow_restart
     # Its VRAM is found by the systemd unit its processes run in. Without
     # `vram:`, the service's unit is used; {process: SUBSTRING} matches the
-    # command line instead.
+    # command line instead - or the process name on Windows, where an elevated
+    # process hides both ({process: strata.exe}).
     resident: {get: /health, path: loaded}   # true while its model is in VRAM
     release:
       post: /unload?wait={wait}   # {wait}: seconds to let a running answer finish
@@ -28,6 +29,24 @@ workloads:
     confirm: {vram_at_most: 0}    # released once its VRAM is down to this
     load: {post: /load, timeout: 300}   # `switch strata` leaves it loaded
     model: {get: /health, path: model}  # which model it serves; picks the admission below
+    # headers: {Authorization: "Bearer ${SOME_KEY}"}   # sent with every request vhotseat makes
+    #                                       # to this workload. $NAME reads the environment:
+    #                                       # a key doesn't belong in a file that gets pasted
+    #                                       # around. Ask for one and get a 401, and status
+    #                                       # says "asks for a key it isn't being sent" rather
+    #                                       # than pretending the server is down.
+    # body: {model_path: "{model}"}        # JSON body for a POST: {model} is what `model:`
+    #                                       # says is served, {wait} the release's wait. For
+    #                                       # servers that release one model at a time by id.
+    # estimate:                             # optional: ask the server what one of its models
+    #   from: {get: /settings/last-model}    # would cost on the card, at a given context.
+    #   post: /estimate-memory               #   `from:` names the fields the body needs;
+    #   body: {model_path: "{id}", n_ctx: "{ctx}"}
+    #   ctx: 32768
+    #   path: gpu_bytes                      # reported in status and `why`, never enforced:
+    #                                       # a server may fit a model by shrinking its
+    #                                       # context or spilling into RAM - that's your call,
+    #                                       # the number is what makes it an informed one.
     gate:
       kind: hook       # Strata runs `vhotseat gate strata` before every load
       config: ~/Strata/strata.json   # its config file, checked by doctor
@@ -99,3 +118,43 @@ telemetry:
   # enabled: true
   retention_hours: 24  # ~6 MiB on disk with two workloads; ~0.8 MiB a day more per further workload
   interval_s: 5        # between samples while something samples continuously
+
+power:
+  # What a unit costs where this machine is, so `vhotseat cost` and the dashboard can
+  # price the card's draw. It is the card's own watts as the driver reports them: the
+  # rest of the machine, and what the PSU burns getting them there, aren't in it, so
+  # read the number as a floor rather than the line on your bill.
+  # A number nobody's bill matches is worse than no number, so the example ships with it
+  # unset: put your own tariff in (whatever your utility calls kWh on your line) and the
+  # currency symbol you want to see. Uncomment and edit:
+  # price_per_kwh: 0.30      # what one kWh costs you, in the currency below
+  # currency: "USD"
+  # note: "provider + plan, so a year from now you know where the number came from"
+
+# What owns the card by right rather than by arrangement: a game, or anything else you
+# name. While something matches, nothing *new* loads: the LLM's gate refuses a load that
+# a request would wake, and ComfyUI's guard - which asks with `switch comfy --request`,
+# the queue asking on somebody's behalf - is refused too. A `switch` you type yourself is
+# an order and isn't refused; neither is a requested switch that would load nothing, so a
+# batch mid-flight carries on. Nothing loaded is interrupted, and no claimed process is
+# ever touched: vhotseat doesn't kill games, it declines to load 20 GB on top of one. The
+# check runs inside every decision, so nothing resident is needed for it to hold;
+# `vhotseat watch` only records it. See docs/how-it-works.md §3.7.
+#
+# The built-in rules know the usual installations: Steam (anything under
+# steamapps\common), Epic Games, Riot Games, anything under a \Games\ folder, Roblox, and
+# a few named exes. Launchers (Steam, Epic, EA, Riot, Battle.net, Ubisoft) and their
+# helper processes never claim the card: they run all day. Add what's missing:
+#
+# claims:
+#   - path: '*\World of Warcraft\*'    # matched against the process's image path
+#     note: World of Warcraft          # how a refusal describes it
+#   - name: rocketleague.exe           # or by exe name: works when the path can't be
+#                                      # read, e.g. the game runs elevated
+#   - parent: mylauncher.exe           # or by any ancestor's exe name; it matches that
+#                                      # launcher's helpers too, so prefer path or name
+# claims_builtin: true                 # false leaves only the rules you wrote
+# claims_ignore: [wallpaper64.exe]     # names or globs the built-ins won't claim: the
+#                                      # built-ins already skip Wallpaper Engine, SteamVR
+#                                      # and the Oculus runtime, which live under
+#                                      # steamapps\common\ but aren't somebody playing

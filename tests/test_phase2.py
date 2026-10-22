@@ -113,7 +113,31 @@ def test_patches_config_is_validated():
 def test_example_config_parses_with_every_section():
     """The live config is a copy of this: it must always validate."""
     cfg = config.parse((ROOT / "config.example.yaml").read_text())
-    assert {"gpu", "workloads", "patches", "events"} <= set(cfg)
+    assert {"gpu", "workloads", "patches", "events", "power"} <= set(cfg)
+
+
+def test_power_block_is_validated():
+    """A price is a number, and only the documented keys are allowed: a typo in a rate would
+    otherwise turn into a wrong bill. The example ships the tariff commented out - somebody's
+    local tariff is wrong on every other machine - so the commented lines are uncommented here
+    and validated, the way the claims test does it."""
+    import pytest
+    import yaml
+    src = (ROOT / "config.example.yaml").read_text()
+    raw = config.parse(src)
+    assert not (raw.get("power") or {}).get("price_per_kwh"), "the example must not ship a live tariff"
+    block = src.split("\npower:", 1)[1].split("\n\n", 1)[0]
+    shown = [ln.strip()[2:] for ln in block.splitlines()
+             if ln.strip().startswith(("# price_per_kwh", "# currency:", "# note:"))]
+    assert shown, "the example still shows a tariff, commented"
+    cfg = config.validate({**raw, "power": yaml.safe_load("power:\n" + "\n".join("  " + s for s in shown))["power"]})
+    assert cfg["power"]["price_per_kwh"] > 0 and cfg["power"]["currency"]
+    raw["power"] = {"price_per_kwh": "four point one one"}
+    with pytest.raises(config.ConfigError, match=r"power\.price_per_kwh"):
+        config.validate(raw)
+    raw["power"] = {"price_per_khw": 4.11}
+    with pytest.raises(config.ConfigError, match=r"power: unknown key"):
+        config.validate(raw)
 
 
 def test_proxy_guide_config_validates():
@@ -131,6 +155,7 @@ def test_doctor_warns_about_unattributed_vram(rig):
     rig.gpu.other = 2956
     found = [(s, d) for s, c, d in doctor.checks(rig.arb, rig.cfg) if c == "gpu: other"]
     assert found and found[0][0] == "warn" and "2956 MiB" in found[0][1]
+    assert "Xorg 2956" in found[0][1]        # it names them, not just counts them
     rig.gpu.other = 300
     assert not [c for _, c, _ in doctor.checks(rig.arb, rig.cfg) if c == "gpu: other"]
 

@@ -87,8 +87,12 @@ agent do it with the [vhotseat-setup skill](kit/skills/vhotseat-setup/SKILL.md).
 
 ```sh
 vhotseat doctor     # check the config, the GPU, every workload and gate
-vhotseat status     # who owns the GPU and what each workload holds
+vhotseat status     # who owns the GPU, what each workload holds, and every process by name
+vhotseat why        # why the next job can't have the card, without touching anything
+vhotseat claims     # what owns the card by right (a game), and what the rules match now
 vhotseat web        # dashboard: RAM and VRAM over time, handovers, events, logs
+vhotseat watch      # note when a claim starts and ends, and sample, until stopped
+vhotseat autostart install   # keep that dashboard up from logon (Task Scheduler / systemd user)
 ```
 
 ![The dashboard on an RTX 5070 Ti: Strata hands the GPU to ComfyUI at 01:04, and a render is running.](https://raw.githubusercontent.com/wandermyz/vhotseat/24999a8e62e3a6342e9af6c3bc70042e77765c60/web-dashboard/desktop.png)
