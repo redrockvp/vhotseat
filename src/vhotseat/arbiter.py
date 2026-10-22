@@ -18,9 +18,9 @@ import signal
 import subprocess
 import time
 
-from . import claims, host, util
+from . import claims, host, policy, util
 from .drivers.base import Workload
-from .errors import Busy, ReleaseFailed, SwitchError
+from .errors import Busy, PolicyRefused, ReleaseFailed, SwitchError
 from .events import EventLog
 from .lock import GpuLock, Held
 
@@ -79,6 +79,42 @@ class Arbiter:
 
     def _others(self, name: str | None) -> list[Workload]:
         return [w for n, w in self.workloads.items() if n != name]
+
+    def label(self, name: str) -> str:
+        """A workload's label, or the name itself for anything that isn't a workload."""
+        return self.workloads[name].label if name in self.workloads else name
+
+    # --- who may ask a workload to let go of its models --------------------------
+
+    def loaded(self, gpu: dict) -> list[str]:
+        """Which workloads hold model memory in this snapshot. A workload at or under its
+        idle weight has nothing on the card that anyone could be short of, so it refuses
+        nobody whatever its policy says; that is also what keeps an idle server with a
+        narrow `yields_to:` from blocking the card it isn't holding."""
+        return [n for n, w in self.workloads.items()
+                if (gpu.get(f"{n}_mib") or 0) > w.idle_vram_mib]
+
+    def wont_give_way(self, reason: str, gpu: dict) -> list[str]:
+        """The loaded workloads whose `yields_to:` doesn't cover `reason` - a workload's
+        name, `claims` or `pressure` (policy.py)."""
+        return [n for n in self.loaded(gpu)
+                if n != reason and not policy.yields(self.workloads[n].yields_to, reason)]
+
+    def policy_why(self, requester: str, blockers: list[str], gpu: dict) -> str:
+        """The refusal in words a person can act on: who is in the way, how much it is
+        holding, and what it does give way for - which is the key to change."""
+        who = self.label(requester)
+        bits = [f"{self.label(n)} holds {gpu.get(f'{n}_mib')} MiB and its yields_to "
+                f"({policy.describe(self.workloads[n].yields_to)}) doesn't cover {who}"
+                for n in blockers]
+        return f"nothing will make room for {who}: " + "; ".join(bits)
+
+    def _policy_refused(self, source: str, requester: str, blockers: list[str], why: str) -> None:
+        """One row for one refusal, so the dashboard can warn about it and `why` and
+        `/api/events` can explain it after the fact. `ok: false` is what marks it red on
+        the charts, where the load it stopped is the point."""
+        self.events.record("policy-refused", source=source, requested=requester, ok=False,
+                           workloads=blockers, why=why)
 
     # --- status --------------------------------------------------------------
 
@@ -180,14 +216,35 @@ class Arbiter:
         return None
 
     def _make_room(self, x: Workload | None, wait: float, timeout: float, ensure: bool,
-                   deadline: float | None = None, admit: bool = True) -> list[str]:
+                   deadline: float | None = None, admit: bool = True, requested: bool = False,
+                   gpu: dict | None = None) -> list[str]:
         """Release every workload but `x`, restarting one whose release isn't
         enough when it allows that; then, if `admit`, restart idle ones while
         `x`'s admission isn't met. Returns what was done, for the event log.
 
         Admission is for a workload about to load: one already holding the GPU
-        would count its own memory against itself."""
-        others = self._others(x.name if x else None)
+        would count its own memory against itself.
+
+        `requested` marks a handover nobody typed a decision about: Strata's gate, a
+        ComfyUI job's guard, a proxy's Seat. For those, a workload holding the card that
+        doesn't give way for `x` makes the whole handover a refusal (PolicyRefused) rather
+        than a partial one, because the card can't be given to `x` without it. A `switch`
+        or `hold` a person typed is an order, and unloads it anyway: that is the promise
+        made everywhere else, and the log says whose policy was overridden.
+        """
+        gpu = self.snapshot() if gpu is None else gpu
+        if x is not None:
+            blockers = self.wont_give_way(x.name, gpu)
+            if blockers:
+                why = self.policy_why(x.name, blockers, gpu)
+                if requested:
+                    raise PolicyRefused(why, workloads=blockers)
+                self.events.record("policy-override", requested=x.name, workloads=blockers,
+                                   why=why)
+                util.log(f"switch to {self.label(x.name)} overrides a policy: {why}")
+        # Lowest priority first; a stable sort keeps the config's order among equals, which
+        # is what it was before there were priorities at all.
+        others = sorted(self._others(x.name if x else None), key=lambda w: w.priority)
         done = []
         for y in others:
             try:
@@ -240,9 +297,10 @@ class Arbiter:
             done.append(f"restarted {y.label} to release {held} MiB of RAM + swap for {x.label}")
         return done
 
-    def acquire(self, name: str, wait: float, load: bool) -> list[str]:
+    def acquire(self, name: str, wait: float, load: bool, requested: bool = False) -> list[str]:
         """Give the GPU to `name` (or to nobody, for "none"): release the others,
-        start it if it's stopped, check its admission, and load it if `load`."""
+        start it if it's stopped, check its admission, and load it if `load`.
+        `requested` is what a workload asked for on nobody's order (see _make_room)."""
         x = self.workloads.get(name)
         others = self._others(name)
         s = self.probe()
@@ -253,7 +311,8 @@ class Arbiter:
                 and not any(y.release_always for y in others):
             util.log(f"already in {name} mode")
             return []
-        done = self._make_room(x, wait, self.release_timeout_s, ensure=True, admit=not resident)
+        done = self._make_room(x, wait, self.release_timeout_s, ensure=True, admit=not resident,
+                               requested=requested, gpu=s["gpu"])
         self.lock.bump()
         if x is None:
             return done
@@ -387,9 +446,10 @@ class Arbiter:
           Waiting would deadlock: that switch is blocked on this very load.
         - Anything else holds the lock: refuse.
         - Otherwise a request woke the workload. Another workload busy, or its
-          state unknown: refuse, a render is never interrupted. All idle:
-          release them (restarting one if releasing isn't enough), check
-          admission, then allow.
+          state unknown: refuse, a render is never interrupted. Another workload
+          holding the card that won't give way for `name` (its `yields_to:`): refuse,
+          and name it. All idle and willing: release them (restarting one if releasing
+          isn't enough), check admission, then allow.
 
         It makes room itself rather than calling `switch`: that ends in loading
         `name`, which would wait on the very load running this gate. The lock is
@@ -421,9 +481,13 @@ class Arbiter:
                 # its own memory isn't a shortfall, so don't restart anyone for it.
                 resident = x.active(x.probe(gpu), gpu)
                 try:
-                    done = self._make_room(x, 0, self.gate_release_timeout_s, ensure=False, deadline=deadline,
-                                           admit=not resident)
+                    done = self._make_room(x, 0, self.gate_release_timeout_s, ensure=False,
+                                           deadline=deadline, admit=not resident, requested=True,
+                                           gpu=gpu)
                     self.lock.bump()
+                except PolicyRefused as e:
+                    self._policy_refused("gate", x.name, e.workloads, str(e))
+                    reason = str(e)
                 except SwitchError as e:
                     reason = (f"could not make room in {e.workload.label}: {e}" if e.workload is not None
                               else str(e))
@@ -576,9 +640,11 @@ class Arbiter:
         guard node - rather than one a person typed. A claimed process refuses the
         request and not the typed command: "don't load on top of the game" is a rule
         about loads nobody chose, and someone who types `vhotseat switch` has already
-        decided. A request that changes nothing (the workload already holds the card,
-        so nothing new would load) is not refused either: a batch mid-flight carries on,
-        which is the same promise the guard makes to a render in flight."""
+        decided. So has a workload that won't give way for the newcomer (`yields_to:`):
+        the request is refused, the typed switch goes through and logs the override.
+        A request that changes nothing (the workload already holds the card, so nothing
+        new would load) is not refused either: a batch mid-flight carries on, which is
+        the same promise the guard makes to a render in flight."""
         held = os.environ.get(HOLD_ENV)
         if held:
             # Inside `hold`: our parent owns the lock, so taking it would deadlock.
@@ -614,7 +680,12 @@ class Arbiter:
                 left = max(0.0, (deadline - time.monotonic()) / util.SCALE)
                 before = self.probe()["mode"]
                 try:
-                    done = self.acquire(name, left, load=load)
+                    done = self.acquire(name, left, load=load, requested=request)
+                except PolicyRefused as e:
+                    self._policy_refused("switch", name, e.workloads, str(e))
+                    self.events.record("switch", to=name, ok=False, error=str(e))
+                    util.log(f"switch to {name} refused: {e}")
+                    return {"ok": False, "error": str(e), "exception": e}
                 except SwitchError as e:
                     self.events.record("switch", to=name, ok=False, error=str(e))
                     util.log(f"switch to {name} failed: {e}")

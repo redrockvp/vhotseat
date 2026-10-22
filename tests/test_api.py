@@ -57,6 +57,20 @@ def test_freeing_the_card_is_never_refused_by_a_claim(rig, seat, monkeypatch):
         seat.acquire("strata", 0)                    # loading under the same claim still refused
 
 
+def test_a_seat_asking_for_the_card_is_refused_by_a_policy_too(rig, seat):
+    """Everything a proxy forwards is a load nobody typed, so a workload that won't give way
+    for the newcomer refuses the acquire() the same way a claim refuses it, and raises the
+    refusal rather than unloading anything. The owner typing `vhotseat switch comfy` has
+    decided, and still gets the card."""
+    rig.arb.workloads["strata"].yields_to = ("claims",)
+    rig.strata.loaded = True
+    with pytest.raises(api.SwitchError, match="yields_to"):
+        seat.acquire("comfy", 0)
+    assert rig.strata.loaded                                   # 14 GB stayed put
+    assert rig.cli("switch", "comfy") == 0                     # the typed order is not refused
+    assert not rig.strata.loaded
+
+
 def test_a_seat_that_just_took_the_card_owns_it_while_the_weights_land(rig, seat):
     """A server that loads on request shows nothing on the card until its weights arrive, so
     a probe straight after acquire() says nobody holds the GPU. The seat knows better: it
