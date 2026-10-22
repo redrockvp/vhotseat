@@ -103,6 +103,54 @@ A ComfyUI restart wipes its `/history`, so it only happens with an empty queue,
 and once the latest result is at least 10 s old (`history_settle_s`), so
 clients reading results have had time to.
 
+## Who gives way for whom
+
+Which workloads get unloaded to make room used to be one rule for everything: whatever
+held memory on the card was a candidate for every handover. Two keys per workload make
+it a decision of yours instead:
+
+```yaml
+workloads:
+  strata:
+    priority: 60            # 0-100, default 50: lowest gives way first
+    yields_to: [comfy, claims]   # ComfyUI and a game may unload it; anything else is refused
+  unsloth:
+    priority: 20            # idle and cheap to reload: asked first
+    yields_to: ["*"]        # the default: it gives way for anyone
+```
+
+`yields_to:` lists the newcomers this workload will make room for. An entry is another
+workload's name, `claims` (a process that owns the card by right - a game: see Claims
+below), `pressure` (the card running short under a process vhotseat doesn't manage), or
+`"*"` for anyone. Absent means `["*"]`, which is exactly what vhotseat did before this
+existed, so an existing config keeps behaving as it did. An empty list means it gives
+way for nobody: only a command you type moves it. An entry naming a workload that isn't
+in the config is a config error, not a rule that quietly never matches; a workload can't
+be named `claims` or `pressure`, because those are words `yields_to:` already means.
+
+What the policy decides is **who gets unloaded, and who is refused instead**. It is
+enforced wherever vhotseat decides to unload something, and its direction matters:
+
+- a **load nobody chose** - Strata's gate, ComfyUI's guard (`switch comfy --request`), a
+  proxy's `Seat.acquire` - is refused when a workload holding the card won't give way for
+  it. The refusal names the holder and what its `yields_to:` allows, records a
+  `policy-refused` row, and shows on the dashboard. Nothing is unloaded partially, because
+  the card cannot be given to the newcomer anyway.
+- a **`switch` you type** is an order, and goes through: it unloads the workload that
+  wouldn't have, and records `policy-override` saying whose policy it overrode, so the log
+  answers "why did Strata lose its 20 GB?" later.
+- a **claim starting** (`on_start: release`) never unloads a workload whose `yields_to`
+  doesn't cover `claims`. It isn't refused - freeing the card is not a load - the workload
+  is simply not a target, and the record and the dashboard say so (`policy-kept`), because
+  the game may now be short of the VRAM that stayed put.
+- a workload at or below its `idle_vram_mib` holds nothing for anyone to be short of, so
+  it doesn't refuse a load whatever its `yields_to:` says. The policy reads what the card
+  shows; a load that hasn't put weights on the card yet isn't yet a holder.
+
+`priority:` orders the workloads that *may* be unloaded - the lowest is asked first - and
+never overrules `yields_to:`. Both are shown by `vhotseat status` and `vhotseat why`, and
+read-only on the dashboard until there's a way to edit them there.
+
 ## Talking to a server that isn't a plain server
 
 Two things a URL doesn't cover:

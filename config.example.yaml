@@ -76,6 +76,18 @@ workloads:
         qwen3.8-flash-next-iq3_xxs: {min_available_ram_mib: 46000}
         qwen3.8-flash-next-iq2_xs: {min_available_ram_mib: 40000}
     allow_restart: true
+    # priority: 50                 # 0-100, default 50. Among the workloads that may be
+    #                              # unloaded for the same reason, the lowest goes first.
+    # yields_to: ["*"]            # who may ask it to let go of its models: other
+    #                              # workloads' names, "claims" (a game, or anything else
+    #                              # that owns the card: see the claims section below),
+    #                              # "pressure" (the card running short under a process
+    #                              # vhotseat doesn't manage), or "*" for anyone - which
+    #                              # is also the default, and every handover there has
+    #                              # ever been. A newcomer that isn't listed is refused
+    #                              # rather than unloaded over, and the refusal is logged
+    #                              # and shown. A `switch` you type is an order and goes
+    #                              # through whatever this says.
 
   comfy:
     driver: comfyui    # built-in: /queue, /free, restart when /free isn't enough
