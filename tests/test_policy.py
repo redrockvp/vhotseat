@@ -8,11 +8,12 @@ loading another: a load nobody chose can be refused, a `switch` you typed is an 
 freeing the card for a claim is never refused by either.
 """
 
-import pytest
 from pathlib import Path
 
-from fakes import COMFY_MODEL_VRAM
-from vhotseat import api, config, policy, setup
+import pytest
+
+from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, STRATA_VRAM
+from vhotseat import api, claims, config, host, policy, setup, web
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -192,3 +193,92 @@ def test_the_workload_that_gives_way_first_is_the_one_with_less_priority(rig):
     rig.comfy.vram = COMFY_MODEL_VRAM
     assert rig.cli("switch", "none") == 0
     assert order == ["comfy", "strata"]
+
+
+# --- what a claim may and may not unload ---------------------------------------------
+
+NAME, NOTE = "EldenRing.exe", "Elden Ring"
+
+
+def claim_rule(rig, monkeypatch):
+    """A claim rule in force and the game in the process table, as in tests/test_claim_release.py:
+    here the question is which workloads the claim is allowed to unload."""
+    rig.arb.claim_rules = claims.rules([{"name": NAME, "note": NOTE}], builtin=False)
+    rig.arb.claim_ignore = claims.ignores()
+    monkeypatch.setattr(host, "processes", lambda: {
+        4242: {"pid": 4242, "ppid": 4, "name": NAME, "exe": r"D:\Libraries\elden\EldenRing.exe"}})
+
+
+def test_a_claim_leaves_a_workload_that_doesnt_give_way_for_games_alone(rig, monkeypatch, capsys):
+    """Strata gives way for ComfyUI only. A game starting doesn't unload it, and doesn't
+    pretend to be waiting for it either: it was never owed. ComfyUI goes as always, and the
+    log says who is still holding what, because the game may be short of exactly that much."""
+    claim_rule(rig, monkeypatch)
+    give_way(rig, strata=["comfy"])
+    rig.strata.loaded = True
+    rig.comfy.vram = COMFY_MODEL_VRAM
+    web.watch(rig.arb, polls=1)
+    assert rig.strata.loaded                                   # kept, not unloaded
+    assert rig.comfy.vram == COMFY_CONTEXT_VRAM                # and this one went
+    assert [r["workloads"] for r in rows(rig, "claim-release")] == [["comfy"]]
+    targets = rows(rig, "claim-release-targets")[0]
+    assert targets["targets"] == ["comfy"] and targets["kept"] == ["strata"]
+    kept = rows(rig, "policy-kept")
+    assert len(kept) == 1 and kept[0]["workload"] == "strata"
+    assert kept[0]["held_mib"] == STRATA_VRAM
+    assert "doesn't cover a claim on the card" in kept[0]["why"]
+    assert rows(rig, "claim-release-waiting") == []            # waiting is for what is owed
+
+
+def test_a_long_game_writes_the_kept_warning_once(rig, monkeypatch):
+    """The release for a claim is re-checked on every poll for as long as the game runs, so a
+    warning written per poll would bury the log in the same line every 2 s - and the dashboard
+    banner decides what is news from the row's age, not from a count."""
+    claim_rule(rig, monkeypatch)
+    give_way(rig, strata=["comfy"])
+    rig.strata.loaded = True
+    web.watch(rig.arb, polls=4)
+    assert len(rows(rig, "policy-kept")) == 1
+    assert rig.strata.loaded
+
+
+def test_a_workload_that_refuses_claims_is_never_owed_to_one(rig, monkeypatch):
+    """Even a target list that names it - written before the owner protected it, or by hand -
+    doesn't make it a candidate: the list is what the card held when the claim started, this is
+    what the config says now."""
+    claim_rule(rig, monkeypatch)
+    rig.strata.loaded = True
+    rig.arb.workloads["strata"].yields_to = ()
+    out = rig.arb.claim_release({"name": NAME, "note": NOTE}, only=["strata"])
+    assert out["released"] == [] and out["freed_mib"] == 0
+    assert rig.strata.loaded
+    assert "POST /unload" not in rig.strata.calls
+
+
+def test_a_claim_asks_the_lowest_priority_to_give_way_first(rig, monkeypatch):
+    """Which workload loses its model first, among the ones that may be unloaded at all:
+    priority, not the config's order. With both at the default 50 the order is unchanged."""
+    claim_rule(rig, monkeypatch)
+    rig.strata.loaded = True
+    rig.comfy.vram = COMFY_MODEL_VRAM
+    assert rig.arb.claim_targets() == ["comfy", "strata"]
+    rig.arb.workloads["strata"].priority = 10
+    rig.arb.workloads["comfy"].priority = 90
+    assert rig.arb.claim_targets() == ["strata", "comfy"]
+
+
+def test_status_and_claims_say_what_a_claim_was_not_given(rig, monkeypatch, capsys):
+    """`the card is claimed, and ComfyUI went` is only half the answer when the game is still
+    14 GB short: the other half is that Strata was never asked, and what to change if the owner
+    wants it asked next time."""
+    claim_rule(rig, monkeypatch)
+    give_way(rig, strata=["comfy"])
+    rig.strata.loaded = True
+    rig.comfy.vram = COMFY_MODEL_VRAM
+    web.watch(rig.arb, polls=1)
+    assert rig.cli("claims") == 0
+    out = capsys.readouterr().out
+    assert f"for {NAME} ({NOTE}): unloaded comfy" in out
+    assert "kept for its policy: strata" in out
+    assert rig.cli("status") == 0
+    assert "kept for its policy: strata" in capsys.readouterr().out

@@ -333,6 +333,14 @@ context, a model resident only in RAM - isn't something the claim waits on. Once
 gone the claim has been given its due, and later checks take no GPU lock and read no card for it
 for as long as the game runs.
 
+A workload that says it won't give way for a claim (its `yields_to:` doesn't cover `claims`, see
+§3.8) is left off that list whatever it holds, and is not waited on either: nothing was owed to it.
+It does not stop the release. The direction matters everywhere in vhotseat: a policy refuses a
+*load*, never the freeing of the card, so the game gets whatever the workloads are willing to give
+up and the record says what stayed - a `policy-kept` row naming it and how many MiB, the same line
+in `vhotseat claims` and `vhotseat status`, and a warning on the dashboard, because the honest
+summary is that the game may now be short of exactly that much.
+
 That list, and what has already been released for a claim, come back from the event log rather
 than from a process's memory, which is also what keeps `watch` and `vhotseat web` - both of which
 notice claims - from doing the same release twice. The GPU lock is the mutex between them, and the
@@ -362,6 +370,37 @@ Steam, Epic, EA, Riot and Battle.net run all day, and their helpers live inside 
 directories the game rules point at, so launchers and helpers are excluded by name. When
 a title is missed, `vhotseat claims` shows what the rules can see, and one `path:` line
 adds it.
+
+### 3.8 Who gives way for whom
+
+Which workloads a handover is allowed to unload was one rule for everything: whatever held
+memory on the card was a candidate, whoever was asking. Two keys per workload make that the
+owner's decision instead (docs/reference.md, "Who gives way for whom"):
+
+- `yields_to:` - the newcomers this workload will make room for: other workloads' names,
+  `claims`, `pressure`, or `"*"` for anyone. Absent means `["*"]`, which is every handover
+  there has ever been, so a config written before this exists behaves as it always did.
+- `priority:` - among the workloads that *may* be unloaded, the lowest is asked first. It
+  never overrules `yields_to:`.
+
+The whole policy is a statement about *who gets unloaded*, and it is enforced in the same
+direction everywhere, which is the direction the rest of vhotseat already uses: **a policy can
+refuse a load, and can take a workload off the list of what may be released; it can never stop
+work getting off the card.**
+
+| What is happening | What the policy does |
+| --- | --- |
+| a load nobody chose: Strata's gate, ComfyUI's guard (`switch comfy --request`), a proxy's `Seat.acquire` | refused while a workload holding model memory won't give way for the newcomer: nothing is unloaded, nothing loads, and the refusal names the holder and what it does give way for (`policy-refused`) |
+| a `switch` / `hold` someone typed | goes through - it is an order, as everywhere else - and records whose policy it overrode (`policy-override`) |
+| a claim starting (`on_start: release`) | never refused: the workloads that don't cover `claims` are simply not targets, and the record and the dashboard say the game may be short of them (`policy-kept`) |
+| a workload at or below its `idle_vram_mib` | refuses nobody, whatever its keys say: there is nothing on the card to be short of |
+
+The gate checks it while it holds the lock, inside `_make_room`, rather than only in the
+entry points above it: whatever asks for the card ends up there, so a handover that was
+allowed when it queued and would unload something unwilling by the time it got the lock is
+still refused. And because the answer comes from what the card shows, not from the config
+alone, an idle server with a narrow `yields_to:` cannot block the card it isn't holding - the
+fastest way for a config like this to get thrown away.
 
 ## 4. Deadlocks
 

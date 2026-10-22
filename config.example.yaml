@@ -176,3 +176,7 @@ power:
 #                                      # built-ins already skip Wallpaper Engine, SteamVR
 #                                      # and the Oculus runtime, which live under
 #                                      # steamapps\common\ but aren't somebody playing
+#                                      # A workload whose yields_to: doesn't list "claims"
+#                                      # isn't unloaded when one of these starts: it keeps
+#                                      # its model, the game is short of that much VRAM, and
+#                                      # `vhotseat claims` says so.

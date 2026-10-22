@@ -426,6 +426,15 @@ having.
 `claims_poll_s` is how often that watcher looks - a game has allocated within seconds of starting.
 It's independent of `telemetry.interval_s`, which stays whatever it is for the history graphs.
 
+**A claim that isn't allowed to unload something.** A workload whose `yields_to:` doesn't list
+`claims` is not a target of the claim: it keeps its model, the claim goes ahead without it, and
+the release is never refused - freeing the card is not a load, so a policy can only ever take a
+workload off the list of what may be unloaded, never stop the release. Because the game is then
+short of exactly the VRAM that stayed put, the decision is written down twice: a `policy-kept` row
+in the event log (which the dashboard shows as a warning until it goes stale), and the workload
+named as `kept for its policy:` in `vhotseat claims` and `vhotseat status`, next to what the claim
+was given.
+
 While something matches, nothing **new** loads: the gate refuses a load a request would
 wake, and `switch --request` - what ComfyUI's guard node uses, because the queue is
 asking on somebody's behalf - is refused too. A `switch` you type yourself is an order

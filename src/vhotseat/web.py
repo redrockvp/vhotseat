@@ -25,7 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from urllib.parse import parse_qs, urlparse
 
-from . import util
+from . import policy, util
 from .telemetry import Sampler, cost
 
 # Probing calls every workload's API; several open tabs share one probe a second.
@@ -275,7 +275,9 @@ def release_for(arbiter, key: tuple, rec: dict) -> None:
     The workloads it is owed are decided once, when its release first runs, from what the card
     held at that moment, and recorded. So a model the owner loads in the middle of a game - a
     typed `vhotseat switch` is an order - stays theirs, and no later poll unloads it; and a
-    workload that held nothing when the claim started isn't something the claim is waiting on.
+    workload that held nothing when the claim started isn't something the claim is waiting on,
+    and neither is one whose `yields_to:` doesn't cover a claim: that one is recorded as kept
+    and left holding, because the game is short of it and nothing here is owed it.
     Once every target is released the claim has been given its due: later polls take no GPU
     lock and read no card for it, for as long as the game runs.
 
@@ -286,9 +288,20 @@ def release_for(arbiter, key: tuple, rec: dict) -> None:
     events = arbiter.events
     if rec.get("targets") is None:
         targets = arbiter.claim_targets()
+        # The workloads that are on the card and are *not* owed to this claim, because their
+        # `yields_to:` doesn't cover a claim. A release is never refused, so the claim simply
+        # goes ahead without them; the game may be short of exactly that much memory, so each
+        # one gets a row of its own and a line on the dashboard. Decided here, once, which is
+        # also what keeps a long game from writing a warning every 2 s.
+        kept = arbiter.kept_for_policy(policy.CLAIMS)
         events.record("claim-release-targets", source="watch", name=key[0], note=key[1],
-                      targets=targets)
+                      targets=targets, kept=[k["workload"] for k in kept])
         rec = {**rec, "targets": targets}
+        for k in kept:
+            why = arbiter.kept_why(policy.CLAIMS, k["workload"], k["held_mib"])
+            events.record("policy-kept", source="watch", name=key[0], note=key[1],
+                          workload=k["workload"], held_mib=k["held_mib"], why=why)
+            util.log(f"{key[0]} ({key[1]}): {why}")
     label = lambda n: arbiter.workloads[n].label if n in arbiter.workloads else n  # noqa: E731
     waiting = rec.get("waiting") or []
     stuck = {w["workload"]: w.get("attempts") or 1 for w in waiting if w.get("stuck")}

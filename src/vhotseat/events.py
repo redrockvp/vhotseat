@@ -49,7 +49,7 @@ class EventLog:
 
     def claims_open(self, limit: int = 500) -> dict:
         """What the log shows as claimed right now: {(process, rule note): {claim, targets,
-        released, waiting, freed_mib}}, rebuilt from its tail.
+        kept, released, waiting, freed_mib}}, rebuilt from its tail.
 
         The log is the record, so it is what says whether a claim has been written, which
         workloads it was owed (`targets`), what has already been released for it, and what has
@@ -60,7 +60,7 @@ class EventLog:
 
         def record(key):
             return out.setdefault(key, {"claim": {"name": key[0], "note": key[1]}, "targets": None,
-                                        "released": [], "waiting": [], "freed_mib": 0})
+                                        "kept": [], "released": [], "waiting": [], "freed_mib": 0})
 
         for e in self.tail(limit):
             kind = e.get("event")
@@ -74,7 +74,11 @@ class EventLog:
             elif kind == "claim-release-targets":
                 # Decided once, when the claim's release first ran. An empty list is a real
                 # answer - nothing of ours was on the card then - so it isn't left as None.
+                # `kept` names the workloads that were on the card and are not owed to this
+                # claim because of their `yields_to:`: they keep their model, and the game is
+                # short of it.
                 record(key)["targets"] = list(e.get("targets") or [])
+                record(key)["kept"] = list(e.get("kept") or [])
             elif kind == "claim-release":
                 rec = record(key)
                 got = set(e.get("workloads") or [])

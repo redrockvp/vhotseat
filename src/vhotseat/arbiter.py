@@ -109,6 +109,22 @@ class Arbiter:
                 for n in blockers]
         return f"nothing will make room for {who}: " + "; ".join(bits)
 
+    def kept_for_policy(self, reason: str, gpu: dict | None = None) -> list[dict]:
+        """The loaded workloads that won't give way for a release (`claims`, later
+        `pressure`). A release is never refused, so these keep holding: whoever asked for
+        the card may now be short of exactly that much, which is why each one is worth a row
+        in the log and a line on the dashboard rather than silence."""
+        gpu = self.snapshot() if gpu is None else gpu
+        return [{"workload": n, "held_mib": gpu.get(f"{n}_mib") or 0}
+                for n in self.wont_give_way(reason, gpu)]
+
+    def kept_why(self, reason: str, name: str, held_mib: int) -> str:
+        """Why something stayed loaded, in the sentence the row and the banner show."""
+        return (f"{self.label(name)} holds {held_mib} MiB and its yields_to "
+                f"({policy.describe(self.workloads[name].yields_to)}) doesn't cover "
+                f"{policy.PHRASE.get(reason, reason)}: it keeps its model, and whatever "
+                f"asked for the card may be short of that")
+
     def _policy_refused(self, source: str, requester: str, blockers: list[str], why: str) -> None:
         """One row for one refusal, so the dashboard can warn about it and `why` and
         `/api/events` can explain it after the fact. `ok: false` is what marks it red on
@@ -164,6 +180,8 @@ class Arbiter:
                                 + (f" ({rec['freed_mib']} MiB)" if rec.get("freed_mib") else ""))
                 for w in rec["waiting"]:
                     bits.append(f"{w['workload']} keeps its model: {w['why']}")
+                if kept := rec.get("kept"):
+                    bits.append("kept for its policy: " + ", ".join(kept))
                 if bits:
                     lines.append(f"{'freed for:':<{width}}{key[0]} ({key[1]}) - " + "; ".join(bits))
         lines.append(f"{'ram:':<{width}}" + self._describe_ram(s["ram"]))
@@ -504,7 +522,12 @@ class Arbiter:
 
     def claim_targets(self) -> list[str]:
         """Which workloads a claim is owed: the ones holding more than their idle VRAM on the
-        card right now.
+        card right now, lowest priority first.
+
+        A workload whose `yields_to:` doesn't cover `claims` isn't on that list whatever it
+        holds: the game is short of that much VRAM and vhotseat says so rather than unloading
+        something the owner refused to move for a game. It is recorded as kept
+        (`policy-kept`), not as waiting - nothing is waiting for it, it was never owed.
 
         This is decided once, when the claim's release first runs, and the answer goes in the
         event log (`claim-release-targets`). It matters because a claim lasts as long as the
@@ -512,8 +535,10 @@ class Arbiter:
         the owner loads afterwards is theirs, and a watcher that read the card fresh every poll
         would undo it every 2 seconds for the rest of the game."""
         snap = self.snapshot()
-        return sorted(n for n, y in self.workloads.items()
-                      if (snap.get(f"{n}_mib") or 0) > y.idle_vram_mib)
+        owed = [n for n, y in self.workloads.items()
+                if (snap.get(f"{n}_mib") or 0) > y.idle_vram_mib
+                and policy.yields(y.yields_to, policy.CLAIMS)]
+        return sorted(owed, key=lambda n: (self.workloads[n].priority, n))
 
     def claim_release(self, claim: dict, only: list[str] | None = None) -> dict:
         """A claim appeared (`on_start: release`): ask the workloads it was owed to let go of
@@ -533,13 +558,19 @@ class Arbiter:
         busy, refusing, or stuck holding its VRAM - is reported as waiting, and the watcher tries
         it again while the claim lasts, bounded for a workload that says it unloaded and keeps
         holding. A workload with nothing on the card isn't touched at all: a model living
-        entirely in RAM has nothing here that the game is short of.
+        entirely in RAM has nothing here that the game is short of, and neither is one whose
+        `yields_to:` doesn't cover `claims` - that one was never a target, and isn't asked.
 
         Returns {"declined": why-or-None, "released": [{workload, freed_mib}],
         "waiting": [{workload, why, stuck?}], "freed_mib": int}.
         """
         cands = self.workloads if only is None else {n: y for n, y in self.workloads.items()
                                                     if n in set(only)}
+        # A workload that doesn't give way for a claim is never owed to one, even if the list
+        # recorded when the claim started says otherwise: the list is what the card held then,
+        # this is the config's answer now (an owner who protects a workload mid-game stops the
+        # watcher coming back for it on the next poll).
+        cands = {n: y for n, y in cands.items() if policy.yields(y.yields_to, policy.CLAIMS)}
         pre = self.snapshot()
         if not any((pre.get(f"{n}_mib") or 0) > y.idle_vram_mib for n, y in cands.items()):
             # Nothing it is owed is on the card, so there is nothing to free and no reason to
