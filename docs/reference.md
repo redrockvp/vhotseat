@@ -315,9 +315,19 @@ One page, refreshed every 5 s, that works on a phone too:
 - **VRAM** and **RAM / Swap**: per workload, stacked against the totals.
 - **Power cost**: what the card's watts cost across the range you're looking at, in
   total and per holder, plus what it's drawing right now. Needs `power.price_per_kwh`.
+- **Who gives way for whom**: the policy as the config has it - each workload's priority,
+  what it gives way for, what it holds on the card now and what the history has seen it
+  holding at most - and for every pair of workloads a tile saying whether they fit on the
+  card at the same time. Read-only: the keys are still edited in `config.yaml`.
 - **Events / Logs**: every switch, hold and gate decision, and every line a
   vhotseat command logged, from any process (the guard's `switch comfy`,
   Strata's `gate strata`, your `hold`).
+
+When a policy refused a load, or a claim wasn't allowed to unload something, a banner at the
+top of the page says so - the sentence from the event row, with its time - and stops once the
+row is more than five minutes old. It reads the event log rather than anything the dashboard
+remembers, so a refusal written by `vhotseat watch`, or by a guard in another process, warns
+here too.
 
 Every chart marks each event with a dashed line: hover it to see the event,
 click it to open it in the table. Ranges run from 15 minutes to the whole
@@ -441,6 +451,15 @@ short of exactly the VRAM that stayed put, the decision is written down twice: a
 in the event log (which the dashboard shows as a warning until it goes stale), and the workload
 named as `kept for its policy:` in `vhotseat claims` and `vhotseat status`, next to what the claim
 was given.
+
+**Fits alongside.** The dashboard's policy panel answers the question the owner actually has:
+can these two run at the same time? It is arithmetic on what the card has been *seen* doing:
+each workload at the most the telemetry recorded it holding, plus the most the processes
+vhotseat doesn't manage have held over the same window (the desktop, a browser, a game: the
+part of the card nothing here can free). A pair that fits at those numbers fits; a pair
+measured against what the card happens to be doing this second is a snapshot of luck. A pair
+where one of the two has never been sampled holding models says so rather than promising a
+fit.
 
 While something matches, nothing **new** loads: the gate refuses a load a request would
 wake, and `switch --request` - what ComfyUI's guard node uses, because the queue is

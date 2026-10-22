@@ -299,7 +299,7 @@ def test_status_prints_who_gives_way_for_whom(rig, capsys):
     assert "strata 50 (comfy)" in out and "comfy 30 (anything)" in out
     assert rig.cli("status", "--json") == 0
     assert json.loads(capsys.readouterr().out)["policy"]["strata"] == {
-        "priority": 50, "yields_to": ["comfy"]}
+        "priority": 50, "yields_to": ["comfy"], "gives_way_for": "comfy"}
 
 
 def test_why_calls_a_workload_that_wont_give_way_a_blocker_not_a_delay(rig, capsys):

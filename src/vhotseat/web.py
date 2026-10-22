@@ -4,7 +4,10 @@ and the event and log history, served from telemetry.db.
 The page (web.html) polls a small JSON API:
 
   GET /api/status                    the live status (`status --json`), plus the workloads' order and
-                                     the card's model, load, temperature and power
+                                     the card's model, load, temperature and power, the policy in
+                                     force (read-only), what each workload has peaked at, which
+                                     pairs of them fit on the card together, and the recent policy
+                                     warnings the page should show
   GET /api/why                       for each workload: could it take the card now, and what stands in
                                      the way (`why`'s dry run: it releases nothing)
   GET /api/cost?since=&until=        kWh and money over that window, per holder (needs power.price)
@@ -32,6 +35,42 @@ from .telemetry import Sampler, cost
 STATUS_TTL_S = 1.0
 # `why` probes again (busy(), reachability): share it between tabs the same way.
 WHY_TTL_S = 3.0
+# The event rows that are a warning rather than a record: a load a policy refused, and a
+# workload a claim was not allowed to unload. Both say somebody may be short of VRAM.
+POLICY_WARNING_ROWS = ("policy-refused", "policy-kept")
+# How recent one has to be to still be shown on the page: long enough that the next look at
+# the dashboard sees it, short enough that a refusal from this morning isn't shouting at you
+# this afternoon. It's the row's own timestamp that decides, so every process serving a page
+# sees the same set.
+WARNING_AGE_S = 300.0
+
+
+def fits_on_card(peaks: dict, idle: dict, total_mib: int | None) -> list[dict]:
+    """For each pair of workloads: would they fit on the card at the same time?
+
+    Each one at the most it has been *recorded* holding, plus the most the processes
+    vhotseat doesn't manage have held - the part of the card nothing here can free. A pair
+    that fits at those numbers fits; a pair measured against what the card happens to be
+    doing this second tells you what you already knew and nothing you could act on.
+
+    `fits` is null for a pair where one of the two has never been sampled holding more than
+    its idle weight: the honest answer there is that the card has never been seen doing it,
+    not that it would have fitted."""
+    if total_mib is None:
+        return []
+    floor = peaks.get("other") or 0
+    names = [n for n in peaks if n != "other"]
+    rows = []
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            never = [n for n in (a, b) if (peaks.get(n) or 0) <= (idle.get(n) or 0)]
+            if never:
+                rows.append({"a": a, "b": b, "mib": None, "fits": None,
+                             "why": "never recorded holding models: " + ", ".join(never)})
+                continue
+            mib = peaks[a] + peaks[b] + floor
+            rows.append({"a": a, "b": b, "mib": mib, "fits": mib <= total_mib, "why": None})
+    return rows
 
 
 def bucket(samples: list[dict], points: int) -> list[dict]:
@@ -94,8 +133,33 @@ class Dashboard:
                     # wants anyway.
                     cached["claims_state"] = [{**rec, "name": key[0], "note": key[1]}
                                               for key, rec in cached["claims_state"].items()]
+                # The policy is the config's, shown here read-only until there's a way to edit
+                # it in the page; the warnings come from the event log, which is the shared
+                # state, so a refusal written by `watch` warns here too.
+                cached["policy_warnings"] = self.arbiter.events.recent(POLICY_WARNING_ROWS,
+                                                                      within_s=WARNING_AGE_S)
+                peaks = self._peaks(cached["gpu"])
+                cached["peaks"] = peaks
+                cached["fits"] = fits_on_card(peaks, {n: w.idle_vram_mib
+                                                      for n, w in self.arbiter.workloads.items()},
+                                              cached["gpu"].get("total_mib"))
                 self._status = (time.monotonic(), cached)
             return cached
+
+    def _peaks(self, gpu: dict) -> dict:
+        """The most VRAM each workload has been seen holding, and the most nothing-managed
+        processes held: what telemetry recorded over the retention window, floored by what
+        the card shows right now - a 14 GB model sitting on the card today has cost at least
+        that much, whatever the sampled window happened to catch."""
+        recorded = self.telemetry.peaks(list(self.arbiter.workloads)) if self.telemetry else {}
+        keys = [*self.arbiter.workloads, "other"]
+
+        def highest(*values):
+            return max((v for v in values if v is not None), default=None)
+
+        return {n: (highest(recorded.get(n), gpu.get(f"{n}_mib")) if n != "other"
+                    else highest(recorded.get("other"), gpu.get("other_mib")))
+                for n in keys}
 
     def why(self) -> dict:
         with self._why_lock:

@@ -195,6 +195,26 @@ class Telemetry:
                           "ORDER BY t DESC LIMIT ?", (since, until, limit))
         return [{"t": t, "source": s, "pid": p, "message": m} for t, s, p, m in rows]
 
+    def peaks(self, names: list[str]) -> dict:
+        """The most VRAM each workload has been recorded holding over the retention window, and
+        the most the processes vhotseat doesn't manage reached (under `other`).
+
+        This is what "would these two fit on the card together?" has to be measured against:
+        each one at its worst, plus the memory nothing here can free. Measured against what the
+        card happens to be doing this second, the answer is a snapshot of luck. Read with
+        json_extract so the samples don't have to be pulled into Python for one number."""
+        cols = ["max(cast(json_extract(data, '$.vram_other') as integer))"]
+        args: list = []
+        for n in names:
+            cols.append("max(cast(json_extract(data, ?) as integer))")
+            args.append(f"$.w.{n}.vram")
+        try:
+            row = self._read(f"SELECT {', '.join(cols)} FROM samples WHERE t >= ?",
+                             (*args, time.time() - self.retention_s))[0]
+        except (sqlite3.Error, IndexError, OSError):
+            return {}
+        return dict(zip(["other", *names], row, strict=True))
+
     def oldest(self) -> float | None:
         return self._read("SELECT min(t) FROM samples", ())[0][0]
 

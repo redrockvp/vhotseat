@@ -143,7 +143,8 @@ class Arbiter:
         ram.update({n: w.memory() for n, w in self.workloads.items()})
         hits = self._claims_in(held)
         status = {"mode": mode, **states, "gpu": gpu, "holders": held, "claims": hits,
-                  "policy": {n: {"priority": w.priority, "yields_to": list(w.yields_to)}
+                  "policy": {n: {"priority": w.priority, "yields_to": list(w.yields_to),
+                                  "gives_way_for": policy.describe(w.yields_to)}
                              for n, w in self.workloads.items()},
                   "ram": ram, "last_event": self.events.last()}
         if hits:

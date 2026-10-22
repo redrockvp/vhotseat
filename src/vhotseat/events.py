@@ -103,6 +103,26 @@ class EventLog:
                                            "held_mib": e.get("held_mib") or 0})
         return out
 
+    def recent(self, kinds, within_s: float = 300.0, limit: int = 500) -> list[dict]:
+        """Rows of these kinds no older than `within_s`, newest first: what the dashboard
+        shows as a warning. The log is the record, so "is this still news" is answered from
+        the row's own timestamp rather than from anything a process remembers - which is also
+        what means both the dashboard and `watch` see the same warnings, and whichever of
+        them wrote the row doesn't get a private copy of it."""
+        cutoff = datetime.datetime.now().astimezone() - datetime.timedelta(seconds=within_s)
+        out = []
+        for e in reversed(self.tail(limit)):
+            if e.get("event") not in kinds:
+                continue
+            try:
+                when = datetime.datetime.fromisoformat(e["time"])
+                fresh = when >= cutoff
+            except (KeyError, TypeError, ValueError):
+                continue            # a row whose time can't be read isn't news about now
+            if fresh:
+                out.append(e)
+        return out
+
     def last(self) -> dict | None:
         if not self.path.exists():
             return None

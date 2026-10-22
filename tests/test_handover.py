@@ -43,7 +43,7 @@ def test_status_json_shape_is_unchanged(rig, capsys):
     assert set(s) == {"mode", "strata", "comfy", "gpu", "holders", "claims", "policy", "ram",
                       "last_event"}
     assert set(s["strata"]) == {"service", "reachable", "loaded"}
-    assert set(s["policy"]["strata"]) == {"priority", "yields_to"}
+    assert set(s["policy"]["strata"]) == {"priority", "yields_to", "gives_way_for"}
     assert set(s["comfy"]) == {"service", "reachable", "running", "pending", "holds_models"}
     assert set(s["gpu"]) == {"total_mib", "free_mib", "strata_mib", "comfy_mib", "other_mib"}
     assert set(s["holders"][0]) == {"pid", "mib", "name", "workload"}

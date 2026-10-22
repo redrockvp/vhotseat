@@ -98,6 +98,14 @@ section.card { margin-bottom: 14px; }
 tr.hl td { background: var(--wash); }
 .notice { color: var(--ink-2); font-size: 13px; margin: 0 0 14px; }
 .notice code, td code { font-size: 12px; background: var(--wash); padding: 1px 5px; border-radius: 4px; }
+/* A policy refusal, or a claim that wasn't allowed to unload something: somebody may be
+   short of VRAM right now, so it is shown until it stops being recent news. */
+.banner { background: var(--surface); border-left: 4px solid var(--warning); border-radius: 10px;
+  box-shadow: 0 0 0 1px var(--ring); padding: 10px 14px; margin-bottom: 14px; font-size: 13px; }
+.banner .whead { font-weight: 650; margin-bottom: 4px; }
+.banner ul { margin: 0; padding-left: 18px; color: var(--ink-2); }
+.banner li { margin: 3px 0; overflow-wrap: anywhere; }
+.banner .when { color: var(--muted); }
 .workloads { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-bottom: 14px; }
 .holders { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px 18px; margin-top: 4px; }
 .who.claim { color: var(--critical); }
@@ -165,6 +173,7 @@ td.nw { color: var(--ink); }
     <div class="seg" id="ranges"></div>
     <span class="sub" id="rangeNote"></span>
   </div>
+  <div class="banner" id="warnings" hidden></div>
   <p class="notice" id="notice" hidden></p>
 
   <section class="card" id="owner">
@@ -193,6 +202,14 @@ td.nw { color: var(--ink); }
   <section class="card" id="why-card">
     <div class="head"><h2>Next handover</h2><span class="right" id="whyNote"></span></div>
     <div class="whys" id="whys"></div>
+  </section>
+
+  <section class="card" id="policy-card">
+    <div class="head"><h2>Who gives way for whom</h2><span class="right" id="policyNote"></span></div>
+    <div class="holders" id="policyRows"></div>
+    <div class="chart-head"><h3>Fits alongside</h3></div>
+    <div class="tiles" id="fitsTiles"></div>
+    <p class="notice" id="fitsNote"></p>
   </section>
 
   <section class="card" id="cost-card" hidden>
@@ -770,6 +787,63 @@ function renderWhy() {
   }));
 }
 
+// A policy refusal, or a claim that wasn't allowed to unload something: somebody may be
+// short of VRAM right now, so it stays up until it stops being recent news. The server trims
+// the list to this window from the event log; the page checks the age again so a tab that
+// hasn't refreshed in an hour doesn't go on shouting about this morning.
+const WARNING_AGE_S = 300;
+
+function renderWarnings() {
+  const box = $("warnings"), now = Date.now() / 1000;
+  const rows = (state.status.policy_warnings || []).filter(
+    (w) => now - new Date(w.time).getTime() / 1000 <= WARNING_AGE_S);
+  if (!rows.length) { box.hidden = true; return; }
+  box.hidden = false;
+  const ul = el("ul");
+  for (const w of rows) {
+    const li = el("li");
+    li.append(w.why || w.event);
+    li.append(el("span", { class: "when" },
+      ` · ${fmtTime(new Date(w.time).getTime() / 1000)} · ${w.event}`));
+    ul.append(li);
+  }
+  box.replaceChildren(el("div", { class: "whead" },
+    rows.length === 1 ? "One policy decision worth a look" : `${rows.length} policy decisions worth a look`), ul);
+}
+
+// The config's policy, read-only: what each workload gives way for, what it costs at its
+// worst, and which pairs of them can be on the card at the same time.
+function renderPolicy() {
+  const s = state.status, g = s.gpu || {}, pol = s.policy || {}, peaks = s.peaks || {};
+  const total = g.total_mib || 0;
+  $("policyNote").textContent = "from the config: who may unload what, and in what order";
+  $("policyRows").replaceChildren(...(s.workloads || []).map((n) => {
+    const p = pol[n] || {};
+    const row = el("div", { class: "hrow" });
+    const top = el("div", { class: "top" });
+    top.append(el("b", {}, labelOf(n)), el("span", {}, `priority ${p.priority ?? "–"}`));
+    const bar = el("div", { class: "bar" }), fill = el("i");
+    fill.style.width = total && g[`${n}_mib`] ? `${Math.min(100, Math.round(100 * g[`${n}_mib`] / total))}%` : "0%";
+    fill.style.background = colorOf(n);
+    bar.append(fill);
+    row.append(top, bar, el("div", { class: "who" },
+      `gives way for: ${p.gives_way_for ?? "anyone"} · now ${gib(g[`${n}_mib`])} GiB · peak ${gib(peaks[n])} GiB`));
+    return row;
+  }));
+  const rows = s.fits || [];
+  $("fitsTiles").replaceChildren(...rows.map((f) => {
+    const name = `${labelOf(f.a)} + ${labelOf(f.b)}`;
+    if (f.fits === null || f.fits === undefined) return tile(name, "unknown", "", f.why || "no recorded samples");
+    return tile(name, f.fits ? "fits" : "no room", "", `${gib(f.mib)} of ${gib(total)} GiB at their recorded peaks`,
+      f.fits ? css("--good") : css("--critical"));
+  }));
+  const unknown = rows.filter((f) => f.fits === null).map((f) => `${labelOf(f.a)} + ${labelOf(f.b)}`);
+  $("fitsNote").textContent = rows.length
+    ? `each pair at the most the history recorded each of them holding, plus ${gib(peaks.other)} GiB held by processes vhotseat doesn't manage (a desktop, a browser, a game): nothing here frees that` + (unknown.length ? ` · never seen holding models: ${unknown.join(", ")}` : "")
+    : (g.error ? "the card couldn't be read: there's nothing to compare the pairs against"
+               : "one workload on the card: there's no pair to compare");
+}
+
 function renderCost() {
   const c = state.cost, card = $("cost-card");
   if (!c || c.error) { card.hidden = true; return; }
@@ -827,6 +901,8 @@ function renderCharts() {
   renderOwner();
   renderHolders();
   renderWhy();
+  renderWarnings();
+  renderPolicy();
   renderGpu();
   renderCost();
   renderVram();

@@ -10,6 +10,7 @@ import urllib.request
 
 import pytest
 
+from fakes import COMFY_MODEL_VRAM, STRATA_VRAM
 from vhotseat import claims, config, host, telemetry, util, web
 from vhotseat.telemetry import Telemetry
 
@@ -288,6 +289,90 @@ def test_a_backend_without_health_still_records(rig):
     assert "gpu_util_pct" not in s and s["vram_total"] == 16303
 
 
+def test_the_dashboard_shows_the_policy_and_warns_about_a_refusal(rig, server):
+    """Two things the page has to say without being told: what the policy in the config is,
+    and that it just refused something. The refusal is read back from the event log, which is
+    what lets a `switch --request` run by another process warn on this page too."""
+    rig.arb.workloads["strata"].yields_to = ("claims",)
+    rig.strata.loaded = True
+    assert rig.cli("switch", "comfy", "--request") == 1
+    st = json.loads(get(server + "/api/status")[1])
+    assert st["policy"]["strata"] == {"priority": 50, "yields_to": ["claims"],
+                                      "gives_way_for": "a claim on the card"}
+    warnings = st["policy_warnings"]
+    assert [w["event"] for w in warnings] == ["policy-refused"]
+    assert warnings[0]["requested"] == "comfy" and warnings[0]["workloads"] == ["strata"]
+    assert "Strata holds 14000 MiB" in warnings[0]["why"]
+
+
+def test_a_policy_warning_stops_being_news_after_a_few_minutes(rig, server):
+    """A banner that never goes away is wallpaper, and this one says somebody may be short of
+    VRAM *now*. The row's own age decides, so it is the same answer in every process that
+    serves a page."""
+    rig.arb.workloads["strata"].yields_to = ("claims",)
+    rig.strata.loaded = True
+    assert rig.cli("switch", "comfy", "--request") == 1
+    fetched = json.loads(get(server + "/api/status")[1])["policy_warnings"]
+    assert [w["event"] for w in fetched] == ["policy-refused"]
+    log = rig.state / "events.jsonl"
+    rows = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()]
+    old = (datetime.datetime.now().astimezone() - datetime.timedelta(minutes=9)).isoformat(timespec="seconds")
+    for r in rows:
+        if r["event"] == "policy-refused":
+            r["time"] = old
+    log.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    time.sleep(1.1)                       # the status cache's second
+    assert json.loads(get(server + "/api/status")[1])["policy_warnings"] == []
+
+
+def test_a_kept_for_policy_decision_reaches_the_banner_too(rig, server, monkeypatch):
+    """A claim that wasn't allowed to unload something leaves the game short of VRAM. The row
+    is written by the watcher - here by `watch`, which is what runs at logon - and the page
+    that shows it may be a different process that never saw the claim."""
+    rig.arb.claim_rules = claims.rules([{"name": "game.exe", "note": "a game"}], builtin=False)
+    monkeypatch.setattr(host, "processes", lambda: {7: {"pid": 7, "ppid": 4, "name": "game.exe", "exe": None}})
+    rig.arb.workloads["strata"].yields_to = ("comfy",)
+    rig.strata.loaded = True
+    web.watch(rig.arb, polls=1)
+    st = json.loads(get(server + "/api/status")[1])
+    assert [w["event"] for w in st["policy_warnings"]] == ["policy-kept"]
+    assert st["policy_warnings"][0]["workload"] == "strata"
+
+
+def test_the_dashboard_shows_which_two_workloads_fit_on_the_card_together(rig, server):
+    """"Can I run both?" answered from what the card was seen doing, not from what it happens
+    to be doing: each workload at the most it has been recorded holding, plus the memory
+    nothing here can free. The fakes' card is 16303 MiB, so 14000 + 7000 doesn't fit."""
+    rig.cli("status")                                # nothing loaded yet: no peaks to go on
+    time.sleep(1.1)                                 # the status cache's second
+    out = json.loads(get(server + "/api/status")[1])
+    assert out["fits"] == [{"a": "strata", "b": "comfy", "mib": None, "fits": None,
+                            "why": "never recorded holding models: strata, comfy"}]
+    rig.strata.loaded = True
+    rig.cli("status")
+    rig.strata.loaded = False
+    rig.comfy.vram = COMFY_MODEL_VRAM
+    rig.cli("status")
+    time.sleep(1.1)
+    out = json.loads(get(server + "/api/status")[1])
+    assert out["peaks"] == {"other": 0, "strata": STRATA_VRAM, "comfy": COMFY_MODEL_VRAM}
+    assert out["fits"] == [{"a": "strata", "b": "comfy", "mib": STRATA_VRAM + COMFY_MODEL_VRAM,
+                            "fits": False, "why": None}]
+
+
+def test_peaks_are_read_from_the_samples_and_pruned_with_them(tmp_path):
+    """The window is the retention window: a peak from outside it is gone, which is what keeps
+    the fit honest about what this machine has been doing lately rather than about whatever it
+    did once."""
+    tel = telemetry.Telemetry(tmp_path / "t.db", retention_hours=1)
+    tel._write("INSERT INTO samples VALUES (?, ?, ?)",
+               (time.time() - 60, "strata", json.dumps({"vram_other": 900,
+                                                        "w": {"strata": {"vram": 14000}}})))
+    assert tel.peaks(["strata", "comfy"]) == {"other": 900, "strata": 14000, "comfy": None}
+    tel._db.execute("UPDATE samples SET t = t - 7200")
+    assert tel.peaks(["strata"]) == {"other": None, "strata": None}
+
+
 def test_the_dashboard_survives_an_open_claim(rig, server, monkeypatch):
     """The record of an open claim is keyed by (process name, what claimed it), which is what
     `status` and `claims` unpack - and a JSON object can't have a tuple for a key. So with a
@@ -306,3 +391,21 @@ def test_the_dashboard_survives_an_open_claim(rig, server, monkeypatch):
     assert [c["name"] for c in st["claims_state"]] == ["game.exe"]
     assert st["claims_state"][0]["released"] == ["strata"]
     assert st["claims_state"][0]["freed_mib"]
+
+
+def test_the_fits_matrix_counts_every_pair_and_the_floor_that_comes_with_them():
+    """Three workloads make three pairs, and each pair carries the memory nothing on this
+    side can free. The one honest answer when a workload has never been sampled holding
+    models is unknown: a pair including it has never been seen, and saying it would have
+    fitted would be a promise the history didn't earn."""
+    peaks = {"strata": 14000, "comfy": 7000, "unsloth": None, "other": 900}
+    idle = {"strata": 1500, "comfy": 1500, "unsloth": 1500}
+    assert web.fits_on_card(peaks, idle, 24576) == [
+        {"a": "strata", "b": "comfy", "mib": 21900, "fits": True, "why": None},
+        {"a": "strata", "b": "unsloth", "mib": None, "fits": None,
+         "why": "never recorded holding models: unsloth"},
+        {"a": "comfy", "b": "unsloth", "mib": None, "fits": None,
+         "why": "never recorded holding models: unsloth"},
+    ]
+    assert web.fits_on_card(peaks, idle, 16303)[0]["fits"] is False
+    assert web.fits_on_card(peaks, idle, None) == []      # card unreadable: no comparison
