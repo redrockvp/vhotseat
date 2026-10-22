@@ -14,8 +14,8 @@ import datetime
 import json
 import time
 
-from fakes import COMFY_MODEL_VRAM, STRATA_VRAM
-from vhotseat import host, pressure, util
+from fakes import COMFY_MODEL_VRAM, STRATA_VRAM, FakeStrata
+from vhotseat import host, pressure, util, web
 
 GROWER = "blender.exe"
 
@@ -321,3 +321,58 @@ def test_a_cooldown_that_has_passed_starts_a_fresh_episode(rig, monkeypatch):
     rig.strata.loaded = True
     out = rig.arb.pressure_start()
     assert out["declined"] is None and rig.strata.calls.count("POST /unload") == 2
+
+
+# --- the two actors that run it --------------------------------------------------
+
+
+def test_both_pollers_together_open_one_episode_and_unload_once(rig, monkeypatch):
+    """The dashboard's watcher and `vhotseat watch` both run this, on their own clocks. One
+    episode in the log and one unload: the log says what is already open and already given, and the
+    GPU lock is what keeps the two from acting in the same moment."""
+    scene(rig, monkeypatch)
+    web.watch_pass(rig.arb, [])                            # the dashboard
+    web.watch_pass(rig.arb, [])                            # watch
+    assert not rig.strata.loaded
+    assert len(rows(rig, "pressure")) == 1 and len(rows(rig, "pressure-release")) == 1
+    assert rig.strata.calls.count("POST /unload") == 1
+
+
+def test_the_watcher_that_runs_at_logon_runs_the_pressure_pass_too(rig, monkeypatch):
+    """`vhotseat watch` is the resident process autostart installs, and the trigger's readings need
+    a sampler, which is the same process. One poll of it is enough to open the episode."""
+    scene(rig, monkeypatch)
+    web.watch(rig.arb, polls=1)
+    assert not rig.strata.loaded and len(rows(rig, "pressure")) == 1
+
+
+def test_a_stuck_workload_is_asked_three_times_and_then_left(rig, monkeypatch):
+    """A workload that answers "unloaded" and keeps its 14000 MiB has an unload that doesn't work,
+    not a busy moment. Asking it again every poll for as long as the app holds the card spends the
+    whole time taking the GPU lock for nothing, so the attempts in the rows are counted - from the
+    rows, so both pollers count the same three - and then it is left alone for the episode."""
+    scene(rig, monkeypatch)
+    # An unload that doesn't work: /unload answers "unloaded", the confirm the owner wrote agrees,
+    # and the card still says the 14000 MiB is there. The card decides.
+    monkeypatch.setattr(FakeStrata, "vram", property(lambda self: STRATA_VRAM))
+    rig.arb.workloads["strata"].spec.setdefault("confirm", {})["vram_at_most"] = STRATA_VRAM
+    for _ in range(web.STUCK_TRIES):
+        web.pressure_pass(rig.arb)
+    got = rows(rig, "pressure-release-waiting")
+    assert [r["attempts"] for r in got] == [1, 2, 3]
+    assert all(r["stuck"] and r["held_mib"] == STRATA_VRAM for r in got)
+    unloads = rig.strata.calls.count("POST /unload")
+    web.pressure_pass(rig.arb)
+    assert rig.strata.calls.count("POST /unload") == unloads == web.STUCK_TRIES
+    assert rig.arb.events.episode_open() is not None, "the episode stays open: the card is short"
+
+
+def test_the_episode_is_closed_in_the_log_when_the_room_comes_back(rig, monkeypatch):
+    """The close has to be a row too: it is what tells `why`, the dashboard and the cooldown that
+    this episode is over, rather than a fact one process happens to remember."""
+    scene(rig, monkeypatch)
+    web.pressure_pass(rig.arb)
+    assert not rig.strata.loaded
+    web.pressure_pass(rig.arb)                             # the room came back: close it
+    assert [e["reason"] for e in rows(rig, "pressure-end")] == ["the card is back to 15176 MiB free"]
+    assert rig.arb.events.episode_open() is None

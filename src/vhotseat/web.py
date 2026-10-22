@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from urllib.parse import parse_qs, urlparse
 
-from . import policy, util
+from . import policy, pressure, util
 from .telemetry import Sampler, cost
 
 # Probing calls every workload's API; several open tabs share one probe a second.
@@ -124,7 +124,7 @@ class Dashboard:
                     cached["retention_hours"] = self.telemetry.retention_s / 3600
                     cached["interval_s"] = self.telemetry.interval_s
                     cached["oldest"] = self.telemetry.oldest()
-                claim_transitions(self.arbiter, cached.get("claims", []))
+                watch_pass(self.arbiter, cached.get("claims", []))
                 if "claims_state" in cached:
                     # What has been unloaded for an open claim, and what is still holding. The
                     # log rebuilds it keyed by (process name, what claimed it) because that is
@@ -245,7 +245,7 @@ def claim_watcher(arbiter, stop: threading.Event) -> None:
     every = arbiter.claim_poll_s * util.SCALE
     while not stop.wait(every):
         try:
-            claim_transitions(arbiter, arbiter.claim_hits())
+            watch_pass(arbiter, arbiter.claim_hits())
         except Exception as e:                              # a bad poll must not stop the watcher
             util.log(f"claim check failed: {type(e).__name__}: {e}")
 
@@ -302,7 +302,7 @@ def watch(arbiter, polls: int | None = None) -> int:
     with Sampler(arbiter) if arbiter.telemetry else contextlib.nullcontext():
         while polls is None or polls > 0:
             polls = None if polls is None else polls - 1
-            claim_transitions(arbiter, arbiter.claim_hits())
+            watch_pass(arbiter, arbiter.claim_hits())
             if polls is not None and polls <= 0:
                 break
             stop.wait(claim_every)
@@ -456,6 +456,75 @@ def _groups(hits):
     for h in hits:
         out.setdefault((h["name"], h["note"]), []).append(h)
     return out
+
+
+# How many tries a workload that says it unloaded and keeps holding its VRAM gets in one episode,
+# before it is left alone. That is an unload that doesn't work, not a busy moment, and asking every
+# poll for as long as an app holds the card would spend the whole time taking the GPU lock for
+# nothing. The same patience phase 1 uses for a claim.
+STUCK_TRIES = 3
+
+
+def watch_pass(arbiter, hits: list[dict]) -> None:
+    """One pass of what the watcher does: record the claims and act on them, then look at the
+    pressure the claims don't explain. One call because both halves want the same process scan, and
+    both are safe to run from more than one process on the box."""
+    claim_transitions(arbiter, hits)
+    pressure_pass(arbiter, {h["pid"] for h in hits})
+
+
+def pressure_pass(arbiter, claimed: set = frozenset()) -> None:
+    """One look at the pressure trigger: end an episode that is over, keep an open one going, or
+    start one if the card says it should.
+
+    `claimed` are the pids the claims from this same poll cover: a game is phase 1's, already handed
+    the card by its own rule, so its memory is not also a reason to open an episode over it. Whether
+    an episode is open, which workloads it was owed, and which have come free are read back from the
+    event log, which is what makes this safe for `watch`, the dashboard's watcher and a status
+    request to all run on one box: the second one finds the episode, not a card to free again.
+
+    Nothing is logged when the numbers simply aren't pressure - that is every poll of an ordinary
+    day, and a watcher that printed its reasoning twice a second would bury the lines that matter.
+    What is logged is what moved: an episode opening, a model coming off, a workload still holding,
+    and the episode ending.
+    """
+    events = arbiter.events
+    label = lambda n: arbiter.workloads[n].label if n in arbiter.workloads else n  # noqa: E731
+    ep = events.episode_open()
+    if ep is None:
+        out = arbiter.pressure_start(claimed=claimed)
+        if out["released"]:
+            util.log("pressure: " + pressure.describe(out.get("episode") or {}) + " - " +
+                     ", ".join(f"{label(r['workload'])} {r['freed_mib']} MiB"
+                                for r in out["released"]) + " unloaded, nothing closed")
+        return
+
+    reason = arbiter.pressure_over(ep)
+    if reason:
+        events.record("pressure-end", source="watch", name=ep["episode"].get("name"),
+                      reason=reason, freed_mib=ep.get("freed_mib") or 0)
+        util.log(f"pressure: {reason}: the card is open to loads again")
+        return
+
+    waiting = {w["workload"]: w for w in ep.get("waiting") or []}
+    # A stuck one gets STUCK_TRIES in total, counted from the rows so both pollers are counting the
+    # same three. A busy one is asked again on every poll for as long as the episode lasts: it is
+    # working, and work in flight is never interrupted for an app nobody named.
+    tired = {n for n, w in waiting.items()
+             if w.get("stuck") and (w.get("attempts") or 1) >= STUCK_TRIES}
+    if any((waiting[n].get("attempts") or 1) == STUCK_TRIES for n in tired):
+        util.log(f"pressure: leaving {', '.join(sorted(tired))} alone: "
+                 f"{STUCK_TRIES} tries and it still holds its VRAM")
+    owed = (set(ep.get("targets") or []) - set(ep.get("released") or [])) - tired
+    if not owed:
+        return
+    out = arbiter.pressure_release(ep)
+    if out["released"]:
+        util.log("pressure: " + ", ".join(f"{label(r['workload'])} {r['freed_mib']} MiB"
+                                          for r in out["released"]) + " unloaded, nothing closed")
+    for w in out["waiting"]:
+        if not w.get("stuck"):
+            util.log(f"pressure: {label(w['workload'])} keeps its model for now - {w['why']}")
 
 
 def record(arbiter) -> int:

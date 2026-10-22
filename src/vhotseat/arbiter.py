@@ -26,6 +26,13 @@ from .events import EventLog, row_time
 from .lock import GpuLock, Held
 
 NONE = "none"
+
+
+def _declined(why: str, by_actor: bool = False) -> dict:
+    """A pressure call that did nothing answers in the same shape as one that did: whoever asked
+    can read `released` without knowing which of four ways out was taken."""
+    return {"declined": why, "by_actor": by_actor, "episode": None, "released": [],
+            "waiting": [], "freed_mib": 0, "would": []}
 # Set in a hold's command's environment, so a nested switch to the held workload
 # is a no-op instead of waiting on the lock the hold owns.
 HOLD_ENV = "VHOTSEAT_HOLD"
@@ -820,20 +827,20 @@ class Arbiter:
         """
         blocked = self.pressure_can_start()
         if blocked:
-            return {"declined": blocked, "by_actor": False, "episode": None}
+            return _declined(blocked)
         readings = self.pressure_readings(claimed)
         if readings.get("why"):
-            return {"declined": readings["why"], "by_actor": False, "episode": None}
+            return _declined(readings["why"])
         grower = readings.get("grower") or {}
         name = grower.get("name") or "an unmanaged process"
         got = self.lock.try_take(f"{self.PRESSURE_LOCK} {name}")
         if not isinstance(got, Held):
-            return {"declined": f"{got or 'a switch'} in progress",
-                    "by_actor": bool(got and got.startswith(self.PRESSURE_LOCK)), "episode": None}
+            return _declined(f"{got or 'a switch'} in progress",
+                             by_actor=bool(got and got.startswith(self.PRESSURE_LOCK)))
         with got:
             readings = self.pressure_readings(claimed)      # the card as whoever held the lock left it
             if readings.get("why"):
-                return {"declined": readings["why"], "by_actor": False, "episode": None}
+                return _declined(readings["why"])
             grower = readings.get("grower") or {}
             self.events.record("pressure", source=source, name=grower.get("name") or name,
                                pid=grower.get("pid"), other_mib=readings["other_mib"],
