@@ -52,7 +52,8 @@ def test_status_json_shape_is_unchanged(rig, capsys):
             "free_mib", "total_mib", "other_mib", "floor_mib"} <= set(pr)
     assert pr["open"] is None and pr["last"] is None and pr["would"] is False
     assert set(s["comfy"]) == {"service", "reachable", "running", "pending", "holds_models"}
-    assert set(s["gpu"]) == {"total_mib", "free_mib", "strata_mib", "comfy_mib", "other_mib"}
+    assert set(s["gpu"]) == {"total_mib", "free_mib", "strata_mib", "comfy_mib", "other_mib",
+                             "shared_mib"}
     assert set(s["holders"][0]) == {"pid", "mib", "name", "workload"}
     assert set(s["ram"]) >= {"total_mib", "available_mib", "strata", "comfy"}
 

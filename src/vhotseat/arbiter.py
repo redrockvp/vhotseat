@@ -93,6 +93,25 @@ class Arbiter:
         """The card's model, load, temperature and power; not part of `status`."""
         return self.gpu.health() if hasattr(self.gpu, "health") else {}
 
+    def shared_total_mib(self) -> int | None:
+        """Total shared GPU memory across every process with a context on the card: system RAM the
+        card borrowed once it ran out, which is Task Manager's "shared GPU memory" column.
+
+        Evidence, never a decision - see pressure.py's docstring. Measured on this box: 52206 MiB of
+        it, 50.9 GiB of that Strata, on a card that was merely full. A backend that has no such
+        figure (Linux NVML) answers None rather than 0, because 0 would read as "nothing spilled".
+        """
+        fn = getattr(self.gpu, "shared", None)
+        if not fn:
+            return None
+        try:
+            per = fn()
+        except Exception:
+            return None
+        # {} is the backend saying "I have no such counter" (Linux NVML), not "nothing spilled":
+        # None keeps that difference instead of inventing a zero.
+        return sum(per.values()) if per else None
+
     def _others(self, name: str | None) -> list[Workload]:
         return [w for n, w in self.workloads.items() if n != name]
 
@@ -156,6 +175,10 @@ class Arbiter:
         # the same numbers the trigger would act on.
         gpu, every = self.snapshot_all(limit=0)
         held = every[:8]
+        if "error" not in gpu:
+            # Kept in the card's own block so the samples get it for free: a spill is the other half
+            # of "the card was full", and it is the one number here that says the card ran out.
+            gpu["shared_mib"] = self.shared_total_mib()
         states = {n: w.probe(gpu) for n, w in self.workloads.items()}
         active = [n for n, w in self.workloads.items() if w.active(states[n], gpu)]
         mode = "conflict" if len(active) > 1 else active[0] if active else NONE

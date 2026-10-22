@@ -474,3 +474,20 @@ def test_the_dashboard_shows_the_episode_that_already_ended(rig, server, monkeyp
     assert pr["open"] is None
     assert pr["last"]["event"] == "pressure-end" and pr["last"]["name"] == "blender.exe"
     assert pr["last"]["freed_mib"] == STRATA_VRAM
+
+
+def test_the_spill_into_system_ram_is_recorded_as_evidence(rig):
+    """The card's two memory figures mean different things, and a history that keeps only one loses
+    the difference. Measured on this box: 52206 MiB of shared GPU memory between 37 processes, 50.9
+    GiB of it one workload, while the card was merely full - RAM the card borrowed because it ran
+    out, already off it, and never a reason to unload anything. It's kept per sample so a week later
+    an owner can see the card was oversubscribed at that moment, which is a different fact with a
+    different answer from the card being short."""
+    rig.gpu.shared_of = {1: 4000, 2: 9000}
+    rig.strata.loaded = True
+    st = rig.arb.probe()
+    assert st["gpu"]["shared_mib"] == 13000
+    sample = rig.arb.telemetry.samples(0, time.time() + 1)[-1]
+    assert sample["vram_shared"] == 13000
+    rig.gpu.shared_of = {}                    # a backend with no such counter, not an empty card
+    assert rig.arb.probe()["gpu"]["shared_mib"] is None

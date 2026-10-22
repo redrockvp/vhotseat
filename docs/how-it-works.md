@@ -448,8 +448,8 @@ loads it back on its own, only loading something or a typed `switch` is the orde
 
 Two things it never does. It never treats the card's **shared** counters as a trigger: on Windows a
 workload that spilled into system RAM reports tens of GiB there - 50 GiB of it measured on Strata on
-this box - and shared memory is already off the card, so it is shown as evidence and never decides
-anything. And it is never a lockout: like every other policy here it can filter what gets released
+this box - and shared memory is already off the card, so it is shown as evidence (the card-wide
+total, in every sample and on the dashboard's VRAM card) and never decides anything. And it is never a lockout: like every other policy here it can filter what gets released
 and refuse a load, never stop the card being freed.
 
 The numbers are sized from what this class of box actually does (docs/reference.md, "Pressure: an

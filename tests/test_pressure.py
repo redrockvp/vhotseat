@@ -165,3 +165,18 @@ def test_the_record_says_who_grew_and_what_the_card_was_doing():
     assert "card at 240 MiB free for 34 s" in line and "12000 MiB shared" in line
     assert "pressure" not in line and "51.8" not in line       # no invented precision
     assert pressure.describe({}) == ""
+
+
+def test_a_browser_with_30_gib_of_shared_gpu_memory_is_not_pressure():
+    """The counters report two figures per process, and the difference is the whole point: shared is
+    system RAM the card borrowed once it ran out, which is already off the card and comes back on
+    its own. Measured on this box: 52206 MiB of it between 37 processes, 50.9 GiB of that one
+    workload, on a card that was merely full. Reading the two as one number would mean a dozen new
+    browser tabs were reason to unload a 21 GiB model."""
+    rows = [{"pid": 1, "mib": 300, "name": "firefox.exe", "workload": None, "shared_mib": 30720},
+            {"pid": 2, "mib": 1370, "name": "dwm.exe", "workload": None, "shared_mib": 0}]
+    assert pressure.grow_mib(rows, floor=1000) == 1670 - 1000        # dedicated only
+    for r in rows:                                                   # ten times the spill
+        r["shared_mib"] = (r.get("shared_mib") or 0) * 10
+    assert pressure.grow_mib(rows, floor=1000) == 1670 - 1000
+    assert [r["name"] for r in pressure.growers(rows)] == ["dwm.exe", "firefox.exe"]

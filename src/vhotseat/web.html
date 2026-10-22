@@ -947,7 +947,12 @@ function renderVram() {
   const s = state.status, g = s.gpu, ws = s.workloads;
   $("vramNote").textContent = g.error || `${gib(g.free_mib)} of ${gib(g.total_mib)} GiB free`;
   $("vramTiles").replaceChildren(...ws.map((n) => tile(labelOf(n), gib(g[`${n}_mib`]), "GiB", null, colorOf(n))),
-    tile("Other", gib(g.other_mib), "GiB", null, css("--other")));
+    tile("Other", gib(g.other_mib), "GiB", null, css("--other")),
+    // Evidence, never a trigger, and deliberately not a chart line: on a box with a big model on the
+    // card this is tens of GiB of system RAM, dwarfing the 24 GiB the chart is about.
+    tile("Shared (spill)", gib(g.shared_mib), "GiB",
+         "system RAM the card borrowed: already off the card, and never a reason to release",
+         css("--other")));
   memChart("vramChart", "vramLegend", [...ws.map((n) => ({ label: labelOf(n), color: colorOf(n), get: (p) => p.w && p.w[n] ? p.w[n].vram : null })),
     { label: "other processes", color: css("--other"), get: (p) => p.vram_other }], (p) => p.vram_total);
 }

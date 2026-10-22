@@ -48,6 +48,7 @@ def compact(status: dict, health: dict | None = None) -> dict:
     g, r = status["gpu"], status["ram"]
     names = [n for n in status if n not in NOT_WORKLOADS]
     out = {"vram_total": g.get("total_mib"), "vram_free": g.get("free_mib"), "vram_other": g.get("other_mib"),
+           "vram_shared": g.get("shared_mib"),
            "ram_total": r.get("total_mib"), "ram_available": r.get("available_mib"),
            "swap_total": r.get("swap_total_mib"), "swap_used": r.get("swap_used_mib"),
            "w": {n: {"vram": g.get(f"{n}_mib"), "ram": (r.get(n) or {}).get("ram_mib"),

@@ -503,6 +503,10 @@ Task Manager's "shared GPU memory"). Only dedicated is what the trigger reads. M
 in the same window: 37 processes reporting **51.8 GiB** of shared GPU memory between them, 50.9 GiB
 of it Strata, while the card was merely full. Shared usage goes into the episode's row as evidence
 that the card was oversubscribed at that moment, which is a different fact with a different answer.
+The card-wide total is kept in the samples too (`vram_shared`), and the dashboard's VRAM card shows it
+as a tile labelled **Shared (spill)** rather than a chart line: with a 21 GiB model loaded it is tens
+of GiB of system RAM, so plotted against a 24 GiB card it would flatten every other series on the
+chart. A backend with no such counter (Linux) says "unknown", not zero.
 
 Both `vhotseat watch` and the dashboard's watcher run the check, and both act on it; they coordinate
 through the GPU lock and the event log, the same way claim releases do, so whichever gets there
