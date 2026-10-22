@@ -286,3 +286,23 @@ def test_a_backend_without_health_still_records(rig):
     rig.cli("status")
     s = rig.arb.telemetry.samples(0, time.time() + 1)[-1]
     assert "gpu_util_pct" not in s and s["vram_total"] == 16303
+
+
+def test_the_dashboard_survives_an_open_claim(rig, server, monkeypatch):
+    """The record of an open claim is keyed by (process name, what claimed it), which is what
+    `status` and `claims` unpack - and a JSON object can't have a tuple for a key. So with a
+    claim running, `/api/status` died inside json.dumps and the page got a closed connection:
+    precisely when it has most to show, that the card is somebody else's and here is what was
+    unloaded for it."""
+    rig.arb.claim_rules = claims.rules([{"name": "game.exe", "note": "a Steam game"}], builtin=False)
+    monkeypatch.setattr(host, "processes",
+                        lambda: {5: {"pid": 5, "ppid": 4, "name": "game.exe", "exe": None}})
+    rig.strata.loaded = True
+    web.watch(rig.arb, polls=1)                       # the claim, and the release it asked for
+    assert not rig.strata.loaded
+    code, body = get(f"{server}/api/status")
+    assert code == 200, body
+    st = json.loads(body)
+    assert [c["name"] for c in st["claims_state"]] == ["game.exe"]
+    assert st["claims_state"][0]["released"] == ["strata"]
+    assert st["claims_state"][0]["freed_mib"]

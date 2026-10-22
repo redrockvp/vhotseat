@@ -85,6 +85,15 @@ class Dashboard:
                     cached["interval_s"] = self.telemetry.interval_s
                     cached["oldest"] = self.telemetry.oldest()
                 claim_transitions(self.arbiter, cached.get("claims", []))
+                if "claims_state" in cached:
+                    # What has been unloaded for an open claim, and what is still holding. The
+                    # log rebuilds it keyed by (process name, what claimed it) because that is
+                    # what `status` and `claims` unpack, and a JSON object has no tuple keys: an
+                    # open claim used to kill the response in json.dumps and leave the page with
+                    # a closed connection. Rows with the name and note in them are what a page
+                    # wants anyway.
+                    cached["claims_state"] = [{**rec, "name": key[0], "note": key[1]}
+                                              for key, rec in cached["claims_state"].items()]
                 self._status = (time.monotonic(), cached)
             return cached
 
