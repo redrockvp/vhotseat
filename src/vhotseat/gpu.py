@@ -71,36 +71,67 @@ PDH_FMT_LARGE = 0x400
 _INSTANCE = re.compile(r"pid_(\d+)_luid_")
 
 
-def wddm_process_vram() -> dict[int, int]:
-    """Windows: dedicated VRAM per pid (MiB), from the GPU performance counters,
-    summed over the process's adapters. Raises GpuError if they can't be read.
-    Meant for a single NVIDIA card: with several, a process's VRAM on each is added up."""
+def wddm_process_counters() -> tuple[dict[int, int], dict[int, int]]:
+    """Windows: per pid, (dedicated VRAM MiB, shared GPU memory MiB), from the GPU performance
+    counters, summed over the process's adapters. Raises GpuError if they can't be read. Meant
+    for a single NVIDIA card: with several, a process's figure on each is added up.
+
+    The two counters answer different questions, and only one of them is the card. Dedicated is
+    what actually sits on the 3090. Shared is system RAM set aside for the GPU when the card runs
+    out - the "shared GPU memory" column in Task Manager - and a browser, a video decode or Orca
+    grows it without the card being short of anything. vhotseat acts on dedicated and records
+    shared as evidence: read the two as one number and a dozen new browser tabs would be reason
+    to unload a 20 GB model.
+    """
     pdh = ctypes.WinDLL("pdh")
-    query, counter = ctypes.c_void_p(), ctypes.c_void_p()
+    query = ctypes.c_void_p()
     if pdh.PdhOpenQueryW(None, None, ctypes.byref(query)) != 0:
         raise GpuError("PDH: can't open a query")
     try:
-        rc = pdh.PdhAddEnglishCounterW(query, r"\GPU Process Memory(*)\Dedicated Usage", None,
-                                       ctypes.byref(counter))
-        if rc != 0:
-            raise GpuError(f"PDH: no GPU Process Memory counters (0x{rc & 0xFFFFFFFF:08X})")
+        counters = {}
+        for key, path in (("dedicated", r"\GPU Process Memory(*)\Dedicated Usage"),
+                          ("shared", r"\GPU Process Memory(*)\Shared Usage")):
+            counter = ctypes.c_void_p()
+            if (rc := pdh.PdhAddEnglishCounterW(query, path, None, ctypes.byref(counter))) != 0:
+                raise GpuError(f"PDH: no GPU Process Memory counters (0x{rc & 0xFFFFFFFF:08X})")
+            counters[key] = counter
         if (rc := pdh.PdhCollectQueryData(query)) != 0:
             raise GpuError(f"PDH: collecting failed (0x{rc & 0xFFFFFFFF:08X})")
-        size, count = ctypes.c_ulong(0), ctypes.c_ulong(0)
-        rc = pdh.PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, ctypes.byref(size), ctypes.byref(count), None)
-        if rc & 0xFFFFFFFF != PDH_MORE_DATA:
-            raise GpuError(f"PDH: reading failed (0x{rc & 0xFFFFFFFF:08X})")
-        buf = ctypes.create_string_buffer(size.value)
-        rc = pdh.PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, ctypes.byref(size), ctypes.byref(count), buf)
-        if rc != 0:
-            raise GpuError(f"PDH: reading failed (0x{rc & 0xFFFFFFFF:08X})")
-        out: dict[int, int] = {}
-        for item in (_PdhItem * count.value).from_buffer(buf):
-            if (m := _INSTANCE.match(item.name or "")) and item.status in (0, 1):  # PDH_CSTATUS_VALID/NEW_DATA
-                out[int(m.group(1))] = out.get(int(m.group(1)), 0) + item.value
-        return {pid: b // 2**20 for pid, b in out.items()}
+        out = {}
+        for key, counter in counters.items():
+            out[key] = _sum_by_pid(pdh, counter)
+        return out["dedicated"], out["shared"]
     finally:
         pdh.PdhCloseQuery(query)
+
+
+def _sum_by_pid(pdh, counter) -> dict[int, int]:
+    """One PDH counter array as pid -> MiB. A process has one instance per adapter it touches
+    (`pid_1234_luid_...`), which is why the values are added rather than taken."""
+    size, count = ctypes.c_ulong(0), ctypes.c_ulong(0)
+    rc = pdh.PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, ctypes.byref(size), ctypes.byref(count), None)
+    if rc & 0xFFFFFFFF != PDH_MORE_DATA:
+        raise GpuError(f"PDH: reading failed (0x{rc & 0xFFFFFFFF:08X})")
+    buf = ctypes.create_string_buffer(size.value)
+    if (rc := pdh.PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, ctypes.byref(size), ctypes.byref(count), buf)) != 0:
+        raise GpuError(f"PDH: reading failed (0x{rc & 0xFFFFFFFF:08X})")
+    out: dict[int, int] = {}
+    for item in (_PdhItem * count.value).from_buffer(buf):
+        if (m := _INSTANCE.match(item.name or "")) and item.status in (0, 1):  # PDH_CSTATUS_VALID/NEW_DATA
+            out[int(m.group(1))] = out.get(int(m.group(1)), 0) + item.value
+    return {pid: b // 2**20 for pid, b in out.items()}
+
+
+def wddm_process_vram() -> dict[int, int]:
+    """Windows: dedicated VRAM per pid (MiB), which is the figure the card is made of and the
+    one vhotseat attributes and acts on."""
+    return wddm_process_counters()[0]
+
+
+def wddm_process_shared() -> dict[int, int]:
+    """Windows: shared GPU memory per pid (MiB) - spill into system RAM, never the card. Recorded
+    as evidence that a card was oversubscribed; never a reason to release anything."""
+    return wddm_process_counters()[1]
 
 
 def read_proc(pid: int) -> tuple[str, str]:
@@ -294,14 +325,22 @@ class WddmVram:
     them, under WDDM) get the one from the GPU performance counters, and the ones it
     lists with no name (all of them, under NVML) get the one from a process snapshot."""
 
-    def __init__(self, reader, per_pid=wddm_process_vram, names=process_names):
+    def __init__(self, reader, per_pid=wddm_process_vram, names=process_names,
+                 shared=wddm_process_shared):
         self.reader = reader
         self.name = reader.name
         self.per_pid = per_pid
         self.names = names
+        self._shared = shared
 
     def health(self) -> dict:
         return self.reader.health()
+
+    def shared(self) -> dict[int, int]:
+        """Per-process shared GPU memory (MiB). Asked for when an episode is written, never while
+        the card is being attributed: this is system-RAM spill, not the card, so it belongs in the
+        record and not in the sums."""
+        return self._shared()
 
     def read(self) -> tuple[int, int, list]:
         total, free, procs = self.reader.read()
@@ -349,6 +388,15 @@ class Backend:
             return self.reader.health() if hasattr(self.reader, "health") else {}
         except Exception as e:  # noqa: BLE001 - only ever shown, never decided on
             return {"error": str(e)}
+
+    def shared(self) -> dict[int, int]:
+        """pid -> shared GPU memory in MiB, {} if this backend has no such figure (Linux NVML has
+        none, and a reader that can't say is normal). Evidence for a pressure episode's row, and
+        never part of what the card is doing: it is system RAM, not VRAM."""
+        try:
+            return self.reader.shared() if hasattr(self.reader, "shared") else {}
+        except Exception:  # noqa: BLE001 - one more number in a row is not worth failing a release
+            return {}
 
 
 def open_backend(kind: str = "auto", index: int = 0) -> Backend:

@@ -93,6 +93,30 @@ def test_wddm_skips_the_counters_when_nothing_is_missing():
     reader = gpu.WddmVram(_Reader([(1, 100, "a")]), per_pid=boom)
     assert reader.read()[2] == [(1, 100, "a")]
 
+
+def test_the_two_gpu_memory_counters_never_become_one_number():
+    """Dedicated is what sits on the card; shared is system RAM set aside when the card runs out,
+    and a browser or a video decode grows it while the card is idle. The attribution and the
+    pressure trigger read dedicated only, and shared is a separate call, so a dozen new tabs can't
+    be the reason a 20 GB model gets unloaded."""
+    reader = gpu.WddmVram(_Reader([(1, None, "a"), (2, 300, "b")]),
+                          per_pid=lambda: {1: 20000, 2: 999},
+                          shared=lambda: {1: 4000, 2: 0})
+    assert reader.read()[2] == [(1, 20000, "a"), (2, 300, "b")]   # attribution: dedicated only
+    assert reader.shared() == {1: 4000, 2: 0}
+
+
+def test_a_backend_with_no_shared_counter_says_so_without_a_fuss():
+    """Linux's NVML reports no such figure, and a counter that can't be read is a missing number
+    in a report, not a reason to fail whatever was being decided."""
+    assert gpu.Backend(_Reader([(1, 100, "a")])).shared() == {}
+
+    class Grumpy(gpu.WddmVram):
+        def shared(self):
+            raise gpu.GpuError("PDH: no GPU Process Memory counters")
+
+    assert gpu.Backend(Grumpy(_Reader([(1, 100, "a")]))).shared() == {}
+
 def test_an_invalid_snapshot_handle_is_a_failed_snapshot(monkeypatch):
     """INVALID_HANDLE_VALUE isn't spelled -1 once ctypes has had it: restype=c_void_p hands
     back 18446744073709551615 on a 64-bit build, so the check against -1 never matched and a
@@ -161,12 +185,15 @@ def test_windows_command_line_of_a_process():
 
 @windows_only
 def test_windows_gpu_counters():
-    """The GPU Process Memory counters read, as a pid -> MiB map (empty with no GPU)."""
+    """The GPU Process Memory counters read, as a pid -> MiB map (empty with no GPU), for both
+    dedicated and shared: only the first is what vhotseat acts on."""
     try:
-        per = gpu.wddm_process_vram()
+        per, shared = gpu.wddm_process_counters()
     except gpu.GpuError as e:
         pytest.skip(f"no GPU counters here: {e}")
     assert all(isinstance(pid, int) and mib >= 0 for pid, mib in per.items())
+    assert all(isinstance(pid, int) and mib >= 0 for pid, mib in shared.items())
+    assert gpu.wddm_process_vram() == per and gpu.wddm_process_shared() == shared
 
 
 # --- the logon task that keeps the dashboard up (both paths, whichever we're on) ---
