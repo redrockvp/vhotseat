@@ -27,6 +27,7 @@ import time
 
 from . import claims
 from . import config as cfgmod
+from . import policy
 from . import util
 from .arbiter import NONE, Arbiter
 from .setup import build
@@ -201,7 +202,8 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
             word = {"ready": "could take the card now", "waiting": "would have to wait",
                     "blocked": "is blocked"}
             for name, w in why.items():
-                print(f"{w['label'] + ':':<12}{word[w['would']]}")
+                print(f"{w['label'] + ':':<12}{word[w['would']]} - priority {w['priority']}, "
+                      f"gives way for {policy.describe(w['yields_to'])}")
                 for note in w["notes"]:
                     print(f"{'':<12}- {note}")
         return EXIT_OK

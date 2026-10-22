@@ -32,7 +32,9 @@ whatever they find, including a card somebody else owns.
 **Modes.** `status` reports the owner, derived live from each workload's API
 and the GPU's per-process memory; there is no state file to drift. The mode is
 a workload's name, `none` (the GPU is free) or `conflict` (two hold memory at
-once; a `switch` either way resolves it).
+once; a `switch` either way resolves it). Its `policy:` line prints each
+workload's priority and what it gives way for, so the two keys are visible next
+to the memory they decide the fate of.
 
 **`switch NAME`** releases every other workload, then loads NAME if it can be
 loaded ahead of a request. A workload that's working makes it fail at once,
@@ -377,9 +379,14 @@ day, about R890 a month - which is the case for unloading a model you aren't usi
 
 **`why [NAME]`** is the handover read backwards. Where `switch` acts, `why` reports:
 for each workload it walks the same preconditions - every other workload that would
-be released, the ones that would have to be waited for, then the admission floors -
-and says which of `could take the card now`, `would have to wait` or `is blocked`
-applies and why. The blocked reasons are the ones that make a handover fail: a
+be released, the ones that would have to be waited for, the ones whose `yields_to:`
+refuses to give way for it, then the admission floors - and says which of
+`could take the card now`, `would have to wait` or `is blocked` applies and why. A
+workload that won't give way is `blocked`, not `waiting`: nothing gets unloaded and
+nothing loads. Each answer carries the workload's own `priority` and `yields_to`, and
+while something claims the card it names any workload the claim won't unload, because
+"the game is short of VRAM" is otherwise a mystery. The blocked reasons are the ones
+that make a handover fail: a
 workload whose API is dead while its VRAM is still on the card (start it so there is
 something to ask, or kill the process), a process holding memory with its service
 stopped, and an admission floor the card can't reach - shown as arithmetic, since
@@ -388,8 +395,8 @@ where "refused" is a mystery. The memory that can't be freed is named: the proce
 vhotseat doesn't manage and how much each holds. `why` releases nothing, loads
 nothing and restarts nothing; it exits 0 even when the answer is `blocked`, because
 it is a report and not a gate. `--json` gives the same per workload
-(`{would, holder, free_mib, resident, notes[]}`); the dashboard shows it as the
-**Next handover** card.
+(`{would, holder, free_mib, resident, priority, yields_to, notes[]}`); the dashboard
+shows it as the **Next handover** card.
 
 **Claims: a game owns the card.** `vhotseat claims` prints what the rules match right
 now, the rules themselves and what each one does when it appears, and - while a claim is

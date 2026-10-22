@@ -8,6 +8,7 @@ loading another: a load nobody chose can be refused, a `switch` you typed is an 
 freeing the card for a claim is never refused by either.
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -282,3 +283,45 @@ def test_status_and_claims_say_what_a_claim_was_not_given(rig, monkeypatch, caps
     assert "kept for its policy: strata" in out
     assert rig.cli("status") == 0
     assert "kept for its policy: strata" in capsys.readouterr().out
+
+
+# --- saying it back -----------------------------------------------------------------
+
+
+def test_status_prints_who_gives_way_for_whom(rig, capsys):
+    """The two keys decide what gets unloaded, so they belong next to the memory they decide
+    the fate of: an owner reading `status` mid-fight shouldn't have to open the config to find
+    out which line to change."""
+    give_way(rig, strata=["comfy"])
+    rig.arb.workloads["comfy"].priority = 30
+    assert rig.cli("status") == 0
+    out = capsys.readouterr().out
+    assert "strata 50 (comfy)" in out and "comfy 30 (anything)" in out
+    assert rig.cli("status", "--json") == 0
+    assert json.loads(capsys.readouterr().out)["policy"]["strata"] == {
+        "priority": 50, "yields_to": ["comfy"]}
+
+
+def test_why_calls_a_workload_that_wont_give_way_a_blocker_not_a_delay(rig, capsys):
+    """`why` is the dry run of the handover, so it has to be as strict as the handover: a
+    workload that refuses is `blocked`, not `would have to wait`, and the note names the key
+    that would stop refusing."""
+    give_way(rig, strata=["claims"])
+    rig.strata.loaded = True
+    assert rig.cli("why", "comfy") == 0
+    out = capsys.readouterr().out
+    assert "is blocked" in out and "yields_to (a claim on the card)" in out
+    assert "Strata holds 14000 MiB and won't give way for ComfyUI" in out
+    assert "would be asked to release it" not in out
+    assert rig.cli("why", "--json") == 0
+    assert json.loads(capsys.readouterr().out)["comfy"]["would"] == "blocked"
+
+
+def test_why_names_a_workload_a_claim_wont_unload(rig, monkeypatch, capsys):
+    """A game is short of VRAM and 14 GB is still sitting in Strata because of a key in the
+    config: `why` is where that gets explained, on the workload the owner is asking about."""
+    claim_rule(rig, monkeypatch)
+    give_way(rig, strata=["comfy"])
+    rig.strata.loaded = True
+    assert rig.cli("why", "comfy") == 0
+    assert "Strata keeps its model for the claim" in capsys.readouterr().out

@@ -143,6 +143,8 @@ class Arbiter:
         ram.update({n: w.memory() for n, w in self.workloads.items()})
         hits = self._claims_in(held)
         status = {"mode": mode, **states, "gpu": gpu, "holders": held, "claims": hits,
+                  "policy": {n: {"priority": w.priority, "yields_to": list(w.yields_to)}
+                             for n, w in self.workloads.items()},
                   "ram": ram, "last_event": self.events.last()}
         if hits:
             # And what has been done about it: what this claim has already been given, and what
@@ -158,6 +160,10 @@ class Arbiter:
         width = max(len(n) for n in [*self.workloads, "mode"]) + 2
         lines = [f"{'mode:':<{width}}{s['mode']}"]
         lines += [f"{n + ':':<{width}}{w.describe(s[n])}" for n, w in self.workloads.items()]
+        # Who will make room for whom, and in what order: the two keys are the owner's, and
+        # a refusal that doesn't name them is unfixable from the outside.
+        lines.append(f"{'policy:':<{width}}" + "; ".join(
+            f"{n} {w.priority} ({policy.describe(w.yields_to)})" for n, w in self.workloads.items()))
         shares = ", ".join(f"{n} {g[f'{n}_mib']}" for n in self.workloads)
         lines.append(f"{'gpu:':<{width}}" + (g["error"] if "error" in g else
                      f"{g['free_mib']} of {g['total_mib']} MiB free ({shares}, other {g['other_mib']})"))
@@ -376,7 +382,13 @@ class Arbiter:
         """For each workload: could it take the card right now, and what stands in the
         way. It reads the same state `switch` would act on and touches nothing - no
         release, no load, no restart. What it's for is the question a dashboard can't
-        otherwise answer: not who holds the card, but why the next job can't have it."""
+        otherwise answer: not who holds the card, but why the next job can't have it.
+
+        The policy is part of that state: a workload that won't give way for the one being
+        asked about is a blocker, and one the claim won't unload is named, because "the game
+        is short of VRAM" is otherwise a mystery. Each answer carries its own priority and
+        yields_to, so what to change is on the same line as what is wrong.
+        """
         s = self.probe()
         gpu, ram = s["gpu"], s["ram"]
         hits = self.claim_hits()
@@ -391,6 +403,12 @@ class Arbiter:
                 notes.append("two workloads are on the card at once: asking for it will release the other")
             for y in self._others(name):
                 held = y.vram_mib()
+                if hits and held > y.idle_vram_mib and not policy.yields(y.yields_to, policy.CLAIMS):
+                    # The claim will leave this one alone, so the game gets less than the
+                    # card could give it. Worth saying on the workload being asked about:
+                    # "the game is short of VRAM" is otherwise a mystery.
+                    notes.append(f"{y.label} keeps its model for the claim: its yields_to "
+                                 f"({policy.describe(y.yields_to)}) doesn't cover a claim on the card")
                 if not y.service_active():
                     if held > y.idle_vram_mib:
                         would, why = "blocked", f"a {y.label} process holds {held} MiB but its service is stopped"
@@ -409,8 +427,13 @@ class Arbiter:
                         would = "waiting"
                     notes.append(f"{y.label} is busy: {busy}; a handover waits for it to finish")
                 elif held > y.idle_vram_mib:
-                    freed += held
-                    notes.append(f"{y.label} holds {held} MiB and would be asked to release it")
+                    if not policy.yields(y.yields_to, name):
+                        would = "blocked"
+                        notes.append(f"{y.label} holds {held} MiB and won't give way for {x.label}: "
+                                     f"its yields_to ({policy.describe(y.yields_to)}) doesn't cover it")
+                    else:
+                        freed += held
+                        notes.append(f"{y.label} holds {held} MiB and would be asked to release it")
             adm, model = x.admission_for()
             who = f"{x.label} ({model})" if model else x.label
             if hits:
@@ -453,7 +476,8 @@ class Arbiter:
                     note += f", more than the card's {card} MiB: only part of it can be resident"
                 notes.append(note)
             out[name] = {"target": name, "label": x.label, "would": would, "holder": s["mode"],
-                         "free_mib": gpu.get("free_mib"), "resident": resident, "notes": notes}
+                         "free_mib": gpu.get("free_mib"), "resident": resident,
+                         "priority": x.priority, "yields_to": list(x.yields_to), "notes": notes}
         return out
 
     def gate(self, name: str) -> bool:
