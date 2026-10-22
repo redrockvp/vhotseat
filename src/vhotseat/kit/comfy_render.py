@@ -44,6 +44,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -76,8 +77,51 @@ HOLD_ENV = "VHOTSEAT_HOLD"
 CANCELLED_BY = "cancelled by the user (ComfyUI or another client)"
 
 
+# Programs that hold back or cut off the live progress lines when stdout is piped to them.
+BUFFERING_READERS = {"tail", "head", "grep", "egrep", "fgrep", "rg", "sort", "uniq", "less", "more"}
+SHELLS = {"sh", "bash", "zsh", "dash", "fish"}
+
+
 class UsageError(Exception):
     pass
+
+
+def stdout_reader() -> str | None:
+    """The name of the program reading our stdout, if it's a pipe and that's knowable.
+    Best effort, Linux only. Right after the shell forks a pipeline, the reader may
+    not have exec'd yet and still be named after the shell, so look again briefly."""
+    for _ in range(10):
+        reader = _pipe_reader()
+        if reader not in SHELLS:
+            return reader
+        time.sleep(0.05)
+    return reader
+
+
+def _pipe_reader() -> str | None:
+    """The other process with our stdout pipe open for reading, found in /proc
+    (which only shows the caller's own processes, as a pipeline's are)."""
+    try:
+        st = os.fstat(sys.stdout.fileno())
+    except (OSError, ValueError):
+        return None
+    if not stat.S_ISFIFO(st.st_mode) or not os.path.isdir("/proc"):
+        return None
+    pipe = f"pipe:[{st.st_ino}]"
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        if int(pid) == os.getpid():
+            continue
+        try:
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                if os.readlink(f"/proc/{pid}/fd/{fd}") != pipe:
+                    continue
+                with open(f"/proc/{pid}/fdinfo/{fd}") as f:
+                    flags = next(int(line.split()[1], 8) for line in f if line.startswith("flags:"))
+                if flags & os.O_ACCMODE == os.O_RDONLY:
+                    return Path(f"/proc/{pid}/comm").read_text().strip()
+        except (OSError, StopIteration, ValueError):
+            continue
+    return None
 
 
 # --- input --------------------------------------------------------------------
@@ -571,6 +615,12 @@ def main(argv: list[str] | None = None) -> int:
             args.jobs, args.hold = args.hold, "comfy"
         else:
             p.error("the following arguments are required: jobs")
+    reader = stdout_reader()
+    if reader in BUFFERING_READERS:
+        print(f"comfy-render: don't pipe its output (to {reader}): its progress lines are how the "
+              "user follows a long render live. Run it as `comfy-render JOBS.json`, with no pipe.",
+              file=sys.stderr)
+        return EXIT_USAGE
     if args.hold and os.environ.get(HOLD_ENV) != args.hold:
         return rerun_under_hold(args.hold, args.hold_wait, sys.argv[1:] if argv is None else argv)
     global COMFY_URL, COMFY_DIR

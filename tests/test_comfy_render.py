@@ -3,9 +3,11 @@
 import importlib
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
-from pathlib import PurePath
+from pathlib import Path, PurePath
 
 import pytest
 from conftest import cli_bin
@@ -263,3 +265,13 @@ def test_hold_without_vhotseat_is_a_usage_error(cr, tmp_path, capsys, monkeypatc
     monkeypatch.setattr("shutil.which", lambda *a, **k: None)
     assert cr.main([write(tmp_path, save()), "--hold"]) == 2
     assert "--hold needs the vhotseat command" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+@pytest.mark.parametrize("reader, refused", [("tail", True), ("head -n 50", True), ("cat", False)])
+def test_piping_to_tail_is_refused(tmp_path, reader, refused):
+    root = Path(__file__).resolve().parent.parent
+    jobs = write(tmp_path, [])  # a bad input file: exit 2 either way, with a different message
+    out = subprocess.run(f"'{sys.executable}' '{root / 'comfy-render'}' '{jobs}' | {reader}",
+                         shell=True, capture_output=True, text=True, timeout=30)
+    assert ("don't pipe its output" in out.stderr) == refused
