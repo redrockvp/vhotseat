@@ -353,7 +353,11 @@ class FakeComfy(_Server):
 
 
 class FakeGpu:
-    """A GPU backend whose processes are the fake servers' allocations."""
+    """A GPU backend whose processes are the fake servers' allocations.
+
+    `other` is memory nothing on this box manages, and `extra` gives it a name: an app vhotseat has
+    no way to ask for its memory back - a renderer, a CUDA script - which is what the pressure
+    trigger reads. `total` moves for a test that wants a card the size of a real one."""
 
     name = "fake"
 
@@ -361,16 +365,33 @@ class FakeGpu:
         self.strata, self.comfy = strata, comfy
         self.other = 0
         self.error = None
+        self.total = 16303
+        self.extra: list[dict] = []        # [{pid, name, mib}]: processes nothing manages
+        self.shared_of: dict[int, int] = {}  # pid -> shared GPU memory: system RAM, not the card
+
+    def add_process(self, name: str, mib: int, pid: int | None = None) -> int:
+        """A process nothing manages holding `mib` on the card. Its pid comes back, for the tests
+        that say which ones a claim covers or what the counters report about it."""
+        pid = pid or 4000 + len(self.extra)
+        self.extra.append({"pid": pid, "name": name, "mib": mib})
+        return pid
+
+    def shared(self) -> dict[int, int]:
+        """The other counter, the one that isn't the card: recorded as evidence, never acted on."""
+        return dict(self.shared_of)
 
     def snapshot(self, selectors: dict) -> dict:
         if self.error:
             return {"total_mib": None, "free_mib": None, **{f"{n}_mib": 0 for n in selectors}, "other_mib": 0,
                     "error": self.error}
+        extra = sum(e["mib"] for e in self.extra)
         if getattr(self, "strata_as_other", False):   # a workload the backend can't attribute
-            used = {"strata_mib": 0, "comfy_mib": self.comfy.vram, "other_mib": self.other + self.strata.vram}
+            used = {"strata_mib": 0, "comfy_mib": self.comfy.vram,
+                    "other_mib": self.other + self.strata.vram + extra}
         else:
-            used = {"strata_mib": self.strata.vram, "comfy_mib": self.comfy.vram, "other_mib": self.other}
-        return {"total_mib": 16303, "free_mib": 16303 - sum(used.values()), **used}
+            used = {"strata_mib": self.strata.vram, "comfy_mib": self.comfy.vram,
+                    "other_mib": self.other + extra}
+        return {"total_mib": self.total, "free_mib": self.total - sum(used.values()), **used}
 
     def read_all(self, selectors: dict, limit: int = 8) -> tuple[dict, list]:
         """The same sums, as named processes: what a workload holds, and what nothing
@@ -387,8 +408,10 @@ class FakeGpu:
             rows.append({"pid": 2222, "mib": self.comfy.vram, "name": "python.exe", "workload": "comfy"})
         if self.other:
             rows.append({"pid": 3333, "mib": self.other, "name": "Xorg", "workload": None})
+        rows.extend({"pid": e["pid"], "mib": e["mib"], "name": e["name"], "workload": None}
+                    for e in self.extra)
         rows.sort(key=lambda r: -r["mib"])
-        return snap, rows[:limit]
+        return snap, rows[:limit] if limit else rows
 
 
 class _FakeService:

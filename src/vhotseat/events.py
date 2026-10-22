@@ -4,11 +4,20 @@ import datetime
 import json
 from pathlib import Path
 
-from . import util
+from . import pressure, util
 
 # The rows that say a claim is open, and what has been done about it.
 CLAIM_ROWS = ("claim", "claim-end", "claim-release", "claim-release-targets",
               "claim-release-waiting")
+
+
+def row_time(e: dict) -> datetime.datetime | None:
+    """A row's own time, or None if it can't be read: a row whose timestamp isn't usable isn't
+    news about now, and isn't evidence of when something last happened either."""
+    try:
+        return datetime.datetime.fromisoformat(e["time"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 class EventLog:
@@ -114,14 +123,61 @@ class EventLog:
         for e in reversed(self.tail(limit)):
             if e.get("event") not in kinds:
                 continue
-            try:
-                when = datetime.datetime.fromisoformat(e["time"])
-                fresh = when >= cutoff
-            except (KeyError, TypeError, ValueError):
-                continue            # a row whose time can't be read isn't news about now
-            if fresh:
+            when = row_time(e)
+            if when is not None and when >= cutoff:
                 out.append(e)
         return out
+
+    def episode_open(self, limit: int = 500) -> dict | None:
+        """The pressure episode the log shows as open, or None: {episode, targets, released,
+        waiting, freed_mib}, rebuilt from its rows.
+
+        Same reason as `claims_open`, and the same shape of answer: the episode is one process's
+        growth decided once, the workloads it was owed were chosen then, and what has been released
+        and what is still holding come from the rows rather than from the memory of whichever
+        process wrote them. So `watch` and the dashboard - which both run this check and both act -
+        see one episode, and the one that arrives second finds it already in progress instead of
+        starting a second one and unloading something again.
+
+        The trade is the same one: an episode older than the retained log (`keep` lines) is
+        forgotten, and the next poll treats the card being short as news.
+        """
+        out: dict | None = None
+        for e in self.tail(limit):
+            kind = e.get("event")
+            if kind not in pressure.EPISODE_ROWS:
+                continue
+            if kind == "pressure":
+                out = {"episode": e, "targets": list(e.get("targets") or []), "released": [],
+                       "waiting": [], "freed_mib": 0}
+            elif kind == "pressure-end" and out:
+                out = None
+            elif kind == "pressure-release" and out:
+                got = set(e.get("workloads") or [])
+                out["released"] = sorted(set(out["released"]) | got)
+                out["freed_mib"] += e.get("freed_mib") or 0
+                out["waiting"] = [w for w in out["waiting"] if w["workload"] not in got]
+            elif kind == "pressure-release-waiting" and out:
+                for w in out["waiting"]:
+                    if w["workload"] == e.get("workload"):
+                        w["why"], w["stuck"] = e.get("why") or w["why"], bool(e.get("stuck")) or w["stuck"]
+                        w["attempts"] = max(w.get("attempts") or 0, e.get("attempts") or 1)
+                        w["held_mib"] = e.get("held_mib") or w.get("held_mib") or 0
+                        break
+                else:
+                    out["waiting"].append({"workload": e.get("workload") or "", "why": e.get("why") or "",
+                                           "attempts": e.get("attempts") or 1,
+                                           "stuck": bool(e.get("stuck")), "held_mib": e.get("held_mib") or 0})
+        return out
+
+    def last_episode(self, limit: int = 500) -> dict | None:
+        """The newest pressure row of any kind, open or closed. `cooldown_s` is measured from it:
+        an episode that ended a minute ago is not a clean slate, because the memory that was
+        released has to be reloaded before the card is in the state the next release would fix."""
+        for e in reversed(self.tail(limit)):
+            if e.get("event") in pressure.EPISODE_ROWS and row_time(e) is not None:
+                return e
+        return None
 
     def last(self) -> dict | None:
         if not self.path.exists():

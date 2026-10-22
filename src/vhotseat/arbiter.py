@@ -13,15 +13,16 @@ or the request is refused. Ownership is derived from the live workloads each
 time, never stored, so it can't drift.
 """
 
+import datetime
 import os
 import signal
 import subprocess
 import time
 
-from . import claims, host, policy, util
+from . import claims, host, policy, pressure, util
 from .drivers.base import Workload
 from .errors import Busy, PolicyRefused, ReleaseFailed, SwitchError
-from .events import EventLog
+from .events import EventLog, row_time
 from .lock import GpuLock, Held
 
 NONE = "none"
@@ -34,7 +35,8 @@ class Arbiter:
     def __init__(self, workloads: list[Workload], gpu, lock: GpuLock, events: EventLog, *,
                  gate_release_timeout_s: float = 20, release_timeout_s: float = 60,
                  machine_ram=host.machine_ram, telemetry=None, power: dict | None = None,
-                 claim_rules: list | None = None, claim_ignore=(), claim_poll_s: float = 2.0):
+                 claim_rules: list | None = None, claim_ignore=(), claim_poll_s: float = 2.0,
+                 pressure_cfg: dict | None = None):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
         self.lock = lock
@@ -57,16 +59,23 @@ class Arbiter:
         # `claims_poll_s`). The refusal doesn't depend on it - every gate and guard checks for
         # itself - only the release and the record do.
         self.claim_poll_s = claim_poll_s
+        # The pressure trigger: an app vhotseat doesn't manage taking the card. `pressure_cfg` is
+        # the config block with the measured defaults in it; `pressure_ignores()` reads its
+        # `ignore:` - the processes the owner has said are never the reason (a VM, a benchmark, a
+        # miner), whose memory is out of the measurement rather than just out of the report.
+        self.pressure_cfg = pressure.cfg(pressure_cfg)
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
 
-    def snapshot_all(self) -> tuple[dict, list]:
+    def snapshot_all(self, limit: int = 8) -> tuple[dict, list]:
         """One read of the card: the attribution sums and the named processes behind them.
-        A backend that can't name processes gives the sums and an empty list."""
+        A backend that can't name processes gives the sums and an empty list. `limit` is what a
+        report wants; 0 is every process, which is what the pressure test needs - the app that grew
+        is not necessarily among the eight biggest holders."""
         sel = {n: w.vram_selector for n, w in self.workloads.items()}
         fn = getattr(self.gpu, "read_all", None)
-        return fn(sel) if fn else (self.gpu.snapshot(sel), [])
+        return fn(sel, limit) if fn else (self.gpu.snapshot(sel), [])
 
     def holders(self, limit: int = 8) -> list[dict]:
         """Who holds the card's memory, biggest first, by name: the workloads vhotseat
@@ -632,40 +641,293 @@ class Arbiter:
             if not any(want.values()):
                 return {"declined": None, "by_actor": False, "would": [], "released": [],
                         "waiting": [], "freed_mib": 0}
-            released, waiting = [], []
-            for n, y in cands.items():
-                if not want[n]:
-                    continue
-                if y.service_active() and (busy := y.busy()):
-                    waiting.append({"workload": n, "why": busy})
-                    continue
-                if not y.service_active():
-                    waiting.append({"workload": n,
-                                    "why": f"a {y.label} process holds {want[n]} MiB but "
-                                          f"{y.service.unit or 'its service'} is stopped"})
-                    continue
-                try:
-                    # wait=0: anything still working was skipped above, and the release path's
-                    # own timeout keeps this inside one poll rather than a whole handover's.
-                    y.release(0, self.gate_release_timeout_s)
-                except (Busy, ReleaseFailed, SwitchError) as e:
-                    waiting.append({"workload": n, "why": str(e) or type(e).__name__})
-                    continue
-                left = max(0, (self.snapshot().get(f"{n}_mib") or 0) - y.idle_vram_mib)
-                if left:
-                    # It answered "unloaded" and the card still shows its weights - an owner's
-                    # `confirm:` that is more generous than `idle_vram_mib`, or a node that
-                    # doesn't give the memory back. Not done, and not recorded as released:
-                    # `claim-release` says "unloaded" and must only name what the card agrees
-                    # is clear. `stuck` is what the watcher counts its bounded retries on.
-                    waiting.append({"workload": n, "stuck": True, "held_mib": left,
-                                    "why": f"says it unloaded and still holds {left} MiB"})
-                    continue
-                released.append({"workload": n, "freed_mib": want[n]})
+            released, waiting = self._release_cands(cands, want)
             if released:
                 self.lock.bump()          # seats cache who owns the card: drop that answer
             return {"declined": None, "by_actor": False, "released": released, "waiting": waiting,
                     "freed_mib": sum(r["freed_mib"] for r in released)}
+
+    def _release_cands(self, cands: dict, want: dict) -> tuple[list, list]:
+        """Ask each workload that owes memory to let go of it, through the normal release path, and
+        say which didn't. Called with the GPU lock held; `want` is what the card said each one held
+        above its idle weight, read inside that lock.
+
+        A working workload is skipped rather than interrupted - work in flight is never broken into,
+        whatever asked for the card - and a workload whose service is down is reported: there is
+        nothing to ask. One that answers "unloaded" while the card still shows its weights is
+        reported `stuck`: the release path's confirm can be more generous than `idle_vram_mib`, or a
+        node may not give the memory back, and it is the card that decides, not the server's reply.
+        Whoever is watching retries both kinds, bounded for the stuck one, because a workload that
+        never does unload would otherwise be asked for as long as the reason lasted.
+        """
+        released, waiting = [], []
+        for n, y in cands.items():
+            if not want[n]:
+                continue
+            if y.service_active() and (busy := y.busy()):
+                waiting.append({"workload": n, "why": busy})
+                continue
+            if not y.service_active():
+                waiting.append({"workload": n,
+                                "why": f"a {y.label} process holds {want[n]} MiB but "
+                                      f"{y.service.unit or 'its service'} is stopped"})
+                continue
+            try:
+                # wait=0: anything still working was skipped above, and the release path's
+                # own timeout keeps this inside one poll rather than a whole handover's.
+                y.release(0, self.gate_release_timeout_s)
+            except (Busy, ReleaseFailed, SwitchError) as e:
+                waiting.append({"workload": n, "why": str(e) or type(e).__name__})
+                continue
+            left = max(0, (self.snapshot().get(f"{n}_mib") or 0) - y.idle_vram_mib)
+            if left:
+                # It answered "unloaded" and the card still shows its weights. Not done, and not
+                # recorded as released: the row says "unloaded" and must only name what the card
+                # agrees is clear. `stuck` is what the watcher counts its bounded retries on.
+                waiting.append({"workload": n, "stuck": True, "held_mib": left,
+                                "why": f"says it unloaded and still holds {left} MiB"})
+                continue
+            released.append({"workload": n, "freed_mib": want[n]})
+        return released, waiting
+
+    # --- pressure: an app vhotseat doesn't manage takes the card ---------------------
+
+    PRESSURE_LOCK = "pressure release"     # the lock's label, and how a sister actor is spotted
+
+    def pressure_readings(self, claimed=frozenset()) -> dict:
+        """What the card, the samples and the config say about pressure, in one place so the trigger
+        and the reports can't drift apart. It reads: it never takes the lock, releases nothing and
+        loads nothing, which is what lets `vhotseat why` answer "was that release mine?".
+
+        Every answer carries the numbers, and when this is not pressure, `why` names which of the
+        three conditions is missing - a card out of working room, out of it for long enough, and out
+        of it because of memory vhotseat can't manage rather than memory it can ask back.
+
+        `claimed` are the pids an open claim already covers: a game is phase 1's, already given the
+        card by its rule, and counting its memory again would write a second episode over the same
+        gigabytes.
+        """
+        cfg = self.pressure_cfg
+        out = {"enabled": cfg["enabled"], "min_free_mib": cfg["min_free_mib"], "grow_mib": cfg["grow_mib"],
+               "sustain_s": cfg["sustain_s"], "headroom_mib": cfg["headroom_mib"],
+               "end_margin_mib": cfg["end_margin_mib"], "cooldown_s": cfg["cooldown_s"],
+               "ignore": list(cfg["ignore"])}
+        if not cfg["enabled"]:
+            return {**out, "why": "pressure.enabled is false: nothing is released for an app "
+                                  "vhotseat doesn't manage"}
+        snap, rows = self.snapshot_all(limit=0)
+        if snap.get("free_mib") is None:
+            return {**out, "why": f"the card couldn't be read ({snap.get('error')})"}
+        out.update({"free_mib": snap["free_mib"], "total_mib": snap.get("total_mib"),
+                    "other_mib": snap.get("other_mib") or 0})
+        claimed = set(claimed)
+        ignore = self.pressure_ignores()
+        growers = pressure.growers(rows, ignore, claimed)
+        if growers:
+            grower = dict(growers[0])
+            shared = getattr(self.gpu, "shared", lambda: {})()
+            grower["shared_mib"] = (shared or {}).get(grower["pid"]) or 0
+            out["grower"] = grower
+        floor = self.telemetry.floor_mib() if self.telemetry else None
+        grew = pressure.grow_mib(rows, floor, ignore, claimed)
+        out.update({"floor_mib": floor, "grew_mib": grew})
+        if floor is None:
+            # No samples is not a card with nothing else on it. Without a recorded baseline there is
+            # no such thing as growth, and guessing one would unload models for a card that has been
+            # like this all along - so the sampler (`watch`, `web`, `record`) is part of the trigger.
+            return {**out, "why": "no samples to measure the growth against: run `vhotseat watch` "
+                                  "or `vhotseat web`"}
+        if grew < cfg["grow_mib"]:
+            return {**out, "why": f"the memory vhotseat doesn't manage is only {grew} MiB over its "
+                                  f"usual {floor} MiB floor, needs {cfg['grow_mib']} MiB"}
+        low = (self.telemetry.below_free(cfg["min_free_mib"], max(2 * cfg["sustain_s"], 120))
+               if self.telemetry else None)
+        if not low:
+            return {**out, "why": f"the card hasn't been under {cfg['min_free_mib']} MiB free for "
+                                  f"long enough to tell"}
+        low_for_s = max(0.0, time.time() - low[0])
+        out.update({"low_for_s": int(low_for_s), "samples": low[1]})
+        if low_for_s + 1 < cfg["sustain_s"]:
+            return {**out, "why": f"the card has been under {cfg['min_free_mib']} MiB free for "
+                                  f"{int(low_for_s)} s, needs {cfg['sustain_s']} s"}
+        if snap["free_mib"] >= cfg["min_free_mib"]:
+            # The samples say it was short often enough; this read says it isn't now. Freeing a model
+            # for room that has already come back is the whole cost with none of the benefit.
+            return {**out, "why": f"the card is back above {cfg['min_free_mib']} MiB free"}
+        need = pressure.need_mib(snap["free_mib"], cfg["min_free_mib"], cfg["headroom_mib"])
+        candidates = self.pressure_candidates(snap)
+        targets = pressure.targets(candidates, need)
+        out.update({"need_mib": need, "candidates": [n for n, _ in candidates], "targets": targets})
+        if not targets:
+            return {**out, "why": "nothing of ours on the card will give way for pressure"}
+        return out
+
+    def pressure_ignores(self) -> frozenset:
+        """The `pressure.ignore:` set, built from the config block as it is now rather than once at
+        startup: the block is a plain dict, and a policy that can't be changed while the process
+        runs is a policy a later dashboard can't edit."""
+        return pressure.ignores(self.pressure_cfg["ignore"])
+
+    def pressure_candidates(self, snap: dict | None = None) -> list[tuple[str, int]]:
+        """The workloads that could pay for the room, lowest priority first, each with the MiB it
+        would give up: only ones whose `yields_to:` covers `pressure`, and only ones holding more
+        than their idle weight, because the app that grew is short of VRAM and not of the RAM a model
+        with no card weights costs.
+
+        A busy one stays on the list. It is left alone when the release runs and asked again when it
+        goes idle - work in flight is never interrupted, whatever asked for the card - and dropping it
+        here would mean an episode quietly freeing less than it decided to.
+        """
+        snap = snap if snap is not None else self.snapshot_all()[0]
+        out = []
+        for n, y in sorted(self.workloads.items(), key=lambda kv: (kv[1].priority, kv[0])):
+            held = (snap.get(f"{n}_mib") or 0) - y.idle_vram_mib
+            if held > 0 and policy.yields(y.yields_to, policy.PRESSURE):
+                out.append((n, held))
+        return out
+
+    def pressure_can_start(self) -> str | None:
+        """Why a new episode can't start now, or None that it can. Both halves are read from the
+        event log rather than remembered, because `watch` and the dashboard both run this check and
+        neither may have a private idea of what the other has begun: one episode at a time, and no
+        second one inside `cooldown_s` of the last row of the last one. An episode that stays open -
+        because the app keeps its memory and the room never quite comes back - is not a free pass for
+        a second round of releases either.
+        """
+        if self.events.episode_open() is not None:
+            return "a pressure episode is already open"
+        last = self.events.last_episode()
+        when = row_time(last) if last else None
+        if when is not None:
+            age = (datetime.datetime.now().astimezone() - when).total_seconds()
+            if age < self.pressure_cfg["cooldown_s"]:
+                return (f"the last pressure episode was {int(age)} s ago, "
+                        f"cooldown is {self.pressure_cfg['cooldown_s']} s")
+        return None
+
+    def pressure_start(self, claimed=frozenset(), source: str = "watch") -> dict:
+        """Open a pressure episode if the readings say pressure, and release what it is owed.
+
+        The readings are taken twice: outside the lock, so a box that isn't short pays one card read
+        per poll and no lock at all, and again inside it. The second reading is what makes two
+        pollers safe - whichever takes the lock first writes the episode and frees the card, and the
+        other finds nothing left holding, writes nothing, and declines as `by_actor`.
+
+        The episode row is written before anything is released, and it carries the workloads that
+        were decided would pay for the room. Later polls act on that record and not on a fresh look
+        at the card: a model loaded during an episode is the owner's, and a trigger that re-picked
+        its targets every poll would take it back within seconds. Phase 1 learned that once.
+        """
+        blocked = self.pressure_can_start()
+        if blocked:
+            return {"declined": blocked, "by_actor": False, "episode": None}
+        readings = self.pressure_readings(claimed)
+        if readings.get("why"):
+            return {"declined": readings["why"], "by_actor": False, "episode": None}
+        grower = readings.get("grower") or {}
+        name = grower.get("name") or "an unmanaged process"
+        got = self.lock.try_take(f"{self.PRESSURE_LOCK} {name}")
+        if not isinstance(got, Held):
+            return {"declined": f"{got or 'a switch'} in progress",
+                    "by_actor": bool(got and got.startswith(self.PRESSURE_LOCK)), "episode": None}
+        with got:
+            readings = self.pressure_readings(claimed)      # the card as whoever held the lock left it
+            if readings.get("why"):
+                return {"declined": readings["why"], "by_actor": False, "episode": None}
+            grower = readings.get("grower") or {}
+            self.events.record("pressure", source=source, name=grower.get("name") or name,
+                               pid=grower.get("pid"), other_mib=readings["other_mib"],
+                               floor_mib=readings["floor_mib"], grew_mib=readings["grew_mib"],
+                               free_mib=readings["free_mib"], total_mib=readings["total_mib"],
+                               min_free_mib=readings["min_free_mib"], low_for_s=readings["low_for_s"],
+                               samples=readings.get("samples"), need_mib=readings["need_mib"],
+                               shared_mib=grower.get("shared_mib") or 0,
+                               targets=readings["targets"], candidates=readings["candidates"])
+            ep = self.events.episode_open() or {"episode": {}, "targets": readings["targets"]}
+            out = self._pressure_release(ep, set(readings["targets"]), source)
+            out["episode"] = self.events.episode_open()
+            return out
+
+    def pressure_release(self, ep: dict, source: str = "watch") -> dict:
+        """Keep an open episode's release going: the workloads it was owed when it started, less the
+        ones the card agrees came free, and nobody else. A target that was working is asked again on
+        every poll while the episode lasts; one that says it unloaded and keeps its VRAM is asked a
+        bounded number of times and then left, because that is an unload that doesn't work rather
+        than a busy moment.
+
+        Nothing is added to the list whatever the card now shows. If it goes shorter for a new
+        reason, that is a new episode, and the cooldown decides when it may start.
+        """
+        owed = set(ep.get("targets") or []) - set(ep.get("released") or [])
+        owed &= set(self.workloads)
+        if not owed:
+            return {"declined": None, "by_actor": False, "would": [], "released": [],
+                    "waiting": [], "freed_mib": 0}
+        snap = self.snapshot()
+        if not any((snap.get(f"{n}_mib") or 0) > self.workloads[n].idle_vram_mib for n in owed):
+            # Nothing it is still owed is on the card, so no lock and no card read is taken for as
+            # long as the episode lasts afterwards.
+            return {"declined": None, "by_actor": False, "would": [], "released": [],
+                    "waiting": [], "freed_mib": 0}
+        name = (ep.get("episode") or {}).get("name") or "an unmanaged process"
+        got = self.lock.try_take(f"{self.PRESSURE_LOCK} {name}")
+        if not isinstance(got, Held):
+            return {"declined": f"{got or 'a switch'} in progress",
+                    "by_actor": bool(got and got.startswith(self.PRESSURE_LOCK)),
+                    "would": sorted(owed), "released": [], "waiting": [], "freed_mib": 0}
+        with got:
+            return self._pressure_release(ep, owed, source)
+
+    def _pressure_release(self, ep: dict, targets: set, source: str) -> dict:
+        """The release half, with the GPU lock held: re-read the card inside it, ask the workloads
+        the episode was owed, and write the rows. The re-read is what makes the second arriving
+        poller write nothing at all - inside the lock the card is already what the first one left it,
+        so there is one `pressure-release` row and one unload per workload.
+        """
+        snap = self.snapshot()
+        cands = {n: y for n, y in self.workloads.items()
+                 if n in targets and policy.yields(y.yields_to, policy.PRESSURE)}
+        want = {n: max(0, (snap.get(f"{n}_mib") or 0) - y.idle_vram_mib) for n, y in cands.items()}
+        if not any(want.values()):
+            return {"declined": None, "by_actor": False, "would": sorted(cands), "released": [],
+                    "waiting": [], "freed_mib": 0}
+        released, waiting = self._release_cands(cands, want)
+        name = (ep.get("episode") or {}).get("name")
+        if released:
+            self.events.record("pressure-release", source=source, name=name,
+                               workloads=[r["workload"] for r in released],
+                               freed=[{"workload": r["workload"], "mib": r["freed_mib"]}
+                                      for r in released],
+                               freed_mib=sum(r["freed_mib"] for r in released))
+            self.lock.bump()              # seats cache who owns the card: drop that answer
+        if waiting:
+            known = {w["workload"]: w for w in (self.events.episode_open() or {}).get("waiting", [])}
+            for w in waiting:
+                # How many tries the log has already seen for this one, which is what the watcher
+                # counts its bounded retries on. Read back rather than remembered, so both pollers
+                # are counting the same three.
+                w["attempts"] = (known.get(w["workload"], {}).get("attempts") or 0) + 1
+                self.events.record("pressure-release-waiting", source=source, name=name, **w)
+        return {"declined": None, "by_actor": False, "would": sorted(cands), "released": released,
+                "waiting": waiting, "freed_mib": sum(r["freed_mib"] for r in released)}
+
+    def pressure_over(self, ep: dict) -> str | None:
+        """Why an open episode is over, or None that it isn't: the room is back above the wider
+        margin, or the process that grew has gone.
+
+        The wider margin is the point. Ending an episode at the same line that started it would
+        restart it the moment the grower allocated again - unload and reload ~20 GB over and over -
+        and on a card with under a gigabyte of slack there is no room in between to be quiet in.
+        """
+        cfg = self.pressure_cfg
+        free = self.snapshot().get("free_mib")
+        if free is not None and free >= cfg["min_free_mib"] + cfg["end_margin_mib"]:
+            return f"the card is back to {free} MiB free"
+        name = (ep.get("episode") or {}).get("name")
+        if name and not any((p.get("name") or "").lower() == name.lower()
+                            for p in host.processes().values()):
+            return f"{name} is gone"
+        return None
 
     def _busy_other(self, name: str) -> str | None:
         """Why another workload mustn't be released now, if one says it's working."""

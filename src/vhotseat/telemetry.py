@@ -243,6 +243,29 @@ class Telemetry:
         mid = len(values) // 2
         return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) // 2
 
+    def below_free(self, mib: int, within_s: float) -> tuple[float, int] | None:
+        """How long the card has been continuously under `mib` MiB free, from the samples:
+        (start of the run, how many samples in it). None when the newest sample isn't under it,
+        or when there are no samples at all.
+
+        "Has the card been short for 30 s" is read from the samples rather than from a counter in
+        the process asking, for the usual reason: `watch` and the dashboard both ask, and neither
+        may hold private state about what the other already decided. It is also why the trigger
+        needs a sampler running - with no samples the answer is "I don't know", and not knowing
+        does not unload a 20 GB model.
+
+        A sample with nothing to say about free VRAM (a card read that failed) ends the run: a
+        stretch that wasn't measured is not a stretch that was short.
+        """
+        rows = self._read("SELECT t, cast(json_extract(data, '$.vram_free') as integer) FROM samples "
+                          "WHERE t >= ? ORDER BY t DESC LIMIT 400", (time.time() - within_s,))
+        start, count = None, 0
+        for t, free in rows:
+            if free is None or free >= mib:
+                break
+            start, count = t, count + 1
+        return (start, count) if start is not None else None
+
     def oldest(self) -> float | None:
         return self._read("SELECT min(t) FROM samples", ())[0][0]
 
