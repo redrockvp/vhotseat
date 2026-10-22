@@ -212,6 +212,13 @@ td.nw { color: var(--ink); }
     <p class="notice" id="fitsNote"></p>
   </section>
 
+  <section class="card" id="pressure-card" hidden>
+    <div class="head"><h2>Pressure</h2><span class="right" id="pressureNote"></span></div>
+    <div class="tiles" id="pressureTiles"></div>
+    <div class="holders" id="pressureRows"></div>
+    <p class="notice" id="pressureNote2"></p>
+  </section>
+
   <section class="card" id="cost-card" hidden>
     <div class="head"><h2>Power cost</h2><span class="right" id="costNote"></span></div>
     <div class="tiles" id="costTiles"></div>
@@ -795,20 +802,35 @@ const WARNING_AGE_S = 300;
 
 function renderWarnings() {
   const box = $("warnings"), now = Date.now() / 1000;
+  const pr = state.status.pressure || {};
   const rows = (state.status.policy_warnings || []).filter(
     (w) => now - new Date(w.time).getTime() / 1000 <= WARNING_AGE_S);
-  if (!rows.length) { box.hidden = true; return; }
+  const items = [];
+  if (pr.open) {
+    // Current, not recent news: the card is short right now and models are coming off under the
+    // page's own feet. It stays up for as long as the episode is open, whatever its start time.
+    const ep = pr.open.episode || {};
+    items.push([`the card is short for ${ep.name || "an app vhotseat doesn't manage"}: `, ep.grew_mib != null
+      ? `${gib(ep.grew_mib)} GiB over its ${gib(ep.floor_mib)} GiB usual, card at ${gib(ep.free_mib)} GiB free`
+      : "releases are in progress"]);
+  }
+  for (const w of rows) {
+    items.push([w.why || w.event, ` · ${fmtTime(new Date(w.time).getTime() / 1000)} · ${w.event}`]);
+  }
+  if (!items.length) { box.hidden = true; return; }
   box.hidden = false;
   const ul = el("ul");
-  for (const w of rows) {
+  for (const [what, when] of items) {
     const li = el("li");
-    li.append(w.why || w.event);
-    li.append(el("span", { class: "when" },
-      ` · ${fmtTime(new Date(w.time).getTime() / 1000)} · ${w.event}`));
+    li.append(what);
+    li.append(el("span", { class: "when" }, when));
     ul.append(li);
   }
   box.replaceChildren(el("div", { class: "whead" },
-    rows.length === 1 ? "One policy decision worth a look" : `${rows.length} policy decisions worth a look`), ul);
+    pr.open && rows.length ? `${items.length} things worth a look`
+      : pr.open ? "The card is short right now"
+      : rows.length === 1 ? "One policy decision worth a look"
+      : `${rows.length} policy decisions worth a look`), ul);
 }
 
 // The config's policy, read-only: what each workload gives way for, what it costs at its
@@ -842,6 +864,57 @@ function renderPolicy() {
     ? `each pair at the most the history recorded each of them holding, plus the ${gib(s.floor)} GiB processes vhotseat doesn't manage usually hold (dwm, a browser, an overlay): their worst hour isn't counted, because a game's memory comes back when it closes` + (unknown.length ? ` · never seen holding models: ${unknown.join(", ")}` : "")
     : (g.error ? "the card couldn't be read: there's nothing to compare the pairs against"
                : "one workload on the card: there's no pair to compare");
+}
+
+// The pressure trigger, read-only: the numbers it is reading now, and what an episode running in
+// front of the owner - or the last one that ran, after the fact - is doing about them. They come
+// from the same probe as the card tiles, so this can't disagree with what the release acted on.
+function renderPressure() {
+  const s = state.status, pr = s.pressure, card = $("pressure-card");
+  if (!pr || pr.enabled === false) { card.hidden = true; return; }
+  card.hidden = false;
+  const open = pr.open, ep = (open && open.episode) || pr.last || {};
+  $("pressureNote").textContent = open ? "an app vhotseat doesn't manage took the card by its usual floor"
+    : pr.would ? "the readings say release now: nothing has yet"
+    : (pr.why || "the card and the samples don't add up to pressure");
+  $("pressureTiles").replaceChildren(
+    tile("Card free", gib(pr.free_mib), "GiB", `under ${gib(pr.min_free_mib)} GiB for ${pr.sustain_s} s`,
+         pr.would ? css("--critical") : null),
+    tile("Unmanaged", gib(pr.other_mib), "GiB",
+         `the usual floor is ${gib(pr.floor_mib)} GiB`, css("--other")),
+    tile(ep.name || "Grew", gib(ep.grew_mib), "GiB",
+         `over its usual, ${gib(pr.grow_mib)} GiB needed to start`,
+         (ep.grew_mib || 0) >= pr.grow_mib ? css("--critical") : null),
+    tile("Low for", num(pr.low_for_s), "s", `needs ${pr.sustain_s} s running`,
+         (pr.low_for_s || 0) >= pr.sustain_s ? css("--good") : null));
+  const rows = [];
+  for (const n of (open && open.targets) || []) {
+    const rel = ((open.released || []).includes(n));
+    const wait = (open.waiting || []).find((w) => w.workload === n);
+    const held = s.gpu && s.gpu[`${n}_mib`];
+    const row = el("div", { class: "hrow" });
+    const top = el("div", { class: "top" });
+    top.append(el("b", {}, labelOf(n)), el("span", {}, rel ? "unloaded" : wait ? "keeping its model" : "not asked yet"));
+    const bar = el("div", { class: "bar" }), fill = el("i");
+    fill.style.width = s.gpu && s.gpu.total_mib && held ? `${Math.min(100, Math.round(100 * held / s.gpu.total_mib))}%` : "0%";
+    fill.style.background = colorOf(n);
+    bar.append(fill);
+    row.append(top, bar, el("div", { class: "who" }, rel
+      ? `came off for ${ep.name}: ${gib(held)} GiB now, and nothing closed`
+      : wait ? `${wait.why}${wait.stuck ? ` · try ${wait.attempts} of ${pr.stuck_tries}` : ""}`
+             : `asked because its yields_to covers pressure and it holds more than its ${gib((s.idle || {})[n])} GiB idle`));
+    rows.push(row);
+  }
+  $("pressureRows").replaceChildren(...rows);
+  const last = pr.last || {};
+  $("pressureNote2").textContent = open
+    ? `asks lowest priority first, never closes anything, and ends on its own at ${gib((pr.min_free_mib || 0) + (pr.end_margin_mib || 0))} GiB free: what it unloads stays unloaded unless you load something or type switch`
+    : last.event
+      ? `last episode ${last.time}: ${last.name} ${last.event === "pressure-end" ? `(${last.reason})` : "is still owed releases"}, `
+        + `${gib(last.freed_mib)} GiB came free · it won't start another for ${pr.cooldown_s} s after one ends`
+      : `nothing has grown past its usual by ${gib(pr.grow_mib)} GiB while the card is under ${gib(pr.min_free_mib)} GiB free: `
+        + `${gib(pr.floor_mib)} GiB of unmanaged memory is the usual here, and ` + (pr.ignore || []).length
+        + ` process(es) are ignored by name`;
 }
 
 function renderCost() {
@@ -903,6 +976,7 @@ function renderCharts() {
   renderWhy();
   renderWarnings();
   renderPolicy();
+  renderPressure();
   renderGpu();
   renderCost();
   renderVram();

@@ -40,10 +40,17 @@ def test_status_json_shape_is_unchanged(rig, capsys):
     """A dashboard reads these keys: they are the --json contract."""
     assert rig.cli("status", "--json") == 0
     s = json.loads(capsys.readouterr().out)
-    assert set(s) == {"mode", "strata", "comfy", "gpu", "holders", "claims", "policy", "ram",
-                      "last_event"}
+    assert set(s) == {"mode", "strata", "comfy", "gpu", "holders", "claims", "policy",
+                      "pressure", "ram", "last_event"}
     assert set(s["strata"]) == {"service", "reachable", "loaded"}
     assert set(s["policy"]["strata"]) == {"priority", "yields_to", "gives_way_for"}
+    # What the pressure trigger is reading, whether or not anything is happening: the thresholds,
+    # the same numbers the card tiles show, and the open and last episode (both empty here).
+    pr = s["pressure"]
+    assert {"enabled", "min_free_mib", "grow_mib", "sustain_s", "headroom_mib",
+            "end_margin_mib", "cooldown_s", "ignore", "would", "why", "open", "last",
+            "free_mib", "total_mib", "other_mib", "floor_mib"} <= set(pr)
+    assert pr["open"] is None and pr["last"] is None and pr["would"] is False
     assert set(s["comfy"]) == {"service", "reachable", "running", "pending", "holds_models"}
     assert set(s["gpu"]) == {"total_mib", "free_mib", "strata_mib", "comfy_mib", "other_mib"}
     assert set(s["holders"][0]) == {"pid", "mib", "name", "workload"}

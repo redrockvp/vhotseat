@@ -510,7 +510,13 @@ first does it and the other declines quietly. The episode is one `pressure` row 
 much, over how long, what the card was doing, what was decided - then `pressure-release` and
 `pressure-release-waiting` rows, and one `pressure-end` row when the room is back or the grower is
 gone. `vhotseat status`, `vhotseat why` and the dashboard read the episode from those rows, so they
-say the same thing whichever process is asked.
+say the same thing whichever process is asked. The dashboard has a **Pressure** card for it: the
+free VRAM against its threshold, the unmanaged memory against its usual floor, how long the card has
+been low, and for each workload the episode was owed whether it came off, is still holding and why,
+or hasn't been asked yet; while an episode is open the warning banner names the app that grew. A
+workload that answers "unloaded" and keeps its VRAM is asked three times in total, then left for the
+rest of the episode - that is an unload that doesn't work, not a busy moment - and the card counts
+the tries from the rows, so `watch` and the dashboard aren't each allowing themselves three.
 
 **Fits alongside.** The dashboard's policy panel answers the question the owner actually has:
 can these two run at the same time? It is arithmetic on what the card has been *seen* doing:

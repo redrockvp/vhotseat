@@ -151,7 +151,11 @@ class Arbiter:
     # --- status --------------------------------------------------------------
 
     def probe(self) -> dict:
-        gpu, held = self.snapshot_all()
+        # One card read, every process in it: the pressure reading needs the app that grew, which
+        # is not necessarily among the eight biggest holders, and the report has to be built from
+        # the same numbers the trigger would act on.
+        gpu, every = self.snapshot_all(limit=0)
+        held = every[:8]
         states = {n: w.probe(gpu) for n, w in self.workloads.items()}
         active = [n for n, w in self.workloads.items() if w.active(states[n], gpu)]
         mode = "conflict" if len(active) > 1 else active[0] if active else NONE
@@ -162,6 +166,7 @@ class Arbiter:
                   "policy": {n: {"priority": w.priority, "yields_to": list(w.yields_to),
                                   "gives_way_for": policy.describe(w.yields_to)}
                              for n, w in self.workloads.items()},
+                  "pressure": self.pressure_status(card=(gpu, every)),
                   "ram": ram, "last_event": self.events.last()}
         if hits:
             # And what has been done about it: what this claim has already been given, and what
@@ -215,6 +220,18 @@ class Arbiter:
                     bits.append("kept for its policy: " + ", ".join(kept))
                 if bits:
                     lines.append(f"{pad('freed for:')}{key[0]} ({key[1]}) - " + "; ".join(bits))
+        pr = s.get("pressure") or {}
+        if open := pr.get("open"):
+            # The card is short right now for something vhotseat doesn't manage, and this says so in
+            # the same words the release wrote: what took the memory, how far past its usual it is,
+            # and what has come off and what is still holding because of it.
+            bits = [pressure.describe(open)]
+            if open.get("released"):
+                bits.append("unloaded " + ", ".join(self.label(n) for n in open["released"])
+                            + (f" ({open['freed_mib']} MiB)" if open.get("freed_mib") else ""))
+            for w in open.get("waiting") or []:
+                bits.append(f"{self.label(w['workload'])} keeps its model: {w['why']}")
+            lines.append(f"{pad('pressure:')}" + "; ".join(bits))
         lines.append(f"{pad('ram:')}" + self._describe_ram(s["ram"]))
         if ev := s.get("last_event"):
             detail = ", ".join(f"{k}={v}" for k, v in ev.items() if k not in ("time", "event"))
@@ -469,6 +486,27 @@ class Arbiter:
                     would, why = "blocked", (f"the card is claimed by {claims.describe(hits)}: "
                                              "nothing new loads while it runs")
                     notes.insert(0, why)
+            # An episode that is open now, or ran and ended, is part of why a workload is off the
+            # card and why nothing is putting it back: an owner who sees Strata unloaded ten minutes
+            # after a game closed needs to know which of the two did it.
+            if (ep := (s.get("pressure") or {}).get("open")):
+                row = ep["episode"]
+                if name in (ep.get("released") or []):
+                    notes.append(f"{row['time']}: its model came off for the pressure episode "
+                                 f"({row.get('name')} grew to {row.get('grew_mib')} MiB): vhotseat "
+                                 "won't chase it back on, reloading is your call")
+                elif name in (ep.get("targets") or []):
+                    notes.append(f"the pressure episode for {row.get('name')} is still owed this "
+                                 "workload: it has not come off yet")
+                elif not policy.yields(x.yields_to, policy.PRESSURE):
+                    notes.append(f"it was never a pressure target: its yields_to "
+                                 f"({policy.describe(x.yields_to)}) doesn't cover pressure")
+                if not x.active(x.probe(gpu), gpu):
+                    notes.append("nothing loads it back while the card is short this way: only "
+                                 "loading something, or `switch`, is the order to fill it again")
+            elif (last := (s.get("pressure") or {}).get("last")) and last.get("event") == "pressure-end":
+                notes.append(f"{last['time']}: the pressure episode for {last.get('name')} ended "
+                             f"({last.get('reason')}): what it unloaded stayed unloaded")
             if (need := (adm or {}).get("min_free_vram_mib")) and not resident:
                 free = gpu.get("free_mib") or 0
                 have = free + freed
@@ -701,10 +739,15 @@ class Arbiter:
 
     PRESSURE_LOCK = "pressure release"     # the lock's label, and how a sister actor is spotted
 
-    def pressure_readings(self, claimed=frozenset()) -> dict:
+    def pressure_readings(self, claimed=frozenset(), card: tuple | None = None) -> dict:
         """What the card, the samples and the config say about pressure, in one place so the trigger
         and the reports can't drift apart. It reads: it never takes the lock, releases nothing and
         loads nothing, which is what lets `vhotseat why` answer "was that release mine?".
+
+        `card` is a card already read - the (sums, every holder) pair `probe` and the watcher keep
+        for their own use. A report that read the card a second time to explain a decision would
+        both double the cost of every status probe and be able to disagree with the numbers the
+        decision was made on.
 
         Every answer carries the numbers, and when this is not pressure, `why` names which of the
         three conditions is missing - a card out of working room, out of it for long enough, and out
@@ -722,7 +765,7 @@ class Arbiter:
         if not cfg["enabled"]:
             return {**out, "why": "pressure.enabled is false: nothing is released for an app "
                                   "vhotseat doesn't manage"}
-        snap, rows = self.snapshot_all(limit=0)
+        snap, rows = card if card else self.snapshot_all(limit=0)
         if snap.get("free_mib") is None:
             return {**out, "why": f"the card couldn't be read ({snap.get('error')})"}
         out.update({"free_mib": snap["free_mib"], "total_mib": snap.get("total_mib"),
@@ -935,6 +978,27 @@ class Arbiter:
                             for p in host.processes().values()):
             return f"{name} is gone"
         return None
+
+    def pressure_status(self, claimed=frozenset(), card: tuple | None = None) -> dict:
+        """What to show about pressure: the numbers the trigger is reading now, the episode if one
+        is open, and the most recent episode whether or not it is.
+
+        The open and the last one come from the event log, so an episode is explained the same way
+        in the process that started it, in the other process watching it, and in a `vhotseat status`
+        run an hour after it ended. `would` is the answer to "would it fire right now", which is the
+        question an owner asks when nothing moved.
+        """
+        r = self.pressure_readings(claimed, card=card)
+        out = {"enabled": r["enabled"], "min_free_mib": r["min_free_mib"], "grow_mib": r["grow_mib"],
+               "sustain_s": r["sustain_s"], "headroom_mib": r["headroom_mib"],
+               "end_margin_mib": r["end_margin_mib"], "cooldown_s": r["cooldown_s"],
+               "ignore": list(r["ignore"]), "would": not r.get("why"), "why": r.get("why"),
+               "open": self.events.episode_open(), "last": self.events.last_episode()}
+        for key in ("free_mib", "total_mib", "other_mib", "floor_mib", "grew_mib", "grower",
+                    "low_for_s", "samples", "need_mib", "candidates", "targets"):
+            if key in r:
+                out[key] = r[key]
+        return out
 
     def _busy_other(self, name: str) -> str | None:
         """Why another workload mustn't be released now, if one says it's working."""

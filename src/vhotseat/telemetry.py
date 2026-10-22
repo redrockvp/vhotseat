@@ -38,7 +38,8 @@ CREATE INDEX IF NOT EXISTS logs_t ON logs (t);
 """
 TABLES = ("samples", "events", "logs")
 # The status keys that aren't a workload's.
-NOT_WORKLOADS = {"mode", "gpu", "ram", "holders", "claims", "claims_state", "last_event", "policy"}
+NOT_WORKLOADS = {"mode", "gpu", "ram", "holders", "claims", "claims_state", "last_event",
+                 "policy", "pressure"}
 
 
 def compact(status: dict, health: dict | None = None) -> dict:

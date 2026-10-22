@@ -119,6 +119,7 @@ class Dashboard:
             if cached is None or time.monotonic() - at > STATUS_TTL_S:
                 cached = {**self.arbiter.probe(), "workloads": list(self.arbiter.workloads),
                           "labels": {n: w.label for n, w in self.arbiter.workloads.items()},
+                          "idle": {n: w.idle_vram_mib for n, w in self.arbiter.workloads.items()},
                           "gpu_health": self.arbiter.gpu_health(), "now": time.time()}
                 if self.telemetry is not None:
                     cached["retention_hours"] = self.telemetry.retention_s / 3600
@@ -139,6 +140,10 @@ class Dashboard:
                 # state, so a refusal written by `watch` warns here too.
                 cached["policy_warnings"] = self.arbiter.events.recent(POLICY_WARNING_ROWS,
                                                                       within_s=WARNING_AGE_S)
+                if cached.get("pressure"):
+                    # The page says "try 2 of 3" for a workload whose unload doesn't take, so it
+                    # needs the number the watcher is actually counting to, not one copied here.
+                    cached["pressure"]["stuck_tries"] = STUCK_TRIES
                 peaks = self._peaks(cached["gpu"])
                 floor = self._floor(cached["gpu"])
                 cached["peaks"] = peaks

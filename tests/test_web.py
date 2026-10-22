@@ -441,3 +441,36 @@ def test_the_fits_matrix_counts_every_pair_and_the_floor_that_comes_with_them():
     ]
     assert web.fits_on_card(peaks, 900, idle, 16303)[0]["fits"] is False
     assert web.fits_on_card(peaks, 900, idle, None) == []      # card unreadable: no comparison
+
+
+def test_the_dashboard_shows_the_pressure_episode_while_it_runs(rig, server, monkeypatch):
+    """Mid-flight: an owner watching models vanish needs the app that took the card, how far past
+    its usual floor it sits, and what has come off for it. Those are the numbers the release acted
+    on, out of the same probe that read the card, so the explanation can't disagree with the
+    decision - and `stuck_tries` rides along because the page counts tries alongside the watcher."""
+    from test_pressure_episode import scene
+    scene(rig, monkeypatch, grower="blender.exe", grower_mib=9000)
+    web.pressure_pass(rig.arb)
+    st = json.loads(get(server + "/api/status")[1])
+    pr = st["pressure"]
+    assert pr["open"]["episode"]["name"] == "blender.exe"
+    assert pr["open"]["episode"]["other_mib"] == 9000 and pr["open"]["episode"]["floor_mib"] == 1000
+    assert pr["open"]["released"] == ["strata"] and pr["open"]["freed_mib"] == STRATA_VRAM
+    assert pr["stuck_tries"] == web.STUCK_TRIES
+    assert pr["enabled"] is True and pr["min_free_mib"] == 1500
+    assert st["idle"]["strata"] == rig.arb.workloads["strata"].idle_vram_mib
+
+
+def test_the_dashboard_shows_the_episode_that_already_ended(rig, server, monkeypatch):
+    """After the fact: `open` is empty and `last` is the row that closed it, with the reason and
+    how much came free. It comes from the event log, so a dashboard opened the next morning still
+    says which app was behind the unload, and so does one that never saw the episode happen."""
+    from test_pressure_episode import scene
+    scene(rig, monkeypatch, grower="blender.exe", grower_mib=9000)
+    web.pressure_pass(rig.arb)
+    web.pressure_pass(rig.arb)                             # the room came back: it closes
+    time.sleep(1.1)                                        # the status cache is a second wide
+    pr = json.loads(get(server + "/api/status")[1])["pressure"]
+    assert pr["open"] is None
+    assert pr["last"]["event"] == "pressure-end" and pr["last"]["name"] == "blender.exe"
+    assert pr["last"]["freed_mib"] == STRATA_VRAM

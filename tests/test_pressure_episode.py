@@ -376,3 +376,86 @@ def test_the_episode_is_closed_in_the_log_when_the_room_comes_back(rig, monkeypa
     web.pressure_pass(rig.arb)                             # the room came back: close it
     assert [e["reason"] for e in rows(rig, "pressure-end")] == ["the card is back to 15176 MiB free"]
     assert rig.arb.events.episode_open() is None
+
+
+# --- what it says about itself ---------------------------------------------------
+
+
+def test_a_status_probe_carries_the_episode_it_is_acting_on(rig, monkeypatch):
+    """Mid-flight: an owner looking at the dashboard while this happens must be able to see which
+    app took the card, how far past its usual it is, and what has come off so far. Every number
+    that made the decision is in the same probe that shows the decision, from the same card read -
+    a report that read the card again to explain itself could disagree with what was acted on."""
+    scene(rig, monkeypatch, grower="blender.exe", grower_mib=9000)
+    web.pressure_pass(rig.arb)
+    pr = rig.arb.probe()["pressure"]
+    assert pr["would"] is False, "the room came back, so it isn't pressure now"
+    assert pr["why"] == "the card is back above 1500 MiB free" or pr["why"] == "nothing unmanaged grew"
+    ep = pr["open"]["episode"]
+    assert ep["name"] == "blender.exe" and ep["grew_mib"] == 8000 and ep["other_mib"] == 9000
+    assert ep["free_mib"] == 1176 and ep["floor_mib"] == 1000 and ep["min_free_mib"] == 1500
+    assert pr["open"]["released"] == ["strata"] and pr["open"]["freed_mib"] == STRATA_VRAM
+    assert pr["last"]["name"] == "blender.exe" and pr["last"]["event"] == "pressure-release"
+    assert pr["last"]["time"] == ep["time"], "while it runs, the newest row is this episode's"
+    assert pr["last"]["freed"] == [{"workload": "strata", "mib": STRATA_VRAM}]
+
+
+def test_the_status_text_says_what_took_the_card_and_what_came_off(rig, monkeypatch):
+    """`vhotseat status` is what an owner types when the models vanish. One line, in the words the
+    release wrote: the app, how far past its usual it sits, and what has come off for it."""
+    scene(rig, monkeypatch, grower="blender.exe", grower_mib=9000)
+    web.pressure_pass(rig.arb)
+    out = rig.arb.describe(rig.arb.probe())
+    line = [l for l in out.splitlines() if l.startswith("pressure:")][0]
+    assert "blender.exe holds 9000 MiB vhotseat doesn't manage" in line
+    assert "8000 MiB over its usual 1000" in line
+    assert "card at 1176 MiB free for" in line
+    assert "unloaded Strata (14000 MiB)" in line
+
+
+def test_why_names_the_episode_that_unloaded_a_workload_and_says_it_stays_off(rig, monkeypatch):
+    """After the fact, in `vhotseat why`: the question an owner asks ten minutes after a game or a
+    render closes is whether the vanished model was unloaded for that app and whether it will come
+    back on its own. It won't - only loading something, or `switch`, is the order to refill - and
+    the note says who grew and by how much."""
+    scene(rig, monkeypatch, grower="blender.exe", grower_mib=9000)
+    web.pressure_pass(rig.arb)
+    why = rig.arb.why_all()["strata"]
+    joined = " | ".join(why["notes"])
+    assert "came off for the pressure episode (blender.exe grew to 8000 MiB)" in joined
+    assert "won't chase it back on" in joined
+    assert "nothing loads it back while the card is short this way" in joined
+
+
+def test_why_says_which_workload_the_episode_is_still_owed(rig, monkeypatch):
+    """Mid-flight, the other half: a workload that has not come off yet is not stuck, it is owed,
+    and the note says so rather than leaving the owner to read the event log by hand."""
+    scene(rig, monkeypatch, grower="blender.exe", grower_mib=9000)
+    rig.comfy.vram = COMFY_MODEL_VRAM
+    rig.arb.workloads["strata"].yields_to = ("comfy",)      # not a pressure target: kept out
+    rig.comfy.queue_job({"1": {"class_type": "Slow", "inputs": {}}})   # a render in flight
+    web.pressure_pass(rig.arb)
+    ep = rig.arb.events.episode_open()
+    assert ep["targets"] == ["comfy"] and ep["released"] == []
+    assert [w["workload"] for w in ep["waiting"]] == ["comfy"] and not ep["waiting"][0]["stuck"]
+    joined = " | ".join(rig.arb.why_all()["comfy"]["notes"])
+    assert "still owed this workload: it has not come off yet" in joined
+    joined = " | ".join(rig.arb.why_all()["strata"]["notes"])
+    assert "doesn't cover pressure" in joined
+
+
+def test_a_closed_episode_is_still_explained_after_it_ends(rig, monkeypatch):
+    """An hour later, `open` is empty and `last` carries the whole thing: who grew, what was asked,
+    what came free, and the reason it closed. That is what tells an owner the unload was this
+    feature's and not a crash, and it is a row rather than a memory, so the process that started
+    the episode and the one reading it an hour later both have it."""
+    scene(rig, monkeypatch, grower="blender.exe", grower_mib=9000)
+    web.pressure_pass(rig.arb)
+    web.pressure_pass(rig.arb)                              # the room came back: it closes
+    pr = rig.arb.probe()["pressure"]
+    assert pr["open"] is None
+    assert pr["last"]["event"] == "pressure-end"
+    assert pr["last"]["name"] == "blender.exe" and pr["last"]["freed_mib"] == STRATA_VRAM
+    assert pr["last"]["reason"] == "the card is back to 15176 MiB free"
+    joined = " | ".join(rig.arb.why_all()["strata"]["notes"])
+    assert "the pressure episode for blender.exe ended" in joined
