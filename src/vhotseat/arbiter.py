@@ -34,7 +34,7 @@ class Arbiter:
     def __init__(self, workloads: list[Workload], gpu, lock: GpuLock, events: EventLog, *,
                  gate_release_timeout_s: float = 20, release_timeout_s: float = 60,
                  machine_ram=host.machine_ram, telemetry=None, power: dict | None = None,
-                 claim_rules: list | None = None, claim_ignore=()):
+                 claim_rules: list | None = None, claim_ignore=(), claim_poll_s: float = 2.0):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
         self.lock = lock
@@ -52,6 +52,11 @@ class Arbiter:
         self.claim_rules = claim_rules if claim_rules is not None else claims.rules([])
         # Names and path globs the built-in rules won't claim (Wallpaper Engine, a VR runtime).
         self.claim_ignore = claims.ignores(claim_ignore)
+        # How often the watcher looks for a claim. A game allocates within seconds of starting,
+        # so this is faster than the telemetry sampling and keeps its own clock (config
+        # `claims_poll_s`). The refusal doesn't depend on it - every gate and guard checks for
+        # itself - only the release and the record do.
+        self.claim_poll_s = claim_poll_s
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
@@ -84,8 +89,14 @@ class Arbiter:
         mode = "conflict" if len(active) > 1 else active[0] if active else NONE
         ram = self.machine_ram()
         ram.update({n: w.memory() for n, w in self.workloads.items()})
-        status = {"mode": mode, **states, "gpu": gpu, "holders": held, "claims": self._claims_in(held),
+        hits = self._claims_in(held)
+        status = {"mode": mode, **states, "gpu": gpu, "holders": held, "claims": hits,
                   "ram": ram, "last_event": self.events.last()}
+        if hits:
+            # And what has been done about it: what this claim has already been given, and what
+            # is still holding. Read back from the event log, so it costs nothing when nothing
+            # claims the card and survives whichever process did the releasing.
+            status["claims_state"] = self.events.claims_open()
         if self.telemetry is not None:
             self.telemetry.sample(status, self.gpu_health)
         return status
@@ -103,8 +114,22 @@ class Arbiter:
                               for r in rows[:5])
             lines.append(f"{'holds:':<{width}}{shown}")
         if hits := s.get("claims"):
-            lines.append(f"{'claims:':<{width}}the card is claimed by {claims.describe(hits)}: nothing new "
-                         "loads while it runs")
+            free = any(h.get("on_start", "release") == "release" for h in hits)
+            lines.append(f"{'claims:':<{width}}the card is claimed by {claims.describe(hits)}: "
+                         + ("unloading what is loaded to free it, and nothing new loads while it "
+                            "runs" if free else "nothing new loads while it runs"))
+            hit_keys = {(h["name"], h["note"]) for h in hits}
+            for key, rec in sorted((s.get("claims_state") or {}).items()):
+                if key not in hit_keys:
+                    continue
+                bits = []
+                if rec["released"]:
+                    bits.append("unloaded " + ", ".join(rec["released"])
+                                + (f" ({rec['freed_mib']} MiB)" if rec.get("freed_mib") else ""))
+                for w in rec["waiting"]:
+                    bits.append(f"{w['workload']} keeps its model: {w['why']}")
+                if bits:
+                    lines.append(f"{'freed for:':<{width}}{key[0]} ({key[1]}) - " + "; ".join(bits))
         lines.append(f"{'ram:':<{width}}" + self._describe_ram(s["ram"]))
         if ev := s.get("last_event"):
             detail = ", ".join(f"{k}={v}" for k, v in ev.items() if k not in ("time", "event"))
@@ -412,6 +437,107 @@ class Arbiter:
             self.events.record(kind, source="request", allowed=False, reason=reason)
             util.log(f"refusing {x.label} load: {reason}")
             return False
+
+    def claim_targets(self) -> list[str]:
+        """Which workloads a claim is owed: the ones holding more than their idle VRAM on the
+        card right now.
+
+        This is decided once, when the claim's release first runs, and the answer goes in the
+        event log (`claim-release-targets`). It matters because a claim lasts as long as the
+        game does, and a typed `vhotseat switch strata` in the middle of it is an order: what
+        the owner loads afterwards is theirs, and a watcher that read the card fresh every poll
+        would undo it every 2 seconds for the rest of the game."""
+        snap = self.snapshot()
+        return sorted(n for n, y in self.workloads.items()
+                      if (snap.get(f"{n}_mib") or 0) > y.idle_vram_mib)
+
+    def claim_release(self, claim: dict, only: list[str] | None = None) -> dict:
+        """A claim appeared (`on_start: release`): ask the workloads it was owed to let go of
+        the card, through the normal release path - API unload, then the card confirms the MiB
+        went - and leave anything that is working alone.
+
+        `only` is that set, read back from the log by whoever is acting; workloads outside it
+        are not touched for this claim whatever they come to hold later. With no set passed,
+        every workload holding card memory is a candidate.
+
+        It takes the GPU lock exactly as a switch would: a `hold` or a switch in progress owns
+        the card, and releasing underneath it would pull the ground out from under that work, so
+        this declines and the watcher asks again on the next poll. The claim it is serving never
+        refuses this: freeing the card is not a load (see api.Seat._switch and switch's `request`).
+
+        Nothing is restarted and nothing is killed. A workload whose release doesn't finish -
+        busy, refusing, or stuck holding its VRAM - is reported as waiting, and the watcher tries
+        it again while the claim lasts, bounded for a workload that says it unloaded and keeps
+        holding. A workload with nothing on the card isn't touched at all: a model living
+        entirely in RAM has nothing here that the game is short of.
+
+        Returns {"declined": why-or-None, "released": [{workload, freed_mib}],
+        "waiting": [{workload, why, stuck?}], "freed_mib": int}.
+        """
+        cands = self.workloads if only is None else {n: y for n, y in self.workloads.items()
+                                                    if n in set(only)}
+        pre = self.snapshot()
+        if not any((pre.get(f"{n}_mib") or 0) > y.idle_vram_mib for n, y in cands.items()):
+            # Nothing it is owed is on the card, so there is nothing to free and no reason to
+            # take the lock every poll for as long as the game runs. `would` says as much.
+            return {"declined": None, "by_actor": False, "would": [], "released": [],
+                    "waiting": [], "freed_mib": 0}
+        got = self.lock.try_take(f"claim release {claim.get('name') or ''}".strip())
+        if not isinstance(got, Held):
+            want = {n: max(0, (pre.get(f"{n}_mib") or 0) - y.idle_vram_mib)
+                    for n, y in cands.items()}
+            # Another watcher (watch and the dashboard both act) is mid-release for this same
+            # claim. That isn't a workload holding on: saying so once per workload would both
+            # spam the log and shadow the reason that matters, if one turns up later.
+            sister = bool(got and got.startswith("claim release"))
+            return {"declined": f"{got or 'a switch'} in progress", "by_actor": sister,
+                    "would": sorted(n for n, mib in want.items() if mib),
+                    "released": [], "waiting": [], "freed_mib": 0}
+        with got:
+            # Read the card again now that the lock is ours. Whoever was waiting behind this
+            # lock - the other poller, on a box where watch and the dashboard both run - sees
+            # the card as the first one left it, so it frees nothing and writes nothing rather
+            # than unloading a second time. Same for a switch that happened while we queued.
+            snap = self.snapshot()
+            want = {n: max(0, (snap.get(f"{n}_mib") or 0) - y.idle_vram_mib)
+                    for n, y in cands.items()}
+            if not any(want.values()):
+                return {"declined": None, "by_actor": False, "would": [], "released": [],
+                        "waiting": [], "freed_mib": 0}
+            released, waiting = [], []
+            for n, y in cands.items():
+                if not want[n]:
+                    continue
+                if y.service_active() and (busy := y.busy()):
+                    waiting.append({"workload": n, "why": busy})
+                    continue
+                if not y.service_active():
+                    waiting.append({"workload": n,
+                                    "why": f"a {y.label} process holds {want[n]} MiB but "
+                                          f"{y.service.unit or 'its service'} is stopped"})
+                    continue
+                try:
+                    # wait=0: anything still working was skipped above, and the release path's
+                    # own timeout keeps this inside one poll rather than a whole handover's.
+                    y.release(0, self.gate_release_timeout_s)
+                except (Busy, ReleaseFailed, SwitchError) as e:
+                    waiting.append({"workload": n, "why": str(e) or type(e).__name__})
+                    continue
+                left = max(0, (self.snapshot().get(f"{n}_mib") or 0) - y.idle_vram_mib)
+                if left:
+                    # It answered "unloaded" and the card still shows its weights - an owner's
+                    # `confirm:` that is more generous than `idle_vram_mib`, or a node that
+                    # doesn't give the memory back. Not done, and not recorded as released:
+                    # `claim-release` says "unloaded" and must only name what the card agrees
+                    # is clear. `stuck` is what the watcher counts its bounded retries on.
+                    waiting.append({"workload": n, "stuck": True, "held_mib": left,
+                                    "why": f"says it unloaded and still holds {left} MiB"})
+                    continue
+                released.append({"workload": n, "freed_mib": want[n]})
+            if released:
+                self.lock.bump()          # seats cache who owns the card: drop that answer
+            return {"declined": None, "by_actor": False, "released": released, "waiting": waiting,
+                    "freed_mib": sum(r["freed_mib"] for r in released)}
 
     def _busy_other(self, name: str) -> str | None:
         """Why another workload mustn't be released now, if one says it's working."""

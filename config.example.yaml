@@ -153,7 +153,13 @@ power:
 #                                      # read, e.g. the game runs elevated
 #   - parent: mylauncher.exe           # or by any ancestor's exe name; it matches that
 #                                      # launcher's helpers too, so prefer path or name
+#   on_start: release                  # what happens when it appears: release (default)
+#                                      # asks the idle workloads to let go of their models -
+#                                      # nothing running is interrupted - block only refuses
+#                                      # new loads, which is all vhotseat used to do
 # claims_builtin: true                 # false leaves only the rules you wrote
+# claims_poll_s: 2                     # how often `vhotseat watch` looks for a claim (the
+#                                      # telemetry sampler keeps its own, slower interval)
 # claims_ignore: [wallpaper64.exe]     # names or globs the built-ins won't claim: the
 #                                      # built-ins already skip Wallpaper Engine, SteamVR
 #                                      # and the Oculus runtime, which live under

@@ -157,6 +157,26 @@ def test_the_arbiter_hands_its_ignores_to_the_matcher(rig, monkeypatch):
     assert [h["name"] for h in rig.arb._claims_in([])] == ["wallpaper64.exe"]
 
 
+def test_a_claim_rule_says_what_happens_when_it_appears():
+    """`release` (the default, and what the built-ins use) frees the card for the claim by
+    unloading idle workloads; `block` is the older behaviour, refuse new loads only. The action
+    has to travel with the hit, because the watcher decides what to do from the hit."""
+    rs = claims.rules([{"name": "somegame.exe", "note": "a game", "on_start": "block"},
+                       {"name": "othergame.exe", "note": "another game"}], builtin=True)
+    p = procs((10, 4, "somegame.exe", r"D:\Libraries\some\somegame.exe"),
+              (11, 4, "othergame.exe", r"D:\Libraries\other\othergame.exe"))
+    hits = claims.matching(rs, p)
+    by = {h["name"]: h["on_start"] for h in hits}
+    assert by == {"somegame.exe": "block", "othergame.exe": "release"}
+    assert all(r.on_start == "release" for r in rs if r.builtin)
+
+
+def test_an_unknown_on_start_is_rejected():
+    import pytest
+    with pytest.raises(ValueError, match="on_start must be release or block"):
+        claims.Rule({"name": "g.exe", "on_start": "freethecard"})
+
+
 def test_claim_rules_are_validated():
     """A typo in a rule would silently claim the wrong thing - or nothing."""
     raw = config.parse((ROOT / "config.example.yaml").read_text())
@@ -174,6 +194,11 @@ def test_claim_rules_are_validated():
     raw["claims"] = [{"note": "no matcher at all"}]
     with pytest.raises(config.ConfigError, match=r"needs at least one of name, path, parent"):
         config.validate(raw)
+    raw["claims"] = [{"name": "somegame.exe", "on_start": "free"}]
+    with pytest.raises(config.ConfigError, match=r"claims\[0\]\.on_start: expected release"):
+        config.validate(raw)
+    raw["claims"] = [{"name": "somegame.exe", "on_start": "release"}]
+    assert config.validate(raw)["claims"][0]["on_start"] == "release"
     raw["claims"] = "somegame.exe"
     with pytest.raises(config.ConfigError, match=r"claims: expected a list"):
         config.validate(raw)

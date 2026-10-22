@@ -12,7 +12,7 @@
   vhotseat cost [--since 24h]               what the card's power has cost (needs power.price_per_kwh)
   vhotseat why [NAME]                       why a workload can or can't take the GPU right now
   vhotseat claims                           what owns the card by right (a game), and what matches now
-  vhotseat watch                            note when a claim starts and ends, and sample, until stopped
+  vhotseat watch                            free the card for a claim, record it, and sample, until stopped
 
 Exit codes: 0 ok · 1 failed / refused · 2 usage or bad config. `hold` exits with
 CMD's own exit code once CMD has started. `autostart status` exits 1 when nothing
@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
     sp.add_argument("--port", type=int, default=8765, help="port (default 8765)")
     sub.add_parser("record", help="sample RAM and VRAM into the telemetry until stopped (for a service)")
-    sub.add_parser("watch", help="record when a claim (a game) starts and ends, and sample, until stopped")
+    sub.add_parser("watch", help="free the card for a claim (a game) and record it, and sample, until stopped")
     sp = sub.add_parser("claims", help="what owns the card by right, and what matches right now")
     sp.add_argument("--json", action="store_true")
     sp = sub.add_parser("autostart", help="keep the dashboard and sampling up from logon")
@@ -160,19 +160,34 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
                               "rules": [{k: v for k, v in vars(r).items() if v} for r in arbiter.claim_rules]}))
         else:
             if hits:
-                print(f"the card is claimed by {claims.describe(hits)}: nothing new loads while it runs")
+                free = any(h.get("on_start", "release") == "release" for h in hits)
+                print(f"the card is claimed by {claims.describe(hits)}: "
+                      + ("unloading what is loaded to free it, and nothing new loads while it runs"
+                         if free else "nothing new loads while it runs"))
                 for h in hits[:8]:
                     print(f"{'':<12}- pid {h['pid']}: {h['by']}")
                     if h["exe"]:
                         print(f"{'':<12}  {h['exe']}")
                 if len(hits) > 8:
                     print(f"{'':<12}- and {len(hits) - 8} more processes")
+                hit_keys = {(h["name"], h["note"]) for h in hits}
+                for key, rec in sorted(arbiter.events.claims_open().items()):
+                    if key not in hit_keys:
+                        continue
+                    bits = []
+                    if rec["released"]:
+                        bits.append("unloaded " + ", ".join(rec["released"])
+                                    + (f" ({rec['freed_mib']} MiB freed)" if rec.get("freed_mib") else ""))
+                    bits += [f"{w['workload']} keeps its model: {w['why']}" for w in rec["waiting"]]
+                    if bits:
+                        print(f"{'':<12}for {key[0]} ({key[1]}): " + "; ".join(bits))
             else:
                 print("nothing claims the card right now")
             print(f"rules ({len(arbiter.claim_rules)}):")
             for r in arbiter.claim_rules:
                 where, what = next((w, getattr(r, w)) for w in ("name", "path", "parent") if getattr(r, w))
-                print(f"{'':<12}- {where} {what}" + (f"  ({r.note})" if r.note else ""))
+                print(f"{'':<12}- {where} {what}" + (f"  ({r.note})" if r.note else "")
+                      + f"  -> on_start: {r.on_start}")
         return EXIT_OK
     if args.cmd == "why":
         why = arbiter.why_all()

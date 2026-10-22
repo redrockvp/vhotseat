@@ -344,8 +344,10 @@ it is a report and not a gate. `--json` gives the same per workload
 **Next handover** card.
 
 **Claims: a game owns the card.** `vhotseat claims` prints what the rules match right
-now and the rules themselves; the same scan runs inside every gate and guard decision,
-so nothing resident is needed for the rule to hold (docs/how-it-works.md §3.7).
+now, the rules themselves and what each one does when it appears, and - while a claim is
+open - what has already been unloaded for it and what is still holding and why. The same
+scan runs inside every gate and guard decision, so nothing resident is needed for the
+rule to hold (docs/how-it-works.md §3.7).
 
 ```yaml
 claims_builtin: true        # the built-in rules for the usual installations (default true)
@@ -354,8 +356,27 @@ claims:
     note: World of Warcraft            # how it's described in a refusal
   - name: rocketleague.exe             # or by exe name: works when the path can't be read
   - parent: mylauncher.exe             # or by any ancestor's exe name (its helpers too)
+  on_start: release                    # per rule: release (default) or block, see below
 claims_ignore: [myelectronapp.exe]     # names or path globs the built-in rules won't claim
+claims_poll_s: 2                       # how often `watch` looks for a claim (default 2 s)
 ```
+
+**What a claim does when it appears.** `on_start: release` (the default, and what the built-in
+game rules use) frees the card for it: every idle workload vhotseat manages is asked to let go of
+its model through the normal release path - API unload, then the card confirms the MiB went - and
+the servers stay running. A workload with work in flight is never interrupted: it is skipped,
+recorded as `claim-release-waiting`, and released on a later check as soon as it goes idle, while
+the claim lasts. Which workloads the claim is owed is decided when its release first runs, from
+what the card held then, and recorded: a model the owner loads afterwards - a typed `vhotseat
+switch` is an order - is left alone, and a workload that held nothing to begin with isn't waited
+on. A workload that says it unloaded and keeps holding its VRAM is asked three times and then left
+for the rest of the claim. `on_start: block` is the older behaviour: nothing new loads, and what is
+already loaded keeps what it has. Both are enforced at every gate whether or not `watch` runs;
+`release` is the extra half, and it's why `vhotseat autostart install --command watch` is worth
+having.
+
+`claims_poll_s` is how often that watcher looks - a game has allocated within seconds of starting.
+It's independent of `telemetry.interval_s`, which stays whatever it is for the history graphs.
 
 While something matches, nothing **new** loads: the gate refuses a load a request would
 wake, and `switch --request` - what ComfyUI's guard node uses, because the queue is
