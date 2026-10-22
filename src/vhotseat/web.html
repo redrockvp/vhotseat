@@ -839,7 +839,7 @@ function renderPolicy() {
   }));
   const unknown = rows.filter((f) => f.fits === null).map((f) => `${labelOf(f.a)} + ${labelOf(f.b)}`);
   $("fitsNote").textContent = rows.length
-    ? `each pair at the most the history recorded each of them holding, plus ${gib(peaks.other)} GiB held by processes vhotseat doesn't manage (a desktop, a browser, a game): nothing here frees that` + (unknown.length ? ` · never seen holding models: ${unknown.join(", ")}` : "")
+    ? `each pair at the most the history recorded each of them holding, plus the ${gib(s.floor)} GiB processes vhotseat doesn't manage usually hold (dwm, a browser, an overlay): their worst hour isn't counted, because a game's memory comes back when it closes` + (unknown.length ? ` · never seen holding models: ${unknown.join(", ")}` : "")
     : (g.error ? "the card couldn't be read: there's nothing to compare the pairs against"
                : "one workload on the card: there's no pair to compare");
 }

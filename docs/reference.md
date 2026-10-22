@@ -454,12 +454,17 @@ was given.
 
 **Fits alongside.** The dashboard's policy panel answers the question the owner actually has:
 can these two run at the same time? It is arithmetic on what the card has been *seen* doing:
-each workload at the most the telemetry recorded it holding, plus the most the processes
-vhotseat doesn't manage have held over the same window (the desktop, a browser, a game: the
-part of the card nothing here can free). A pair that fits at those numbers fits; a pair
-measured against what the card happens to be doing this second is a snapshot of luck. A pair
-where one of the two has never been sampled holding models says so rather than promising a
-fit.
+each workload at the most the telemetry recorded it holding - a workload costs what its biggest
+model costs, not what it happens to hold this second - plus what the processes vhotseat doesn't
+manage *usually* hold: the median of the non-workload memory over the retention window, which is
+the part of the card no handover can free. Not its peak. A game, Blender or whatever a claim rule
+watches all count as non-workload memory while they run, and all of it comes back when they exit,
+so a peak would have said "no room" for the next 24 hours after one evening of gaming. A pair that
+fits at those numbers fits; a pair measured against what the card happens to be doing this second
+is a snapshot of luck. A pair where one of the two has never been sampled holding models says so
+rather than promising a fit. That median is one function, `Telemetry.floor_mib()`, and the pressure
+trigger's idea of how much of the card can never be freed is the same call: two answers to that
+question would disagree.
 
 While something matches, nothing **new** loads: the gate refuses a load a request would
 wake, and `switch --request` - what ComfyUI's guard node uses, because the queue is

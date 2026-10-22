@@ -355,22 +355,54 @@ def test_the_dashboard_shows_which_two_workloads_fit_on_the_card_together(rig, s
     rig.cli("status")
     time.sleep(1.1)
     out = json.loads(get(server + "/api/status")[1])
-    assert out["peaks"] == {"other": 0, "strata": STRATA_VRAM, "comfy": COMFY_MODEL_VRAM}
+    assert out["peaks"] == {"strata": STRATA_VRAM, "comfy": COMFY_MODEL_VRAM}
+    assert out["floor"] == 0                        # the fakes' card has nothing else on it
     assert out["fits"] == [{"a": "strata", "b": "comfy", "mib": STRATA_VRAM + COMFY_MODEL_VRAM,
                             "fits": False, "why": None}]
+
+
+def test_an_evening_of_gaming_doesnt_make_every_pair_read_no_room(tmp_path):
+    """The floor is what the card *usually* carries, not what it carried at its worst. A game,
+    Blender, or whatever a claim rule watches all count as non-workload memory while they run,
+    and all of it comes back when they exit. Read that window at its peak and every pair of
+    workloads says "no room" for the rest of the retention window after one evening with a game
+    open; the median says what the desktop costs on an ordinary day. The same number is what the
+    pressure trigger will use for how much can never be freed, which is why it lives in
+    Telemetry rather than next to the tiles."""
+    tel = telemetry.Telemetry(tmp_path / "t.db", retention_hours=24)
+    others = [300, 320, 280, 340, 8000, 8100, 7900, 310, 290]      # an evening with a game
+    for other in others:
+        tel._write("INSERT INTO samples VALUES (?, ?, ?)",
+                   (time.time() - 60, "none", json.dumps({"vram_other": other,
+                                                          "w": {"strata": {"vram": 4000},
+                                                                "comfy": {"vram": 7000}}})))
+    peaks, idle = tel.peaks(["strata", "comfy"]), {"strata": 1500, "comfy": 1500}
+    assert peaks == {"strata": 4000, "comfy": 7000}     # the workloads are still read at their worst
+    assert tel.floor_mib() == 320                        # the median, not the 8100 peak
+    assert web.fits_on_card(peaks, tel.floor_mib(), idle, 16303)[0]["fits"] is True
+    # ... and the number this corrects: the same window read at its worst says no room.
+    assert web.fits_on_card(peaks, max(others), idle, 16303)[0]["fits"] is False
+
+
+def test_a_floor_from_an_empty_window_is_none_not_a_zero(tmp_path):
+    """No samples is not the same as a card with nothing else on it: the dashboard falls back to
+    what the card reads right now, and a 0 out of an empty table would quietly promise room."""
+    assert telemetry.Telemetry(tmp_path / "empty.db").floor_mib() is None
 
 
 def test_peaks_are_read_from_the_samples_and_pruned_with_them(tmp_path):
     """The window is the retention window: a peak from outside it is gone, which is what keeps
     the fit honest about what this machine has been doing lately rather than about whatever it
-    did once."""
+    did once. Same for the floor."""
     tel = telemetry.Telemetry(tmp_path / "t.db", retention_hours=1)
     tel._write("INSERT INTO samples VALUES (?, ?, ?)",
                (time.time() - 60, "strata", json.dumps({"vram_other": 900,
                                                         "w": {"strata": {"vram": 14000}}})))
-    assert tel.peaks(["strata", "comfy"]) == {"other": 900, "strata": 14000, "comfy": None}
+    assert tel.peaks(["strata", "comfy"]) == {"strata": 14000, "comfy": None}
+    assert tel.floor_mib() == 900
     tel._db.execute("UPDATE samples SET t = t - 7200")
-    assert tel.peaks(["strata"]) == {"other": None, "strata": None}
+    assert tel.peaks(["strata"]) == {"strata": None}
+    assert tel.floor_mib() is None
 
 
 def test_the_dashboard_survives_an_open_claim(rig, server, monkeypatch):
@@ -398,14 +430,14 @@ def test_the_fits_matrix_counts_every_pair_and_the_floor_that_comes_with_them():
     side can free. The one honest answer when a workload has never been sampled holding
     models is unknown: a pair including it has never been seen, and saying it would have
     fitted would be a promise the history didn't earn."""
-    peaks = {"strata": 14000, "comfy": 7000, "unsloth": None, "other": 900}
+    peaks = {"strata": 14000, "comfy": 7000, "unsloth": None}
     idle = {"strata": 1500, "comfy": 1500, "unsloth": 1500}
-    assert web.fits_on_card(peaks, idle, 24576) == [
+    assert web.fits_on_card(peaks, 900, idle, 24576) == [
         {"a": "strata", "b": "comfy", "mib": 21900, "fits": True, "why": None},
         {"a": "strata", "b": "unsloth", "mib": None, "fits": None,
          "why": "never recorded holding models: unsloth"},
         {"a": "comfy", "b": "unsloth", "mib": None, "fits": None,
          "why": "never recorded holding models: unsloth"},
     ]
-    assert web.fits_on_card(peaks, idle, 16303)[0]["fits"] is False
-    assert web.fits_on_card(peaks, idle, None) == []      # card unreadable: no comparison
+    assert web.fits_on_card(peaks, 900, idle, 16303)[0]["fits"] is False
+    assert web.fits_on_card(peaks, 900, idle, None) == []      # card unreadable: no comparison

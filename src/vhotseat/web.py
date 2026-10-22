@@ -45,21 +45,22 @@ POLICY_WARNING_ROWS = ("policy-refused", "policy-kept")
 WARNING_AGE_S = 300.0
 
 
-def fits_on_card(peaks: dict, idle: dict, total_mib: int | None) -> list[dict]:
+def fits_on_card(peaks: dict, floor: int, idle: dict, total_mib: int | None) -> list[dict]:
     """For each pair of workloads: would they fit on the card at the same time?
 
-    Each one at the most it has been *recorded* holding, plus the most the processes
-    vhotseat doesn't manage have held - the part of the card nothing here can free. A pair
-    that fits at those numbers fits; a pair measured against what the card happens to be
-    doing this second tells you what you already knew and nothing you could act on.
+    Each one at the most it has been *recorded* holding - a workload costs what its biggest
+    model costs, not what it happens to be holding this second - plus `floor`: what the
+    processes vhotseat doesn't manage *usually* hold, which is the part of the card no handover
+    frees. `floor` comes from Telemetry.floor_mib(), median not peak, and that difference is the
+    whole correction: what a game or Blender holds comes back when they close, so counting their
+    worst moment as permanent would have said "no room" for a day after one evening of gaming.
 
     `fits` is null for a pair where one of the two has never been sampled holding more than
     its idle weight: the honest answer there is that the card has never been seen doing it,
     not that it would have fitted."""
     if total_mib is None:
         return []
-    floor = peaks.get("other") or 0
-    names = [n for n in peaks if n != "other"]
+    names = list(peaks)
     rows = []
     for i, a in enumerate(names):
         for b in names[i + 1:]:
@@ -139,27 +140,32 @@ class Dashboard:
                 cached["policy_warnings"] = self.arbiter.events.recent(POLICY_WARNING_ROWS,
                                                                       within_s=WARNING_AGE_S)
                 peaks = self._peaks(cached["gpu"])
+                floor = self._floor(cached["gpu"])
                 cached["peaks"] = peaks
-                cached["fits"] = fits_on_card(peaks, {n: w.idle_vram_mib
-                                                      for n, w in self.arbiter.workloads.items()},
+                cached["floor"] = floor
+                cached["fits"] = fits_on_card(peaks, floor, {n: w.idle_vram_mib
+                                                             for n, w in self.arbiter.workloads.items()},
                                               cached["gpu"].get("total_mib"))
                 self._status = (time.monotonic(), cached)
             return cached
 
     def _peaks(self, gpu: dict) -> dict:
-        """The most VRAM each workload has been seen holding, and the most nothing-managed
-        processes held: what telemetry recorded over the retention window, floored by what
-        the card shows right now - a 14 GB model sitting on the card today has cost at least
-        that much, whatever the sampled window happened to catch."""
+        """The most VRAM each workload has been seen holding: what telemetry recorded over the
+        retention window, floored by what the card shows right now - a 14 GB model sitting on the
+        card today has cost at least that much, whatever the sampled window happened to catch."""
         recorded = self.telemetry.peaks(list(self.arbiter.workloads)) if self.telemetry else {}
-        keys = [*self.arbiter.workloads, "other"]
 
         def highest(*values):
             return max((v for v in values if v is not None), default=None)
 
-        return {n: (highest(recorded.get(n), gpu.get(f"{n}_mib")) if n != "other"
-                    else highest(recorded.get("other"), gpu.get("other_mib")))
-                for n in keys}
+        return {n: highest(recorded.get(n), gpu.get(f"{n}_mib")) for n in self.arbiter.workloads}
+
+    def _floor(self, gpu: dict) -> int:
+        """What the processes vhotseat doesn't manage usually hold on this card. The median over
+        the telemetry window; the current reading when there are no samples yet, which is the
+        best available the first time anything asks. Not the peak: see Telemetry.floor_mib()."""
+        recorded = self.telemetry.floor_mib() if self.telemetry else None
+        return recorded if recorded is not None else (gpu.get("other_mib") or 0)
 
     def why(self) -> dict:
         with self._why_lock:

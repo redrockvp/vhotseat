@@ -196,15 +196,16 @@ class Telemetry:
         return [{"t": t, "source": s, "pid": p, "message": m} for t, s, p, m in rows]
 
     def peaks(self, names: list[str]) -> dict:
-        """The most VRAM each workload has been recorded holding over the retention window, and
-        the most the processes vhotseat doesn't manage reached (under `other`).
+        """The most VRAM each workload has been recorded holding over the retention window.
 
-        This is what "would these two fit on the card together?" has to be measured against:
-        each one at its worst, plus the memory nothing here can free. Measured against what the
-        card happens to be doing this second, the answer is a snapshot of luck. Read with
-        json_extract so the samples don't have to be pulled into Python for one number."""
-        cols = ["max(cast(json_extract(data, '$.vram_other') as integer))"]
-        args: list = []
+        This is what "would these two fit on the card together?" has to be measured against: a
+        workload at its worst, because that is what it costs when it is loaded. Measured against
+        what the card happens to be doing this second, the answer is a snapshot of luck. Read with
+        json_extract so the samples don't have to be pulled into Python for one number. What the
+        processes vhotseat doesn't manage hold is deliberately not here as a peak too: that number
+        is a floor, not a maximum, and `floor_mib()` is where it lives.
+        """
+        cols, args = [], []
         for n in names:
             cols.append("max(cast(json_extract(data, ?) as integer))")
             args.append(f"$.w.{n}.vram")
@@ -213,7 +214,34 @@ class Telemetry:
                              (*args, time.time() - self.retention_s))[0]
         except (sqlite3.Error, IndexError, OSError):
             return {}
-        return dict(zip(["other", *names], row, strict=True))
+        return dict(zip(names, row, strict=True))
+
+    def floor_mib(self) -> int | None:
+        """The non-workload VRAM this card *usually* carries: dwm, the browser, Orca, an overlay.
+
+        The median of `vram_other` over the retention window, and the median is the whole point.
+        The peak is the wrong number: a game, Blender, or whatever a claim rule watches all count
+        as `other` while they run, and all of their memory comes back when they exit. Read a peak
+        over a day that had one evening of gaming in it and every pair of workloads says "no room"
+        for the next 24 hours, and a trigger built on the same number would spend a handover
+        chasing gigabytes that were never there. A median ignores that spike - an evening is a
+        minority of the samples - and stays low, so what it describes is the desktop doing
+        something ordinary.
+
+        One function because two answers to this question would be a bug: the dashboard's "fits
+        alongside" and the pressure trigger's idea of how much of the card can never be freed have
+        to be the same number.
+
+        None when the window holds no such sample; whoever asks decides what to fall back on.
+        """
+        rows = self._read("SELECT cast(json_extract(data, '$.vram_other') as integer) FROM samples "
+                          "WHERE t >= ? AND json_extract(data, '$.vram_other') is not null",
+                          (time.time() - self.retention_s,))
+        values = sorted(r[0] for r in rows if r[0] is not None)
+        if not values:
+            return None
+        mid = len(values) // 2
+        return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) // 2
 
     def oldest(self) -> float | None:
         return self._read("SELECT min(t) FROM samples", ())[0][0]
