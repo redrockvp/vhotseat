@@ -83,6 +83,32 @@ def test_a_seat_that_just_took_the_card_owns_it_while_the_weights_land(rig, seat
     assert seat.owns("strata") is False
 
 
+def test_a_seat_stops_vouching_for_a_card_that_was_never_loaded(rig, seat, monkeypatch):
+    """acquire() hands the card over, and then the request that was going to load it never arrives:
+    the forward failed, the client hung up, the load was refused. Nothing bumps the generation, and a
+    claim that starts afterwards with nothing to release takes no lock either, so the seat kept
+    answering "this one owns it" for as long as the process lived - and every gated request after it
+    skipped the check and put weights on top of the game."""
+    seat.acquire("comfy", wait=5)
+    assert seat.owns("comfy") is True          # this is that window: nothing has loaded yet
+    hits = [{"pid": 4242, "name": "EldenRing.exe", "exe": "", "note": "Elden Ring", "by": "name"}]
+    monkeypatch.setattr(rig.arb, "claim_hits", lambda: hits)
+    assert seat.owns("comfy") is False
+    with pytest.raises(api.SwitchError):
+        seat.acquire("comfy", wait=0)          # asked, and refused, like any other request
+
+
+def test_the_seat_s_own_claim_runs_out_after_the_load_window(rig, seat, monkeypatch):
+    """No claim in sight doesn't mean the seat is still right. A load that never happened stops being
+    vouched for once the window runs out, and the next request goes the slow way and is checked."""
+    seat.acquire("comfy", wait=5)
+    assert seat.owns("comfy") is True
+    real = api._now
+    monkeypatch.setattr(api, "_now", lambda: real() + api.LOAD_WINDOW_S + 1)
+    assert seat.owns("comfy") is False
+    assert seat.owns("comfy") is False, "the window doesn't come back"
+
+
 def test_generation_bumps_on_every_handover(rig, seat):
     g0 = seat.generation()
     rig.cli("switch", "strata")

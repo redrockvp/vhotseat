@@ -74,7 +74,10 @@ Per request:
    since it last checked, this is a small file read: no lock, no `nvidia-smi`,
    no HTTP. `acquire()` also marks the card as this workload's in the seat, so `owns()`
    keeps answering yes through the window where a server that loads on request shows nothing
-   on the card yet: a burst of gated requests is one handover, not one per request. **On a cache miss it probes every workload, including this one, so it
+   on the card yet: a burst of gated requests is one handover, not one per request. That mark
+   lasts one load window (5 minutes) and is withdrawn the moment a claim appears, so a forward
+   that never loaded doesn't leave the proxy vouching for a card nobody holds; inside that
+   window `owns()` pays a process-table scan for the claim check. **On a cache miss it probes every workload, including this one, so it
    calls your own `/_vhotseat/status`**: never call `owns()` (or `acquire()`)
    while holding a lock your status handler needs, and run the HTTP server
    threaded, or a cold request waits on itself.
