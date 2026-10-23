@@ -32,7 +32,9 @@ whatever they find, including a card somebody else owns.
 **Modes.** `status` reports the owner, derived live from each workload's API
 and the GPU's per-process memory; there is no state file to drift. The mode is
 a workload's name, `none` (the GPU is free) or `conflict` (two hold memory at
-once; a `switch` either way resolves it).
+once; a `switch` either way resolves it). Its `policy:` line prints each
+workload's priority and what it gives way for, so the two keys are visible next
+to the memory they decide the fate of.
 
 **`switch NAME`** releases every other workload, then loads NAME if it can be
 loaded ahead of a request. A workload that's working makes it fail at once,
@@ -102,6 +104,54 @@ the load is refused and the event log says what was short.
 A ComfyUI restart wipes its `/history`, so it only happens with an empty queue,
 and once the latest result is at least 10 s old (`history_settle_s`), so
 clients reading results have had time to.
+
+## Who gives way for whom
+
+Which workloads get unloaded to make room used to be one rule for everything: whatever
+held memory on the card was a candidate for every handover. Two keys per workload make
+it a decision of yours instead:
+
+```yaml
+workloads:
+  strata:
+    priority: 60            # 0-100, default 50: lowest gives way first
+    yields_to: [comfy, claims]   # ComfyUI and a game may unload it; anything else is refused
+  unsloth:
+    priority: 20            # idle and cheap to reload: asked first
+    yields_to: ["*"]        # the default: it gives way for anyone
+```
+
+`yields_to:` lists the newcomers this workload will make room for. An entry is another
+workload's name, `claims` (a process that owns the card by right - a game: see Claims
+below), `pressure` (the card running short under a process vhotseat doesn't manage), or
+`"*"` for anyone. Absent means `["*"]`, which is exactly what vhotseat did before this
+existed, so an existing config keeps behaving as it did. An empty list means it gives
+way for nobody: only a command you type moves it. An entry naming a workload that isn't
+in the config is a config error, not a rule that quietly never matches; a workload can't
+be named `claims` or `pressure`, because those are words `yields_to:` already means.
+
+What the policy decides is **who gets unloaded, and who is refused instead**. It is
+enforced wherever vhotseat decides to unload something, and its direction matters:
+
+- a **load nobody chose** - Strata's gate, ComfyUI's guard (`switch comfy --request`), a
+  proxy's `Seat.acquire` - is refused when a workload holding the card won't give way for
+  it. The refusal names the holder and what its `yields_to:` allows, records a
+  `policy-refused` row, and shows on the dashboard. Nothing is unloaded partially, because
+  the card cannot be given to the newcomer anyway.
+- a **`switch` you type** is an order, and goes through: it unloads the workload that
+  wouldn't have, and records `policy-override` saying whose policy it overrode, so the log
+  answers "why did Strata lose its 20 GB?" later.
+- a **claim starting** (`on_start: release`) never unloads a workload whose `yields_to`
+  doesn't cover `claims`. It isn't refused - freeing the card is not a load - the workload
+  is simply not a target, and the record and the dashboard say so (`policy-kept`), because
+  the game may now be short of the VRAM that stayed put.
+- a workload at or below its `idle_vram_mib` holds nothing for anyone to be short of, so
+  it doesn't refuse a load whatever its `yields_to:` says. The policy reads what the card
+  shows; a load that hasn't put weights on the card yet isn't yet a holder.
+
+`priority:` orders the workloads that *may* be unloaded - the lowest is asked first - and
+never overrules `yields_to:`. Both are shown by `vhotseat status` and `vhotseat why`, and
+read-only on the dashboard until there's a way to edit them there.
 
 ## Talking to a server that isn't a plain server
 
@@ -265,9 +315,19 @@ One page, refreshed every 5 s, that works on a phone too:
 - **VRAM** and **RAM / Swap**: per workload, stacked against the totals.
 - **Power cost**: what the card's watts cost across the range you're looking at, in
   total and per holder, plus what it's drawing right now. Needs `power.price_per_kwh`.
+- **Who gives way for whom**: the policy as the config has it - each workload's priority,
+  what it gives way for, what it holds on the card now and what the history has seen it
+  holding at most - and for every pair of workloads a tile saying whether they fit on the
+  card at the same time. Read-only: the keys are still edited in `config.yaml`.
 - **Events / Logs**: every switch, hold and gate decision, and every line a
   vhotseat command logged, from any process (the guard's `switch comfy`,
   Strata's `gate strata`, your `hold`).
+
+When a policy refused a load, or a claim wasn't allowed to unload something, a banner at the
+top of the page says so - the sentence from the event row, with its time - and stops once the
+row is more than five minutes old. It reads the event log rather than anything the dashboard
+remembers, so a refusal written by `vhotseat watch`, or by a guard in another process, warns
+here too.
 
 Every chart marks each event with a dashed line: hover it to see the event,
 click it to open it in the table. Ranges run from 15 minutes to the whole
@@ -329,9 +389,14 @@ day, about R890 a month - which is the case for unloading a model you aren't usi
 
 **`why [NAME]`** is the handover read backwards. Where `switch` acts, `why` reports:
 for each workload it walks the same preconditions - every other workload that would
-be released, the ones that would have to be waited for, then the admission floors -
-and says which of `could take the card now`, `would have to wait` or `is blocked`
-applies and why. The blocked reasons are the ones that make a handover fail: a
+be released, the ones that would have to be waited for, the ones whose `yields_to:`
+refuses to give way for it, then the admission floors - and says which of
+`could take the card now`, `would have to wait` or `is blocked` applies and why. A
+workload that won't give way is `blocked`, not `waiting`: nothing gets unloaded and
+nothing loads. Each answer carries the workload's own `priority` and `yields_to`, and
+while something claims the card it names any workload the claim won't unload, because
+"the game is short of VRAM" is otherwise a mystery. The blocked reasons are the ones
+that make a handover fail: a
 workload whose API is dead while its VRAM is still on the card (start it so there is
 something to ask, or kill the process), a process holding memory with its service
 stopped, and an admission floor the card can't reach - shown as arithmetic, since
@@ -340,8 +405,8 @@ where "refused" is a mystery. The memory that can't be freed is named: the proce
 vhotseat doesn't manage and how much each holds. `why` releases nothing, loads
 nothing and restarts nothing; it exits 0 even when the answer is `blocked`, because
 it is a report and not a gate. `--json` gives the same per workload
-(`{would, holder, free_mib, resident, notes[]}`); the dashboard shows it as the
-**Next handover** card.
+(`{would, holder, free_mib, resident, priority, yields_to, notes[]}`); the dashboard
+shows it as the **Next handover** card.
 
 **Claims: a game owns the card.** `vhotseat claims` prints what the rules match right
 now, the rules themselves and what each one does when it appears, and - while a claim is
@@ -377,6 +442,100 @@ having.
 
 `claims_poll_s` is how often that watcher looks - a game has allocated within seconds of starting.
 It's independent of `telemetry.interval_s`, which stays whatever it is for the history graphs.
+
+**A claim that isn't allowed to unload something.** A workload whose `yields_to:` doesn't list
+`claims` is not a target of the claim: it keeps its model, the claim goes ahead without it, and
+the release is never refused - freeing the card is not a load, so a policy can only ever take a
+workload off the list of what may be unloaded, never stop the release. Because the game is then
+short of exactly the VRAM that stayed put, the decision is written down twice: a `policy-kept` row
+in the event log (which the dashboard shows as a warning until it goes stale), and the workload
+named as `kept for its policy:` in `vhotseat claims` and `vhotseat status`, next to what the claim
+was given.
+
+**Pressure: an app vhotseat doesn't manage takes the card.** A game names itself, and the claim
+rules say what to do with it. A Blender render, a CUDA script, or a browser that decides to use the
+GPU for something large does not: no rule covers it, nobody asked for the card, and the card is
+short anyway. Pressure is how vhotseat notices that and answers with the only lever it has -
+releasing workloads that are idle: the ones whose `yields_to:` covers `pressure`, lowest
+`priority:` first, and no more of them than pays for the room. It needs a sampler running to say
+"has been short for 30 s", so it works when `vhotseat watch`, `vhotseat web` or `vhotseat record`
+is (which is what `vhotseat autostart install` starts); without samples, nothing fires.
+
+```yaml
+pressure:
+  enabled: true              # false: never release for an app vhotseat doesn't manage
+  min_free_mib: 512          # the card is out of working room below this...
+  sustain_s: 30              # ...and has been for this long (6 samples at 5 s)...
+  grow_mib: 2000             # ...and the memory vhotseat doesn't manage is this far over its floor
+  headroom_mib: 1000         # release enough to get back to min_free plus this
+  end_margin_mib: 2000       # the episode ends once free is back above min_free plus this
+  cooldown_s: 600            # and the next episode starts no sooner than this after the last
+  ignore: [vmware-vmx.exe]   # names or path globs that are never growers: a VM, a benchmark, a miner
+```
+
+All of it is on by default, and every number is deliberately wide, because a wrong firing costs
+unloading ~20 GB, reloading it, and possibly a server restart. They come off a read-only
+measurement of this box (2026-10-22, 99 samples over ~200 s with the current apps open: Strata
+loaded with a 21394 MiB model, ComfyUI down, browser, Orca and Discord open): the card sat at
+**779-958 MiB free** all through it, and the processes vhotseat doesn't manage held
+**3096-3269 MiB** - dwm 1370, firefox 372, explorer 362, Discord 211, Orca ~186 - varying by
+**173 MiB** in three minutes. So `min_free_mib: 512` is under this machine's ordinary bottom,
+which means "low" is a change rather than the state of a card with a model on it; `grow_mib: 2000`
+is ten times that jitter. `sustain_s: 30` is six samples, so a single spike - a tab opening, a
+video seeking - is not pressure. `end_margin_mib` is wider than the trigger on purpose: an
+episode that ends at the same line it started at restarts itself forever, and a 24 GB card with a
+21 GB model has under 1 GB of slack to oscillate in, so the design is few, large, deliberate
+evictions rather than continuous trimming. The floor is the median the telemetry recorded, the same
+number the **Fits alongside** tiles use, so the trigger never goes hunting for memory that was never
+there (a game's memory last evening is not a floor: it came back when the game closed).
+
+What pressure never does: **refuse a load** - growth by a process nobody manages justifies releasing
+idle workloads, never saying no to something you typed, or to a queue that asks; **chase a model you
+load afterwards** - the workloads an episode is owed are decided once, at its start, and recorded;
+touch a workload with work in flight, which is skipped and retried while the episode lasts; and
+unload anything for a process named in `ignore:`. A workload whose `yields_to:` doesn't list
+`pressure` is not a candidate either, which is how you keep one server out of it: Strata with
+`yields_to: [comfy, claims]` keeps its model however big a render gets. `pressure.enabled: false`
+switches the whole thing off.
+
+**Shared GPU memory is evidence, not a trigger.** On Windows each process reports two GPU memory
+figures: dedicated (what is on the card) and shared (system RAM the card borrows once it runs out -
+Task Manager's "shared GPU memory"). Only dedicated is what the trigger reads. Measured on this box
+in the same window: 37 processes reporting **51.0 GiB** of shared GPU memory between them, 50.9 GiB
+of it Strata, while the card was merely full. Shared usage goes into the episode's row as evidence
+that the card was oversubscribed at that moment, which is a different fact with a different answer.
+The card-wide total is kept in the samples too (`vram_shared`), and the dashboard's VRAM card shows it
+as a tile labelled **Shared (spill)** rather than a chart line: with a 21 GiB model loaded it is tens
+of GiB of system RAM, so plotted against a 24 GiB card it would flatten every other series on the
+chart. A backend with no such counter (Linux) says "unknown", not zero.
+
+Both `vhotseat watch` and the dashboard's watcher run the check, and both act on it; they coordinate
+through the GPU lock and the event log, the same way claim releases do, so whichever gets there
+first does it and the other declines quietly. The episode is one `pressure` row - who grew, by how
+much, over how long, what the card was doing, what was decided - then `pressure-release` and
+`pressure-release-waiting` rows, and one `pressure-end` row when the room is back or the grower is
+gone. `vhotseat status`, `vhotseat why` and the dashboard read the episode from those rows, so they
+say the same thing whichever process is asked. The dashboard has a **Pressure** card for it: the
+free VRAM against its threshold, the unmanaged memory against its usual floor, how long the card has
+been low, and for each workload the episode was owed whether it came off, is still holding and why,
+or hasn't been asked yet; while an episode is open the warning banner names the app that grew. A
+workload that answers "unloaded" and keeps its VRAM is asked three times in total, then left for the
+rest of the episode - that is an unload that doesn't work, not a busy moment - and the card counts
+the tries from the rows, so `watch` and the dashboard aren't each allowing themselves three.
+
+**Fits alongside.** The dashboard's policy panel answers the question the owner actually has:
+can these two run at the same time? It is arithmetic on what the card has been *seen* doing:
+each workload at the most the telemetry recorded it holding - a workload costs what its biggest
+model costs, not what it happens to hold this second - plus what the processes vhotseat doesn't
+manage *usually* hold: the median of the non-workload memory over the retention window, which is
+the part of the card no handover can free. Not its peak. A game, Blender or whatever a claim rule
+watches all count as non-workload memory while they run, and all of it comes back when they exit,
+so a peak would have said "no room" for the next 24 hours after one evening of gaming. A pair that
+fits at those numbers fits; a pair measured against what the card happens to be doing this second
+is a snapshot of luck. A pair where one of the two has never been sampled holding models says so
+rather than promising a fit. That median is one function, `Telemetry.floor_mib()`, and the pressure
+trigger's idea of how much of the card can never be freed is the same call: two answers to that
+question would disagree.
 
 While something matches, nothing **new** loads: the gate refuses a load a request would
 wake, and `switch --request` - what ComfyUI's guard node uses, because the queue is

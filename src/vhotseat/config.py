@@ -8,6 +8,7 @@ Validated when loaded: a mistake is reported with its key path, and nothing runs
 import os
 from pathlib import Path
 
+from . import policy, pressure
 from .drivers.base import Context, Workload
 from .drivers.comfyui import ComfyUI
 from .drivers.http import HttpWorkload
@@ -33,7 +34,7 @@ def state_dir(env=os.environ) -> Path:
 GATE_KINDS = ("hook", "plugin", "proxy", "hold")
 SERVICE_KINDS = ("systemd-user", "systemd")
 COMMON = {"driver", "label", "url", "service", "vram", "idle_vram_mib", "gate", "admission",
-          "allow_restart", "restart_timeout_s"}
+          "allow_restart", "restart_timeout_s", "priority", "yields_to"}
 GATE_KEYS = {"kind", "timeout", "config", "custom_nodes", "status"}
 DRIVER_KEYS = {
     "http": {"resident", "busy", "release", "confirm", "load", "model", "headers", "body",
@@ -73,7 +74,7 @@ def _rules(rules, where: str):
 def validate(raw) -> dict:
     _check(isinstance(raw, dict), "config", "expected a mapping at the top level")
     unknown = set(raw) - {"gpu", "workloads", "events", "telemetry", "power", "claims",
-                          "claims_builtin", "claims_ignore", "claims_poll_s", "patches"}
+                          "claims_builtin", "claims_ignore", "claims_poll_s", "pressure", "patches"}
     _check(not unknown, "config", f"unknown key(s): {', '.join(sorted(unknown))}")
     gpu = raw.get("gpu") or {}
     _check(isinstance(gpu, dict), "gpu", "expected a mapping")
@@ -115,6 +116,26 @@ def validate(raw) -> dict:
     for i, s in enumerate(ci):
         _check(isinstance(s, str) and s.strip(), f"claims_ignore[{i}]",
                "expected a non-empty string (an exe name or a path glob)")
+    pr = raw.get("pressure") or {}
+    _check(isinstance(pr, dict), "pressure", "expected a mapping (see the pressure keys in the docs)")
+    unknown = set(pr) - set(pressure.KEYS)
+    _check(not unknown, "pressure", f"unknown key(s): {', '.join(sorted(unknown))}")
+    _check(isinstance(pr.get("enabled", True), bool), "pressure.enabled",
+           "expected true or false: whether vhotseat may release models when an app it doesn't "
+           "manage takes the card")
+    for k in ("min_free_mib", "grow_mib", "headroom_mib", "end_margin_mib"):
+        _int(pr, k, "pressure")
+    for k in ("sustain_s", "cooldown_s"):
+        if k in pr:
+            v = pr[k]
+            _check(isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0,
+                   f"pressure.{k}", f"expected a number of seconds ≥ 0, got {v!r}")
+    pi = pr.get("ignore") or []
+    _check(isinstance(pi, list), "pressure.ignore",
+           "expected a list of exe names or path globs, e.g. [vmware-vmx.exe]")
+    for i, s in enumerate(pi):
+        _check(isinstance(s, str) and s.strip(), f"pressure.ignore[{i}]",
+               "expected a non-empty string (an exe name or a path glob)")
     cl = raw.get("claims") or []
     _check(isinstance(cl, list), "claims", "expected a list of {name, path, parent, note} rules")
     for i, r in enumerate(cl):
@@ -152,10 +173,13 @@ def validate(raw) -> dict:
 
     wls = raw.get("workloads")
     _check(isinstance(wls, dict) and wls, "workloads", "expected at least one workload")
+    known = set(wls)
     for name, w in wls.items():
         where = f"workloads.{name}"
-        _check(isinstance(name, str) and name.replace("-", "").replace("_", "").isalnum() and name != "none",
-               where, "a workload name must be letters, digits, - or _ (and not 'none')")
+        _check(isinstance(name, str) and name.replace("-", "").replace("_", "").isalnum()
+               and name != "none" and name not in policy.RESERVED,
+               where, "a workload name must be letters, digits, - or _ (not 'none', and not "
+                      "'claims' or 'pressure': those are words `yields_to:` gives a meaning to)")
         _check(isinstance(w, dict), where, "expected a mapping")
         driver = w.get("driver")
         _check(driver in DRIVER_KEYS, f"{where}.driver", f"expected one of {', '.join(DRIVER_KEYS)}, got {driver!r}")
@@ -175,6 +199,21 @@ def validate(raw) -> dict:
                "needed when there's no service: how to find its processes on the GPU")
         _int(w, "idle_vram_mib", where)
         _int(w, "restart_timeout_s", where, 1)
+        if "priority" in w:
+            v = w["priority"]
+            _check(isinstance(v, int) and not isinstance(v, bool)
+                   and policy.PRIORITY_MIN <= v <= policy.PRIORITY_MAX, f"{where}.priority",
+                   f"expected a whole number from {policy.PRIORITY_MIN} to {policy.PRIORITY_MAX} "
+                   f"(lowest gives way first), got {v!r}")
+        if "yields_to" in w:
+            _check(isinstance(w["yields_to"], list), f"{where}.yields_to",
+                   'expected a list of workload names, or of "claims", "pressure" and "*"')
+            for i, entry in enumerate(w["yields_to"]):
+                _check(isinstance(entry, str) and entry, f"{where}.yields_to[{i}]",
+                       'expected a workload name, or "claims", "pressure" or "*"')
+                _check(entry in known | set(policy.SPECIAL), f"{where}.yields_to[{i}]",
+                       f"no workload named {entry!r} in this config; configured: "
+                       f"{', '.join(sorted(known))} (plus claims, pressure and \"*\")")
         _check(isinstance(w.get("allow_restart", False), bool), f"{where}.allow_restart", "expected true or false")
         _check(not w.get("allow_restart") or svc is not None, f"{where}.allow_restart",
                "needs a `service:` to restart")
@@ -291,6 +330,11 @@ def workloads(cfg: dict, ctx: Context) -> list[Workload]:
             name=name, label=w.get("label") or name, url=w["url"].rstrip("/"), service=svc, ctx=ctx,
             vram_selector=selector, gate=w["gate"], admission=w.get("admission") or {},
             allow_restart=w.get("allow_restart", False),
+            # An absent key means everyone may unload it, which is what vhotseat did
+            # before there was a policy. An empty list means nobody may: keep the two
+            # apart, so `or` is the wrong way to default it here.
+            yields_to=tuple(w["yields_to"]) if "yields_to" in w else policy.DEFAULT_YIELDS_TO,
+            priority=w.get("priority", policy.DEFAULT_PRIORITY),
         )
         for k in ("idle_vram_mib", "restart_timeout_s"):
             if k in w:

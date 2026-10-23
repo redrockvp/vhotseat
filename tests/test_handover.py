@@ -40,10 +40,20 @@ def test_status_json_shape_is_unchanged(rig, capsys):
     """A dashboard reads these keys: they are the --json contract."""
     assert rig.cli("status", "--json") == 0
     s = json.loads(capsys.readouterr().out)
-    assert set(s) == {"mode", "strata", "comfy", "gpu", "holders", "claims", "ram", "last_event"}
+    assert set(s) == {"mode", "strata", "comfy", "gpu", "holders", "claims", "policy",
+                      "pressure", "ram", "last_event"}
     assert set(s["strata"]) == {"service", "reachable", "loaded"}
+    assert set(s["policy"]["strata"]) == {"priority", "yields_to", "gives_way_for"}
+    # What the pressure trigger is reading, whether or not anything is happening: the thresholds,
+    # the same numbers the card tiles show, and the open and last episode (both empty here).
+    pr = s["pressure"]
+    assert {"enabled", "min_free_mib", "grow_mib", "sustain_s", "headroom_mib",
+            "end_margin_mib", "cooldown_s", "ignore", "would", "why", "open", "last",
+            "free_mib", "total_mib", "other_mib", "floor_mib"} <= set(pr)
+    assert pr["open"] is None and pr["last"] is None and pr["would"] is False
     assert set(s["comfy"]) == {"service", "reachable", "running", "pending", "holds_models"}
-    assert set(s["gpu"]) == {"total_mib", "free_mib", "strata_mib", "comfy_mib", "other_mib"}
+    assert set(s["gpu"]) == {"total_mib", "free_mib", "strata_mib", "comfy_mib", "other_mib",
+                             "shared_mib"}
     assert set(s["holders"][0]) == {"pid", "mib", "name", "workload"}
     assert set(s["ram"]) >= {"total_mib", "available_mib", "strata", "comfy"}
 
@@ -55,9 +65,11 @@ def test_status_text(rig, capsys):
     assert out[0] == "mode:   strata"
     assert out[1] == "strata: model loaded"
     assert out[2] == "comfy:  no models loaded, 0 running / 0 queued"
-    assert out[3].startswith("gpu:    1903 of 16303 MiB free (strata 14000, comfy 400, other 0)")
+    # who may be unloaded for whom, next to the memory that decision covers
+    assert out[3] == "policy: strata 50 (anything); comfy 50 (anything)"
+    assert out[4].startswith("gpu:    1903 of 16303 MiB free (strata 14000, comfy 400, other 0)")
     # who actually holds it, by name: the workloads and anything nothing manages
-    assert out[4] == "holds:  strata.exe 14000 (strata)  python.exe 400 (comfy)"
+    assert out[5] == "holds:  strata.exe 14000 (strata)  python.exe 400 (comfy)"
 
 
 # --- switch --------------------------------------------------------------------

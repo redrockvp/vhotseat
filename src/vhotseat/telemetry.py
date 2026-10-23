@@ -38,7 +38,8 @@ CREATE INDEX IF NOT EXISTS logs_t ON logs (t);
 """
 TABLES = ("samples", "events", "logs")
 # The status keys that aren't a workload's.
-NOT_WORKLOADS = {"mode", "gpu", "ram", "holders", "claims", "claims_state", "last_event"}
+NOT_WORKLOADS = {"mode", "gpu", "ram", "holders", "claims", "claims_state", "last_event",
+                 "policy", "pressure"}
 
 
 def compact(status: dict, health: dict | None = None) -> dict:
@@ -47,6 +48,7 @@ def compact(status: dict, health: dict | None = None) -> dict:
     g, r = status["gpu"], status["ram"]
     names = [n for n in status if n not in NOT_WORKLOADS]
     out = {"vram_total": g.get("total_mib"), "vram_free": g.get("free_mib"), "vram_other": g.get("other_mib"),
+           "vram_shared": g.get("shared_mib"),
            "ram_total": r.get("total_mib"), "ram_available": r.get("available_mib"),
            "swap_total": r.get("swap_total_mib"), "swap_used": r.get("swap_used_mib"),
            "w": {n: {"vram": g.get(f"{n}_mib"), "ram": (r.get(n) or {}).get("ram_mib"),
@@ -194,6 +196,77 @@ class Telemetry:
         rows = self._read("SELECT t, source, pid, message FROM logs WHERE t >= ? AND t <= ? "
                           "ORDER BY t DESC LIMIT ?", (since, until, limit))
         return [{"t": t, "source": s, "pid": p, "message": m} for t, s, p, m in rows]
+
+    def peaks(self, names: list[str]) -> dict:
+        """The most VRAM each workload has been recorded holding over the retention window.
+
+        This is what "would these two fit on the card together?" has to be measured against: a
+        workload at its worst, because that is what it costs when it is loaded. Measured against
+        what the card happens to be doing this second, the answer is a snapshot of luck. Read with
+        json_extract so the samples don't have to be pulled into Python for one number. What the
+        processes vhotseat doesn't manage hold is deliberately not here as a peak too: that number
+        is a floor, not a maximum, and `floor_mib()` is where it lives.
+        """
+        cols, args = [], []
+        for n in names:
+            cols.append("max(cast(json_extract(data, ?) as integer))")
+            args.append(f"$.w.{n}.vram")
+        try:
+            row = self._read(f"SELECT {', '.join(cols)} FROM samples WHERE t >= ?",
+                             (*args, time.time() - self.retention_s))[0]
+        except (sqlite3.Error, IndexError, OSError):
+            return {}
+        return dict(zip(names, row, strict=True))
+
+    def floor_mib(self) -> int | None:
+        """The non-workload VRAM this card *usually* carries: dwm, the browser, Orca, an overlay.
+
+        The median of `vram_other` over the retention window, and the median is the whole point.
+        The peak is the wrong number: a game, Blender, or whatever a claim rule watches all count
+        as `other` while they run, and all of their memory comes back when they exit. Read a peak
+        over a day that had one evening of gaming in it and every pair of workloads says "no room"
+        for the next 24 hours, and a trigger built on the same number would spend a handover
+        chasing gigabytes that were never there. A median ignores that spike - an evening is a
+        minority of the samples - and stays low, so what it describes is the desktop doing
+        something ordinary.
+
+        One function because two answers to this question would be a bug: the dashboard's "fits
+        alongside" and the pressure trigger's idea of how much of the card can never be freed have
+        to be the same number.
+
+        None when the window holds no such sample; whoever asks decides what to fall back on.
+        """
+        rows = self._read("SELECT cast(json_extract(data, '$.vram_other') as integer) FROM samples "
+                          "WHERE t >= ? AND json_extract(data, '$.vram_other') is not null",
+                          (time.time() - self.retention_s,))
+        values = sorted(r[0] for r in rows if r[0] is not None)
+        if not values:
+            return None
+        mid = len(values) // 2
+        return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) // 2
+
+    def below_free(self, mib: int, within_s: float) -> tuple[float, int] | None:
+        """How long the card has been continuously under `mib` MiB free, from the samples:
+        (start of the run, how many samples in it). None when the newest sample isn't under it,
+        or when there are no samples at all.
+
+        "Has the card been short for 30 s" is read from the samples rather than from a counter in
+        the process asking, for the usual reason: `watch` and the dashboard both ask, and neither
+        may hold private state about what the other already decided. It is also why the trigger
+        needs a sampler running - with no samples the answer is "I don't know", and not knowing
+        does not unload a 20 GB model.
+
+        A sample with nothing to say about free VRAM (a card read that failed) ends the run: a
+        stretch that wasn't measured is not a stretch that was short.
+        """
+        rows = self._read("SELECT t, cast(json_extract(data, '$.vram_free') as integer) FROM samples "
+                          "WHERE t >= ? ORDER BY t DESC LIMIT 400", (time.time() - within_s,))
+        start, count = None, 0
+        for t, free in rows:
+            if free is None or free >= mib:
+                break
+            start, count = t, count + 1
+        return (start, count) if start is not None else None
 
     def oldest(self) -> float | None:
         return self._read("SELECT min(t) FROM samples", ())[0][0]

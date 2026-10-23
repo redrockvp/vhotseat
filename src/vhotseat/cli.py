@@ -27,6 +27,7 @@ import time
 
 from . import claims
 from . import config as cfgmod
+from . import policy
 from . import util
 from .arbiter import NONE, Arbiter
 from .setup import build
@@ -179,6 +180,8 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
                         bits.append("unloaded " + ", ".join(rec["released"])
                                     + (f" ({rec['freed_mib']} MiB freed)" if rec.get("freed_mib") else ""))
                     bits += [f"{w['workload']} keeps its model: {w['why']}" for w in rec["waiting"]]
+                    if kept := rec.get("kept"):
+                        bits.append("kept for its policy: " + ", ".join(kept))
                     if bits:
                         print(f"{'':<12}for {key[0]} ({key[1]}): " + "; ".join(bits))
             else:
@@ -199,7 +202,8 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
             word = {"ready": "could take the card now", "waiting": "would have to wait",
                     "blocked": "is blocked"}
             for name, w in why.items():
-                print(f"{w['label'] + ':':<12}{word[w['would']]}")
+                print(f"{w['label'] + ':':<12}{word[w['would']]} - priority {w['priority']}, "
+                      f"gives way for {policy.describe(w['yields_to'])}")
                 for note in w["notes"]:
                     print(f"{'':<12}- {note}")
         return EXIT_OK

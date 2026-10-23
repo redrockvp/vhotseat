@@ -271,7 +271,9 @@ started by hand outside its service, or a ComfyUI custom node that loads models
 outside a job. `vhotseat status` shows that VRAM as `other`, and `doctor` warns
 about it. The LLM's `admission.min_free_vram_mib` is the last line of defence:
 it won't load into a GPU that lacks room. A job whose model doesn't fit fails
-with ComfyUI's own out-of-memory error.
+with ComfyUI's own out-of-memory error. What vhotseat does about that memory -
+when it leaves it alone, and when it asks its own workloads to give some of it
+back - is §3.9.
 
 ### 3.6 A workload was closed by hand
 
@@ -333,6 +335,14 @@ context, a model resident only in RAM - isn't something the claim waits on. Once
 gone the claim has been given its due, and later checks take no GPU lock and read no card for it
 for as long as the game runs.
 
+A workload that says it won't give way for a claim (its `yields_to:` doesn't cover `claims`, see
+§3.8) is left off that list whatever it holds, and is not waited on either: nothing was owed to it.
+It does not stop the release. The direction matters everywhere in vhotseat: a policy refuses a
+*load*, never the freeing of the card, so the game gets whatever the workloads are willing to give
+up and the record says what stayed - a `policy-kept` row naming it and how many MiB, the same line
+in `vhotseat claims` and `vhotseat status`, and a warning on the dashboard, because the honest
+summary is that the game may now be short of exactly that much.
+
 That list, and what has already been released for a claim, come back from the event log rather
 than from a process's memory, which is also what keeps `watch` and `vhotseat web` - both of which
 notice claims - from doing the same release twice. The GPU lock is the mutex between them, and the
@@ -362,6 +372,99 @@ Steam, Epic, EA, Riot and Battle.net run all day, and their helpers live inside 
 directories the game rules point at, so launchers and helpers are excluded by name. When
 a title is missed, `vhotseat claims` shows what the rules can see, and one `path:` line
 adds it.
+
+### 3.8 Who gives way for whom
+
+Which workloads a handover is allowed to unload was one rule for everything: whatever held
+memory on the card was a candidate, whoever was asking. Two keys per workload make that the
+owner's decision instead (docs/reference.md, "Who gives way for whom"):
+
+- `yields_to:` - the newcomers this workload will make room for: other workloads' names,
+  `claims`, `pressure`, or `"*"` for anyone. Absent means `["*"]`, which is every handover
+  there has ever been, so a config written before this exists behaves as it always did.
+- `priority:` - among the workloads that *may* be unloaded, the lowest is asked first. It
+  never overrules `yields_to:`.
+
+The whole policy is a statement about *who gets unloaded*, and it is enforced in the same
+direction everywhere, which is the direction the rest of vhotseat already uses: **a policy can
+refuse a load, and can take a workload off the list of what may be released; it can never stop
+work getting off the card.**
+
+| What is happening | What the policy does |
+| --- | --- |
+| a load nobody chose: Strata's gate, ComfyUI's guard (`switch comfy --request`), a proxy's `Seat.acquire` | refused while a workload holding model memory won't give way for the newcomer: nothing is unloaded, nothing loads, and the refusal names the holder and what it does give way for (`policy-refused`) |
+| a `switch` / `hold` someone typed | goes through - it is an order, as everywhere else - and records whose policy it overrode (`policy-override`) |
+| a claim starting (`on_start: release`) | never refused: the workloads that don't cover `claims` are simply not targets, and the record and the dashboard say the game may be short of them (`policy-kept`) |
+| a workload at or below its `idle_vram_mib` | refuses nobody, whatever its keys say: there is nothing on the card to be short of |
+
+The gate checks it while it holds the lock, inside `_make_room`, rather than only in the
+entry points above it: whatever asks for the card ends up there, so a handover that was
+allowed when it queued and would unload something unwilling by the time it got the lock is
+still refused. And because the answer comes from what the card shows, not from the config
+alone, an idle server with a narrow `yields_to:` cannot block the card it isn't holding - the
+fastest way for a config like this to get thrown away.
+
+### 3.9 An app vhotseat doesn't manage takes the card
+
+A game with no claim rule, a browser with a 4K stream upscaling itself, another CUDA program, a
+launcher: none of them is a workload, so nothing asks them for anything, and their memory does not
+come back on its own the way a released model's does. The card goes under the LLM's admission floor
+and stays there - `min_free_vram_mib` refuses the load every time, and the owner waits for a machine
+that is already switched off. That is §3.5's blind spot with the shape of §3.7's problem, so the
+answer has the shape of §3.7's answer: **notice it, then ask the workloads that may be asked**.
+
+The trigger is a threshold over a floor, with a rule about what counts as having grown:
+
+| Condition | What it means |
+| --- | --- |
+| free VRAM under `min_free_mib` | the card has no working room for the next thing at all, not just for one big model |
+| free VRAM under it for `sustain_s` | one poll's dip is not a reason: the readings come from the samples, so this outlives a restart of whichever process is watching |
+| unmanaged memory `grow_mib` over its **median** over the retention window | something *grew*, rather than this being the usual state of the machine: dwm, a browser and an overlay sit at roughly the same MiB all day, and an evening of gaming moves the median far less than it moves the peak |
+
+All three, together, or nothing happens. Memory belonging to a workload, to a process an open claim
+already covers (a game is phase 1's, handed the card by its rule, and a second actor releasing over
+the same gigabytes would fight it), or to a name in `pressure.ignore:` is not pressure: vhotseat can
+ask its own workloads back, so the shortfall has to be memory it cannot.
+
+What it does is the release path it already had, in a burst. The workloads whose `yields_to:` covers
+`pressure`, lowest `priority:` first, until the readings are satisfied - API unload, then the card
+confirms the MiB went - and then only as many of them as were needed. A walk that stops when the
+room is covered says nothing about what the middle of it was worth: 1000 MiB in front of a 6000 MiB
+workload takes both for a 5000 MiB need, and once the big one has to go the small one pays for
+nothing. So the run gives back what the rest of it covers without, highest `priority:` first, which
+keeps the choice the owner's: where there is a real choice, the lowest priority is still what goes.
+It never gives back the last one in, because without it the run fell short. **Nothing is closed and
+nothing is killed**, not even a workload that answers nothing at all: a stopped server costs a model
+reload, and that is cheaper than losing a render or a game in flight. A workload that is working is
+left alone, and tried again on every poll for as long as the episode lasts; a workload that says it
+unloaded and keeps its VRAM is asked three times in
+total and then left, because that is an unload that doesn't work, not a busy moment.
+
+An episode is decided once and lives in the event log, not in a process's memory: `pressure` names
+who grew and by how much over what floor, `pressure-release-targets` fixes which workloads were owed
+at the moment it started, `pressure-release` says what came off, `pressure-release-waiting` what
+hasn't, and `pressure-end` the reason it stopped asking. That is what makes it safe for `watch` and
+the dashboard's watcher to both run the check on the same box - the second one finds an episode, not
+a card to free again - and what lets `vhotseat why` answer "was that unload mine?" an hour later.
+
+It ends by itself: the card back `end_margin_mib` wider than the trigger, the app that grew gone, or
+the samples running out. Then a `cooldown_s` wait before another one, so an app that grabs and
+releases can't grind the models off the card over and over. What it unloaded stays unloaded: nothing
+loads it back on its own, only loading something or a typed `switch` is the order to refill the card.
+
+Two things it never does. It never treats the card's **shared** counters as a trigger: on Windows a
+workload that spilled into system RAM reports tens of GiB there - 50 GiB of it measured on Strata on
+this box - and shared memory is already off the card, so it is shown as evidence (the card-wide
+total, in every sample and on the dashboard's VRAM card) and never decides anything. And it is never a lockout: like every other policy here it can filter what gets released
+and refuse a load, never stop the card being freed.
+
+The numbers are sized from what this class of box actually does (docs/reference.md, "Pressure: an
+app vhotseat doesn't manage takes the card"): 512 MiB of free VRAM to be out of working room - under
+this box's ordinary bottom of 779 MiB, so "low" means something changed rather than that a model is
+loaded - 30 s of it (six samples), 2000 MiB of growth over the median floor (ten times the 173 MiB a
+desktop here jitters by), an episode ending only once free is back 2000 MiB wider than the trigger,
+and 600 s before another one starts. The readings, the open episode and the last closed one are on
+the dashboard's Pressure card and in `vhotseat status` / `why`.
 
 ## 4. Deadlocks
 

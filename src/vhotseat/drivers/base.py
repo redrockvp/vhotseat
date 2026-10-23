@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import socket
 from urllib.parse import urlsplit
 
-from .. import util
+from .. import policy, util
 from ..errors import ReleaseFailed, SwitchError
 
 
@@ -44,6 +44,14 @@ class Workload:
     admission: dict = field(default_factory=dict)
     # How it asks for the GPU: {"kind": "hook" | "plugin" | "hold", "timeout": s, …}.
     gate: dict = field(default_factory=dict)
+    # Which newcomers it will make room for (policy.py): workload names, "claims",
+    # "pressure", or ("*",) for anyone. ("*",) - the default when the config says nothing -
+    # is every handover, which is what vhotseat did before there was a policy; () means it
+    # keeps its model until someone types `vhotseat switch`.
+    yields_to: tuple[str, ...] = policy.DEFAULT_YIELDS_TO
+    # Among the workloads that may be unloaded for the same reason, the lowest priority
+    # is asked first. It is never a way to unload something that refused.
+    priority: int = policy.DEFAULT_PRIORITY
 
     # --- questions ---
 

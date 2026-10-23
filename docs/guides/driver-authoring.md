@@ -40,6 +40,8 @@ Shared by every driver (set from the config, not code):
 | `allow_restart` | `allow_restart` | the arbiter may restart it, when idle, if releasing isn't enough |
 | `admission` | `admission` | `min_available_ram_mib`, `min_free_vram_mib`, `by_model` |
 | `gate` | `gate` | `kind` and its settings (§4) |
+| `yields_to` | `yields_to` | which newcomers it will make room for: workload names, `claims`, `pressure` or `["*"]` for anyone (docs/reference.md) |
+| `priority` | `priority` | among the workloads that may be unloaded, lowest is asked first (0-100, default 50) |
 
 The one rule that matters: **release never interrupts running work.** If the
 server can't tell you it's working, it can't be released safely while it is;

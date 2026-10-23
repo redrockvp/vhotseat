@@ -76,6 +76,18 @@ workloads:
         qwen3.8-flash-next-iq3_xxs: {min_available_ram_mib: 46000}
         qwen3.8-flash-next-iq2_xs: {min_available_ram_mib: 40000}
     allow_restart: true
+    # priority: 50                 # 0-100, default 50. Among the workloads that may be
+    #                              # unloaded for the same reason, the lowest goes first.
+    # yields_to: ["*"]            # who may ask it to let go of its models: other
+    #                              # workloads' names, "claims" (a game, or anything else
+    #                              # that owns the card: see the claims section below),
+    #                              # "pressure" (the card running short under a process
+    #                              # vhotseat doesn't manage), or "*" for anyone - which
+    #                              # is also the default, and every handover there has
+    #                              # ever been. A newcomer that isn't listed is refused
+    #                              # rather than unloaded over, and the refusal is logged
+    #                              # and shown. A `switch` you type is an order and goes
+    #                              # through whatever this says.
 
   comfy:
     driver: comfyui    # built-in: /queue, /free, restart when /free isn't enough
@@ -164,3 +176,37 @@ power:
 #                                      # built-ins already skip Wallpaper Engine, SteamVR
 #                                      # and the Oculus runtime, which live under
 #                                      # steamapps\common\ but aren't somebody playing
+#                                      # A workload whose yields_to: doesn't list "claims"
+#                                      # isn't unloaded when one of these starts: it keeps
+#                                      # its model, the game is short of that much VRAM, and
+#                                      # `vhotseat claims` says so.
+#
+# pressure: what vhotseat does when an app it does NOT manage takes the card - a Blender
+# render, a CUDA script, a browser using the GPU for something big. It never named itself and
+# no claim rule covers it, so the release is the only way to answer. It releases idle workloads
+# and nothing else: it never refuses a load, and it never unloads a model you load afterwards.
+# On by default, slow to anger, and it needs a sampler running (`vhotseat watch` or `web`,
+# which `vhotseat autostart install` starts) because "has been short for 30 s" is read from the
+# samples. The defaults are measured on a 24 GiB 3090 with a 21394 MiB model loaded: the card
+# sits at 779-958 MiB free, and dwm/firefox/explorer/Discord/Orca hold 3096-3269 MiB between
+# them. A wrong firing costs unloading and reloading ~20 GB, so every number here is wide.
+# pressure:
+#   enabled: true                      # false: never release for an app vhotseat doesn't manage
+#   min_free_mib: 512                  # the card is out of working room below this. Below this
+#                                      # box's ordinary bottom (779), so "low" means something
+#                                      # changed rather than that a model is loaded
+#   sustain_s: 30                      # ...and stayed there: 6 samples at the 5 s interval, so a
+#                                      # single spike (a tab opening, a video seeking) is not it
+#   grow_mib: 2000                     # ...and the memory vhotseat doesn't manage is this far over
+#                                      # its usual floor (the median it recorded, not its worst).
+#                                      # Ten times the 173 MiB of jitter the desktop here produced
+#   headroom_mib: 1000                 # release enough to get back to min_free plus this, not to
+#                                      # the line that was tripped
+#   end_margin_mib: 2000               # the episode ends once free is back above min_free plus
+#                                      # this - wider than the trigger on purpose, so it cannot
+#                                      # restart itself the moment it stops
+#   cooldown_s: 600                    # no second episode this soon after the last one
+#   ignore: [vmware-vmx.exe, '*cudaball*']   # never growers: a VM, a benchmark, a miner. The card
+#                                      # is theirs for the taking; nothing of ours is unloaded for it
+#                                      # A workload whose yields_to: doesn't list "pressure" is not
+#                                      # a candidate whatever else the numbers say.
