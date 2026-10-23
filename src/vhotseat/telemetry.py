@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS logs (t REAL NOT NULL, source TEXT, pid INTEGER, mess
 CREATE INDEX IF NOT EXISTS logs_t ON logs (t);
 """
 TABLES = ("samples", "events", "logs")
+# How a read fails when the file is locked by another process or has gone: telemetry itself swallows
+# writes, so this is for whoever *asks* for a number, who decides what a missing one means. Reading
+# it is optional - a decision that falls over because the history is unreadable is a bug.
+READ_ERRORS = (sqlite3.Error, OSError)
 # The status keys that aren't a workload's.
 NOT_WORKLOADS = {"mode", "gpu", "ram", "holders", "claims", "claims_state", "last_event",
                  "policy", "pressure"}
@@ -145,7 +149,7 @@ class Telemetry:
                     self._last_prune = now
                     for table in TABLES:
                         db.execute(f"DELETE FROM {table} WHERE t < ?", (now - self.retention_s,))
-        except (sqlite3.Error, OSError):
+        except READ_ERRORS:
             pass
 
     def _read(self, sql: str, args: tuple) -> list:
@@ -177,7 +181,7 @@ class Telemetry:
         """Whether a sampler should take a sample now: no process wrote one for an interval."""
         try:
             last = self._read("SELECT max(t) FROM samples", ())[0][0] or 0
-        except (sqlite3.Error, OSError):
+        except READ_ERRORS:
             last = 0
         return time.time() - max(last, self._last_sample) >= self.interval_s * 0.8
 

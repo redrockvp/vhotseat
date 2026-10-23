@@ -12,6 +12,7 @@ The scene in these tests is a 24576 MiB card with Strata's 14000 MiB model loade
 
 import datetime
 import json
+import sqlite3
 import time
 
 from fakes import COMFY_MODEL_VRAM, STRATA_VRAM, FakeStrata
@@ -165,6 +166,31 @@ def test_without_samples_there_is_no_such_thing_as_growth(rig, monkeypatch):
     out = rig.arb.pressure_start()
     assert out["declined"].startswith("no samples to measure the growth against")
     assert rig.strata.loaded
+
+
+def test_a_telemetry_that_cant_be_read_is_no_samples_not_a_broken_gate(rig, monkeypatch):
+    """The samples are an optional feature, and every probe reads them: `status`, a switch and the
+    Strata gate all go through the pressure readings. A locked or corrupt telemetry.db raised out of
+    `floor_mib`, so one stuck database made `vhotseat status` traceback and refused to hand the card
+    over. The answer is "I have no usable samples", which is the same decline as no sampler running,
+    with the error named so the owner knows to fix the file."""
+    scene(rig, monkeypatch)
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    floor = rig.arb.telemetry.floor_mib
+    monkeypatch.setattr(rig.arb.telemetry, "floor_mib", locked)
+    assert rig.arb.pressure_start()["declined"] == (
+        "no usable samples: the telemetry couldn't be read (database is locked)")
+    why = rig.arb.probe()["pressure"]["why"]
+    assert why.startswith("no usable samples") and "database is locked" in why
+    assert rig.cli("switch", "comfy") == 0 and not rig.strata.loaded
+
+    # The other read from the same file, the one only reached once the floor came back.
+    monkeypatch.setattr(rig.arb.telemetry, "floor_mib", floor)
+    monkeypatch.setattr(rig.arb.telemetry, "below_free", locked)
+    assert "the telemetry couldn't be read" in rig.arb.pressure_readings()["why"]
 
 
 def test_the_readings_explain_which_condition_is_missing(rig, monkeypatch):
