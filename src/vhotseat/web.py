@@ -199,7 +199,11 @@ class Dashboard:
             price = self.arbiter.power.get("price_per_kwh")
             if not price:
                 return 404, {"error": "no power.price_per_kwh in the config"}
-            report = cost(self.telemetry.samples(since, until), price)
+            # The cadence this history was kept at, so an hour nobody sampled is a hole in the
+            # range rather than an hour the card drew its last reading for: `hours` then says what
+            # was sampled, which is what the page's "this is a floor" note is measured against.
+            report = cost(self.telemetry.samples(since, until), price,
+                          step_s=self.telemetry.interval_s)
             extra = {k: v for k, v in self.arbiter.power.items() if k != "price_per_kwh"}
             return 200, {"price": price, "window_s": until - since, **extra, **report}
         if path == "/api/history":

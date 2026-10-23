@@ -69,15 +69,21 @@ def cost(samples: list[dict], price_per_kwh: float, step_s: float | None = None)
 
     Each gap between two samples that both carry a wattage is integrated (their mean
     over that gap) and charged to whoever held the card at the start of it. What counts
-    as a hole is measured from the samples themselves - their median spacing, the pace
-    this window was actually sampled at - because a stretch with no samples is no data,
-    not a card that drew nothing; gaps over six steps are skipped. Pass `step_s` to
-    override that. What this counts is the card's own draw as the driver reports it:
+    as a hole is judged against the cadence the history is kept at - callers pass it as
+    `step_s`, because it is their own sampler's `interval_s` - falling back on the
+    samples' median spacing when nobody says, because a stretch with no samples is no
+    data, not a card that drew nothing; gaps over six steps are skipped. The median is
+    the fallback, not the rule: ask it of a window holding three samples an hour apart
+    and it answers "this history is kept hourly", and the outage becomes an hour of
+    watts. What this counts is the card's own draw as the driver reports it:
     the rest of the machine, and the PSU burning some of it on the way in, are not in
     the number - so treat it as a floor, not the line on your bill."""
     out: dict[str, dict] = {}
     total = 0.0
     gaps = sorted(g for g in (b["t"] - a["t"] for a, b in zip(samples, samples[1:])) if g > 0)
+    # Six steps of the cadence the history is kept at, whoever read it last saying what that is:
+    # the median spacing is the fallback, and on a window with three samples in it the fallback is
+    # the outage itself.
     limit = 6 * max(step_s or (gaps[len(gaps) // 2] if gaps else 1.0), 1.0)
     for a, b in zip(samples, samples[1:]):
         w1, w2, dt = a.get("gpu_power_w"), b.get("gpu_power_w"), b["t"] - a["t"]

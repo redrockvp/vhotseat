@@ -283,6 +283,45 @@ def test_web_serves_the_power_cost(rig, server):
     assert out["w_now"] == 250.0 and out["by_mode"]
 
 
+def test_an_hour_with_no_samples_in_it_is_not_an_hour_on_the_card():
+    """How big a hole counts as a hole was measured from the samples in the window, so a window with
+    a handful in it - a box that stopped sampling, a range that starts where the retention does -
+    said the history was kept an hour apart, and integrated the hour that wasn't there: the mean of
+    the two readings for sixty minutes of a card nobody was looking at. The cadence is in the config
+    as `telemetry.interval_s`, so it is what a gap gets judged against."""
+    samples = [{"t": 0, "mode": "strata", "gpu_power_w": 300},
+               {"t": 3600, "mode": "strata", "gpu_power_w": 300}]
+    invented = telemetry.cost(samples, 4.0)                   # no cadence: the samples' own spacing
+    assert invented["hours"] == 1.0 and invented["kwh"] == 0.3
+    honest = telemetry.cost(samples, 4.0, step_s=5)           # the 5 s the sampler records at
+    assert honest == {"kwh": 0.0, "cost": 0.0, "hours": 0.0, "w_now": 300, "by_mode": {}}
+
+
+def test_the_cost_answers_pass_the_cadence_the_history_is_kept_at(rig, server, monkeypatch):
+    """Both callers know what interval recorded the samples they just read, and neither said: the
+    dashboard's Power cost card and `vhotseat cost` each priced an outage as if the card had been
+    watched through it. Once the gap is a gap, `hours` is what was actually sampled, which is what
+    both of them already use to say "this is a floor, not the whole cost"."""
+    seen, real = [], telemetry.cost
+
+    def spy(samples, price, step_s=None):
+        seen.append(step_s)
+        return real(samples, price, step_s)
+
+    rig.gpu.health = lambda: {"power_w": 300.0}
+    rig.arb.power = {"price_per_kwh": 4.0}
+    rig.cli("status")
+    time.sleep(1.1)
+    rig.cli("status")
+    monkeypatch.setattr(telemetry, "cost", spy)                # `cost` is imported inside the CLI
+    monkeypatch.setattr(web, "cost", spy)                      # ... and at the top of web.py
+    assert rig.cli("cost", "--since", "1h", "--json") == 0
+    code, _ = get(server + "/api/cost?since=0&until=99999999999")
+    assert code == 200
+    cadence = rig.arb.telemetry.interval_s
+    assert seen == [cadence, cadence], "the CLI and the dashboard both said it"
+
+
 def test_a_backend_without_health_still_records(rig):
     rig.cli("status")
     s = rig.arb.telemetry.samples(0, time.time() + 1)[-1]
