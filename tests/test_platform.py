@@ -289,6 +289,24 @@ def test_autostart_systemd_user_unit(tmp_path, capsys):
     assert not unit.exists()
 
 
+def test_autostart_systemd_quotes_an_exe_path_with_a_space_in_it(tmp_path, capsys):
+    """The unit names whichever `vhotseat` is on PATH, or the one running now, and either can sit
+    under a directory with a space in it: a profile, a mounted volume, a home directory with a name
+    in it. systemd splits `ExecStart` on whitespace before it runs anything, so the unit was left
+    holding half a path plus a second word it knew nothing about: the install reported success, and
+    nothing was serving or sampling after the next logon."""
+    calls, run = _spy()
+    exe = "/home/peter m/My Apps/vhotseat"
+    assert autostart.install("web", exe=exe, at="systemd", run=run, units=tmp_path) == 0
+    assert f'ExecStart="{exe}" web' in (tmp_path / "vhotseat.service").read_text()
+    assert autostart.status(at="systemd", run=run, units=tmp_path) == 0
+
+    weird = '/home/peter/we"ird\\bin/vhotseat'
+    assert autostart.install("record", exe=weird, at="systemd", run=run, units=tmp_path) == 0
+    unit = (tmp_path / "vhotseat.service").read_text()
+    assert 'ExecStart="/home/peter/we\\"ird\\\\bin/vhotseat" record' in unit
+
+
 def test_autostart_status_says_when_nothing_is_registered(tmp_path, capsys):
     """`status` is a scriptable answer: exit 1 when nothing was installed."""
     calls, run = _spy()
