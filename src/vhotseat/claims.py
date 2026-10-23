@@ -143,12 +143,14 @@ def matching(rs: list[Rule], procs: dict[int, dict], exclude: set = frozenset(),
     workload's directory isn't guaranteed to sit outside a Games folder.
 
     `ignore` (see ignores()) holds names and path globs that the *built-in* rules won't claim.
+    Neither that nor the launchers below hold a rule from the config back: an owner's own rule
+    claims whatever it names, launcher or not.
     """
     ignore = ignores() if ignore is None else ignore
     hits = []
     for pid, p in procs.items():
         name, exe = p.get("name") or "", (p.get("exe") or "")
-        if not name or pid in exclude or _fold(name) in _LAUNCHERS:
+        if not name or pid in exclude:
             continue
         folded, folded_exe = _fold(name), _fold(exe)
         chain = None
@@ -165,9 +167,10 @@ def matching(rs: list[Rule], procs: dict[int, dict], exclude: set = frozenset(),
                 by = f"{name}, launched by {next(a for a in chain if fnmatch.fnmatch(_fold(a), _fold(r.parent)))}"
             else:
                 continue
-            if r.builtin and any(fnmatch.fnmatch(folded, pat) or (exe and fnmatch.fnmatch(folded_exe, pat))
-                                 for pat in ignore):
-                continue                # a built-in won't call a wallpaper renderer a game
+            if r.builtin and (folded in _LAUNCHERS or
+                              any(fnmatch.fnmatch(folded, pat) or
+                                  (exe and fnmatch.fnmatch(folded_exe, pat)) for pat in ignore)):
+                continue     # a built-in won't call a launcher, or a wallpaper renderer, a game
             hits.append({"pid": pid, "name": name, "exe": exe or None,
                          "note": r.note or "claimed", "by": by, "on_start": r.on_start})
             break                       # one rule per process: the first match explains it

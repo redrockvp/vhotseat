@@ -102,6 +102,19 @@ def test_launchers_never_claim_the_card_however_they_are_installed():
     assert claims.matching(builtin, p) == []
 
 
+def test_a_rule_of_your_own_can_still_claim_a_launcher():
+    r"""The built-ins won't call Steam a game, whatever directory it is installed under; a rule of
+    one's own is the owner saying it is - a big-picture box on the TV is the thing being used. The
+    launcher exclusion used to run before any rule was looked at, so `{name: steam.exe}` could never
+    match and the escape hatch the exclusion's own comment promises was decoration."""
+    mine = [{"name": "steam.exe", "note": "the Steam box on the TV"}]
+    steam = procs((1, 4, "steam.exe", r"D:\Games\Steam\bin\steam.exe"))
+    hits = claims.matching(claims.rules(mine), steam)          # built-ins first, then the owner's
+    assert [h["note"] for h in hits] == ["the Steam box on the TV"]
+    assert [h["note"] for h in claims.matching(rules(mine[0]), steam)] == ["the Steam box on the TV"]
+    assert claims.matching(claims.rules(), steam) == []        # and the built-ins still skip it
+
+
 def test_the_builtin_rules_recognise_the_common_installations():
     builtin = claims.rules() if sys.platform == "win32" else claims.rules()
     p = procs((1, 0, "game.exe", r"C:\Program Files (x86)\Steam\steamapps\common\Some Game\game.exe"),
