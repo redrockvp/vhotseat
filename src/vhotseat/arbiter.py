@@ -905,7 +905,9 @@ class Arbiter:
         The readings are taken twice: outside the lock, so a box that isn't short pays one card read
         per poll and no lock at all, and again inside it. The second reading is what makes two
         pollers safe - whichever takes the lock first writes the episode and frees the card, and the
-        other finds nothing left holding, writes nothing, and declines as `by_actor`.
+        other finds nothing left holding, writes nothing, and declines as `by_actor`. So is the
+        episode check: both can be told "nothing is open" in the same moment before either has
+        written a row, and the one that arrives second at the lock has to find the first one's.
 
         The episode row is written before anything is released, and it carries the workloads that
         were decided would pay for the room. Later polls act on that record and not on a fresh look
@@ -925,6 +927,12 @@ class Arbiter:
             return _declined(f"{got or 'a switch'} in progress",
                              by_actor=bool(got and got.startswith(self.PRESSURE_LOCK)))
         with got:
+            blocked = self.pressure_can_start()       # the log as whoever held the lock left it
+            if blocked:
+                # The other actor got its row down while this one was queueing for the lock. It is
+                # the one doing this release: say so quietly rather than write a second episode over
+                # the same memory and ask for the same workloads a second time.
+                return _declined(blocked, by_actor=self.events.episode_open() is not None)
             readings = self.pressure_readings(claimed)      # the card as whoever held the lock left it
             if readings.get("why"):
                 return _declined(readings["why"])

@@ -283,6 +283,31 @@ def test_a_card_being_short_doesn_t_walk_the_lock_when_nothing_is_owed(rig, monk
                                            "released": [], "waiting": [], "freed_mib": 0}
 
 
+def test_the_actor_that_takes_the_lock_second_writes_no_second_episode(rig, monkeypatch):
+    """`watch` and the dashboard each ask whether an episode may start, and both can be answered
+    "nothing is open" a moment before either has written one. Inside the GPU lock the readings are
+    re-read - the card is what the first actor left it - but the episode check was not, so the second
+    one wrote a second `pressure` row and started a second round of releases over the same
+    gigabytes. Here that first row lands between this actor's check and its own turn on the lock."""
+    scene(rig, monkeypatch)
+    real, wrote = rig.arb.lock.try_take, []
+
+    def take_after_the_other_actor_wrote(label):
+        if not wrote:                        # A got in first, in the moment between the two checks
+            wrote.append(1)
+            rig.arb.events.record("pressure", source="watch", name=GROWER, other_mib=9000,
+                                  floor_mib=1000, grew_mib=8000, free_mib=1176, min_free_mib=1500,
+                                  low_for_s=35, samples=8, need_mib=824, targets=["strata"],
+                                  candidates=["strata"])
+        return real(label)
+
+    monkeypatch.setattr(rig.arb.lock, "try_take", take_after_the_other_actor_wrote)
+    out = rig.arb.pressure_start()
+    assert out["declined"] == "a pressure episode is already open" and out["by_actor"] is True
+    assert len(rows(rig, "pressure")) == 1, "one episode in the log, whoever wrote it"
+    assert rig.strata.loaded, "the one that arrived second unloaded nothing"
+
+
 def test_a_model_the_owner_loads_during_an_episode_is_left_alone(rig, monkeypatch):
     """The workloads an episode is owed were chosen when it started, from what the card held then.
     A switch the owner types in the middle of it is an order, and the next poll does not take it
