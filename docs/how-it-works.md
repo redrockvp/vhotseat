@@ -428,10 +428,16 @@ ask its own workloads back, so the shortfall has to be memory it cannot.
 
 What it does is the release path it already had, in a burst. The workloads whose `yields_to:` covers
 `pressure`, lowest `priority:` first, until the readings are satisfied - API unload, then the card
-confirms the MiB went. **Nothing is closed and nothing is killed**, not even a workload that answers
-nothing at all: a stopped server costs a model reload, and that is cheaper than losing a render or a
-game in flight. A workload that is working is left alone, and tried again on every poll for as long
-as the episode lasts; a workload that says it unloaded and keeps its VRAM is asked three times in
+confirms the MiB went - and then only as many of them as were needed. A walk that stops when the
+room is covered says nothing about what the middle of it was worth: 1000 MiB in front of a 6000 MiB
+workload takes both for a 5000 MiB need, and once the big one has to go the small one pays for
+nothing. So the run gives back what the rest of it covers without, highest `priority:` first, which
+keeps the choice the owner's: where there is a real choice, the lowest priority is still what goes.
+It never gives back the last one in, because without it the run fell short. **Nothing is closed and
+nothing is killed**, not even a workload that answers nothing at all: a stopped server costs a model
+reload, and that is cheaper than losing a render or a game in flight. A workload that is working is
+left alone, and tried again on every poll for as long as the episode lasts; a workload that says it
+unloaded and keeps its VRAM is asked three times in
 total and then left, because that is an unload that doesn't work, not a busy moment.
 
 An episode is decided once and lives in the event log, not in a process's memory: `pressure` names

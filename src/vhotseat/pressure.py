@@ -120,7 +120,8 @@ def need_mib(free: int, min_free: int, headroom: int) -> int:
 
 
 def targets(candidates: list[tuple[str, int]], need: int) -> list[str]:
-    """The workloads to release: the shortest run down the list that pays for it.
+    """The workloads to release: the shortest run down the list that pays for it, minus whatever it
+    then turns out the run didn't need.
 
     `candidates` is [(workload, MiB it would give up)] already filtered - to the ones that yield to
     pressure, hold something, and aren't working - and already ordered lowest priority first. That
@@ -129,17 +130,30 @@ def targets(candidates: list[tuple[str, int]], need: int) -> list[str]:
     never asked for. A workload holding nothing is skipped - the app that grew is short of VRAM, not
     of the RAM a model with no card weights costs.
 
+    Then the run is pruned, because a run stops when it is covered and says nothing about what the
+    middle of it was worth: need 5000 with a 1000 MiB workload in front of a 6000 MiB one takes
+    both, and once the big one has to go the small one pays for nothing. So each member before the
+    last is offered up in turn, highest priority first, kept only if the rest still covers the
+    need. The last member is never offered: the run fell short without it by construction. The
+    lowest-priority members are offered last, so when there is a genuine choice it is still
+    `priority:` that decides who goes.
+
     It does not reorder to find one big release instead of two small ones. `priority:` says which
     workloads the owner would rather lose; swapping a cheap one for an expensive one to save a
-    release would be reopening a question they already answered.
+    release would be reopening a question they already answered. Pruning is the other half of the
+    same respect: it only ever takes workloads off the list, never puts a different one on.
     """
-    chosen, total = [], 0
+    run, total = [], 0
     for name, mib in candidates:
         if total >= need or mib <= 0:
             continue
-        chosen.append(name)
+        run.append((name, mib))
         total += mib
-    return chosen
+    for i in range(len(run) - 2, -1, -1):
+        if total - run[i][1] >= need:
+            total -= run[i][1]
+            del run[i]
+    return [name for name, _ in run]
 
 
 def describe(ep: dict) -> str:

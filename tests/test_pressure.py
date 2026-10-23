@@ -143,12 +143,31 @@ def test_the_release_set_stops_as_soon_as_the_need_is_paid_for():
 
 
 def test_the_owner_s_order_is_not_reordered_to_save_a_release():
-    """Two cheap workloads come before one expensive one because the config says so, even though
-    the expensive one alone would have covered the need. `priority:` answers which workload the
-    owner would rather lose; the trigger doesn't get to reopen that."""
+    """Two cheap workloads are asked together because the config says so, when between them they
+    cover the need, even though one expensive workload further down would have covered it on its
+    own. `priority:` answers which workload the owner would rather lose; the trigger doesn't get to
+    reopen that by skipping to the big one."""
     cand = [("comfy", 1000), ("unsloth", 1000), ("strata", 20000)]
     assert pressure.targets(cand, need=1500) == ["comfy", "unsloth"]
-    assert pressure.targets(cand, need=2500) == ["comfy", "unsloth", "strata"]
+    assert pressure.targets(cand, need=2500) == ["strata"]
+
+
+def test_a_workload_the_run_didn_t_need_is_not_released():
+    """The run stops when it is covered, which says nothing about what the middle of it was worth.
+    With 5000 needed and a 1000 MiB workload in front of a 6000 MiB one, taking both unloads two
+    servers to pay for one: once the big one has to go anyway, the small one buys nothing the
+    priority order was protecting, and it still costs the owner a reload.
+
+    What is left of the run is decided by the same order: need 6500 against 3000 + 3000 + 6000 takes
+    all three, and the prune gives up the 3000 that is higher in the priority order (b) rather than
+    the one the owner would rather lose (a). The last one in is never given up: without it the run
+    fell short by construction, so dropping the rest down to it would release less than was asked
+    for."""
+    assert pressure.targets([("unsloth", 1000), ("comfy", 6000)], need=5000) == ["comfy"]
+    cand = [("a", 3000), ("b", 3000), ("c", 6000)]
+    assert pressure.targets(cand, need=5000) == ["a", "b"]      # covered before c is reached
+    assert pressure.targets(cand, need=6500) == ["a", "c"]      # c pays for b, not for a
+    assert pressure.targets(cand, need=12000) == ["a", "b", "c"]
 
 
 def test_a_workload_holding_nothing_is_not_in_a_release_set():

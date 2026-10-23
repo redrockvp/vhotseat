@@ -456,9 +456,10 @@ was given.
 rules say what to do with it. A Blender render, a CUDA script, or a browser that decides to use the
 GPU for something large does not: no rule covers it, nobody asked for the card, and the card is
 short anyway. Pressure is how vhotseat notices that and answers with the only lever it has -
-releasing workloads that are idle. It needs a sampler running to say "has been short for 30 s", so
-it works when `vhotseat watch`, `vhotseat web` or `vhotseat record` is (which is what `vhotseat
-autostart install` starts); without samples, nothing fires.
+releasing workloads that are idle: the ones whose `yields_to:` covers `pressure`, lowest
+`priority:` first, and no more of them than pays for the room. It needs a sampler running to say
+"has been short for 30 s", so it works when `vhotseat watch`, `vhotseat web` or `vhotseat record`
+is (which is what `vhotseat autostart install` starts); without samples, nothing fires.
 
 ```yaml
 pressure:
