@@ -70,11 +70,35 @@ PDH_MORE_DATA = 0x800007D2
 PDH_FMT_LARGE = 0x400
 _INSTANCE = re.compile(r"pid_(\d+)_luid_")
 
+# The two per-process GPU memory counters as English counter paths: `PdhAddEnglishCounterW` finds
+# them whatever locale this machine's counter set is translated to.
+DEDICATED_USAGE = r"\GPU Process Memory(*)\Dedicated Usage"
+SHARED_USAGE = r"\GPU Process Memory(*)\Shared Usage"
+
+
+def _counter_by_pid(path: str) -> dict[int, int]:
+    """One PDH counter path, read as pid -> MiB, over a query of its own. Raises GpuError when the
+    counter isn't there or can't be read; whoever asked decides whether that matters."""
+    pdh = ctypes.WinDLL("pdh")
+    query = ctypes.c_void_p()
+    if pdh.PdhOpenQueryW(None, None, ctypes.byref(query)) != 0:
+        raise GpuError("PDH: can't open a query")
+    try:
+        counter = ctypes.c_void_p()
+        if (rc := pdh.PdhAddEnglishCounterW(query, path, None, ctypes.byref(counter))) != 0:
+            raise GpuError(f"PDH: no counter for {path} (0x{rc & 0xFFFFFFFF:08X})")
+        if (rc := pdh.PdhCollectQueryData(query)) != 0:
+            raise GpuError(f"PDH: collecting {path} failed (0x{rc & 0xFFFFFFFF:08X})")
+        return _sum_by_pid(pdh, counter)
+    finally:
+        pdh.PdhCloseQuery(query)
+
 
 def wddm_process_counters() -> tuple[dict[int, int], dict[int, int]]:
     """Windows: per pid, (dedicated VRAM MiB, shared GPU memory MiB), from the GPU performance
-    counters, summed over the process's adapters. Raises GpuError if they can't be read. Meant
-    for a single NVIDIA card: with several, a process's figure on each is added up.
+    counters, summed over the process's adapters. Raises GpuError if the dedicated one can't be
+    read; a shared counter that isn't there reads as {}. Meant for a single NVIDIA card: with
+    several, a process's figure on each is added up.
 
     The two counters answer different questions, and only one of them is the card. Dedicated is
     what actually sits on the 3090. Shared is system RAM set aside for the GPU when the card runs
@@ -82,27 +106,19 @@ def wddm_process_counters() -> tuple[dict[int, int], dict[int, int]]:
     grows it without the card being short of anything. vhotseat acts on dedicated and records
     shared as evidence: read the two as one number and a dozen new browser tabs would be reason
     to unload a 20 GB model.
+
+    They are read one counter per query for that reason: the second query costs milliseconds, and a
+    counter set some driver won't give up must not take the other with it. Losing shared loses one
+    number in a pressure row. Losing dedicated with it leaves every WDDM process with no VRAM at
+    all, which reads as a card made entirely of `other_mib`: nothing attributable, nothing
+    releasable.
     """
-    pdh = ctypes.WinDLL("pdh")
-    query = ctypes.c_void_p()
-    if pdh.PdhOpenQueryW(None, None, ctypes.byref(query)) != 0:
-        raise GpuError("PDH: can't open a query")
+    dedicated = _counter_by_pid(DEDICATED_USAGE)
     try:
-        counters = {}
-        for key, path in (("dedicated", r"\GPU Process Memory(*)\Dedicated Usage"),
-                          ("shared", r"\GPU Process Memory(*)\Shared Usage")):
-            counter = ctypes.c_void_p()
-            if (rc := pdh.PdhAddEnglishCounterW(query, path, None, ctypes.byref(counter))) != 0:
-                raise GpuError(f"PDH: no GPU Process Memory counters (0x{rc & 0xFFFFFFFF:08X})")
-            counters[key] = counter
-        if (rc := pdh.PdhCollectQueryData(query)) != 0:
-            raise GpuError(f"PDH: collecting failed (0x{rc & 0xFFFFFFFF:08X})")
-        out = {}
-        for key, counter in counters.items():
-            out[key] = _sum_by_pid(pdh, counter)
-        return out["dedicated"], out["shared"]
-    finally:
-        pdh.PdhCloseQuery(query)
+        shared = _counter_by_pid(SHARED_USAGE)
+    except GpuError:
+        shared = {}          # evidence we can't give, not a card we can't read
+    return dedicated, shared
 
 
 def _sum_by_pid(pdh, counter) -> dict[int, int]:

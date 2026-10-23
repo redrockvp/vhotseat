@@ -106,6 +106,30 @@ def test_the_two_gpu_memory_counters_never_become_one_number():
     assert reader.shared() == {1: 4000, 2: 0}
 
 
+def test_a_shared_counter_that_cant_be_read_keeps_the_dedicated_one(monkeypatch):
+    """Dedicated is what attribution is built on; shared is one extra number in a pressure row. The
+    two were added to one PDH query, so a driver or counter set that wouldn't give up `Shared Usage`
+    raised out of the whole read and took the dedicated figures with it: every process came back with
+    no VRAM, every workload read as unattributable, and `other_mib` swallowed the card over a figure
+    that only ever goes in the record."""
+    def read(path):
+        if path == gpu.SHARED_USAGE:
+            raise gpu.GpuError("PDH: no counter for Shared Usage (0xC0000BC6)")
+        return {1: 20000, 2: 999}
+
+    monkeypatch.setattr(gpu, "_counter_by_pid", read)
+    assert gpu.wddm_process_counters() == ({1: 20000, 2: 999}, {})
+    assert gpu.wddm_process_vram() == {1: 20000, 2: 999}
+    assert gpu.wddm_process_shared() == {}
+
+    def no_card(path):
+        raise gpu.GpuError("PDH: no counter for Dedicated Usage (0xC0000BC6)")
+
+    monkeypatch.setattr(gpu, "_counter_by_pid", no_card)
+    with pytest.raises(gpu.GpuError):
+        gpu.wddm_process_counters()          # the one that is the card still fails loudly
+
+
 def test_a_backend_with_no_shared_counter_says_so_without_a_fuss():
     """Linux's NVML reports no such figure, and a counter that can't be read is a missing number
     in a report, not a reason to fail whatever was being decided."""
