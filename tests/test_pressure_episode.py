@@ -12,6 +12,7 @@ The scene in these tests is a 24576 MiB card with Strata's 14000 MiB model loade
 
 import datetime
 import json
+import sqlite3
 import time
 
 from fakes import COMFY_MODEL_VRAM, STRATA_VRAM, FakeStrata
@@ -167,6 +168,31 @@ def test_without_samples_there_is_no_such_thing_as_growth(rig, monkeypatch):
     assert rig.strata.loaded
 
 
+def test_a_telemetry_that_cant_be_read_is_no_samples_not_a_broken_gate(rig, monkeypatch):
+    """The samples are an optional feature, and every probe reads them: `status`, a switch and the
+    Strata gate all go through the pressure readings. A locked or corrupt telemetry.db raised out of
+    `floor_mib`, so one stuck database made `vhotseat status` traceback and refused to hand the card
+    over. The answer is "I have no usable samples", which is the same decline as no sampler running,
+    with the error named so the owner knows to fix the file."""
+    scene(rig, monkeypatch)
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    floor = rig.arb.telemetry.floor_mib
+    monkeypatch.setattr(rig.arb.telemetry, "floor_mib", locked)
+    assert rig.arb.pressure_start()["declined"] == (
+        "no usable samples: the telemetry couldn't be read (database is locked)")
+    why = rig.arb.probe()["pressure"]["why"]
+    assert why.startswith("no usable samples") and "database is locked" in why
+    assert rig.cli("switch", "comfy") == 0 and not rig.strata.loaded
+
+    # The other read from the same file, the one only reached once the floor came back.
+    monkeypatch.setattr(rig.arb.telemetry, "floor_mib", floor)
+    monkeypatch.setattr(rig.arb.telemetry, "below_free", locked)
+    assert "the telemetry couldn't be read" in rig.arb.pressure_readings()["why"]
+
+
 def test_the_readings_explain_which_condition_is_missing(rig, monkeypatch):
     """`vhotseat why` and the dashboard quote these, so they have to say which of the three things
     isn't true rather than "no"."""
@@ -255,6 +281,31 @@ def test_a_card_being_short_doesn_t_walk_the_lock_when_nothing_is_owed(rig, monk
     ep = rig.arb.events.episode_open()
     assert rig.arb.pressure_release(ep) == {"declined": None, "by_actor": False, "would": [],
                                            "released": [], "waiting": [], "freed_mib": 0}
+
+
+def test_the_actor_that_takes_the_lock_second_writes_no_second_episode(rig, monkeypatch):
+    """`watch` and the dashboard each ask whether an episode may start, and both can be answered
+    "nothing is open" a moment before either has written one. Inside the GPU lock the readings are
+    re-read - the card is what the first actor left it - but the episode check was not, so the second
+    one wrote a second `pressure` row and started a second round of releases over the same
+    gigabytes. Here that first row lands between this actor's check and its own turn on the lock."""
+    scene(rig, monkeypatch)
+    real, wrote = rig.arb.lock.try_take, []
+
+    def take_after_the_other_actor_wrote(label):
+        if not wrote:                        # A got in first, in the moment between the two checks
+            wrote.append(1)
+            rig.arb.events.record("pressure", source="watch", name=GROWER, other_mib=9000,
+                                  floor_mib=1000, grew_mib=8000, free_mib=1176, min_free_mib=1500,
+                                  low_for_s=35, samples=8, need_mib=824, targets=["strata"],
+                                  candidates=["strata"])
+        return real(label)
+
+    monkeypatch.setattr(rig.arb.lock, "try_take", take_after_the_other_actor_wrote)
+    out = rig.arb.pressure_start()
+    assert out["declined"] == "a pressure episode is already open" and out["by_actor"] is True
+    assert len(rows(rig, "pressure")) == 1, "one episode in the log, whoever wrote it"
+    assert rig.strata.loaded, "the one that arrived second unloaded nothing"
 
 
 def test_a_model_the_owner_loads_during_an_episode_is_left_alone(rig, monkeypatch):

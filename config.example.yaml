@@ -156,7 +156,8 @@ power:
 # The built-in rules know the usual installations: Steam (anything under
 # steamapps\common), Epic Games, Riot Games, anything under a \Games\ folder, Roblox, and
 # a few named exes. Launchers (Steam, Epic, EA, Riot, Battle.net, Ubisoft) and their
-# helper processes never claim the card: they run all day. Add what's missing:
+# helper processes never claim the card by a built-in rule: they run all day. A rule of
+# your own can still name one. Add what's missing:
 #
 # claims:
 #   - path: '*\World of Warcraft\*'    # matched against the process's image path

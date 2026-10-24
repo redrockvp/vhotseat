@@ -223,7 +223,7 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
             return EXIT_USAGE
         tel = arbiter.telemetry
         now = time.time()
-        report = cost(tel.samples(now - span, now), price)
+        report = cost(tel.samples(now - span, now), price, step_s=tel.interval_s)
         if json_out:
             print(json.dumps({"window_s": span, "price": price, **arbiter.power, **report}))
             return EXIT_OK

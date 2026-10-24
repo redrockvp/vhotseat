@@ -29,7 +29,7 @@ from importlib import resources
 from urllib.parse import parse_qs, urlparse
 
 from . import policy, pressure, util
-from .telemetry import Sampler, cost
+from .telemetry import READ_ERRORS, Sampler, cost
 
 # Probing calls every workload's API; several open tabs share one probe a second.
 STATUS_TTL_S = 1.0
@@ -124,7 +124,10 @@ class Dashboard:
                 if self.telemetry is not None:
                     cached["retention_hours"] = self.telemetry.retention_s / 3600
                     cached["interval_s"] = self.telemetry.interval_s
-                    cached["oldest"] = self.telemetry.oldest()
+                    oldest, oldest_err = self._history_read("oldest")
+                    cached["oldest"] = oldest
+                else:
+                    oldest_err = None
                 watch_pass(self.arbiter, cached.get("claims", []))
                 if "claims_state" in cached:
                     # What has been unloaded for an open claim, and what is still holding. The
@@ -144,33 +147,58 @@ class Dashboard:
                     # The page says "try 2 of 3" for a workload whose unload doesn't take, so it
                     # needs the number the watcher is actually counting to, not one copied here.
                     cached["pressure"]["stuck_tries"] = STUCK_TRIES
-                peaks = self._peaks(cached["gpu"])
-                floor = self._floor(cached["gpu"])
+                peaks, peaks_err = self._peaks(cached["gpu"])
+                floor, floor_err = self._floor(cached["gpu"])
                 cached["peaks"] = peaks
                 cached["floor"] = floor
                 cached["fits"] = fits_on_card(peaks, floor, {n: w.idle_vram_mib
                                                              for n, w in self.arbiter.workloads.items()},
                                               cached["gpu"].get("total_mib"))
+                if unreadable := next((e for e in (oldest_err, peaks_err, floor_err) if e), None):
+                    # Three of the page's numbers come from the history rather than the card, and a
+                    # file that couldn't be opened looks exactly like a box with no samples in it yet:
+                    # no "history since" line, and a fit worked out from this second's reading alone.
+                    # Only one of the two is something the owner can fix, so the page says which.
+                    cached["history_error"] = unreadable
                 self._status = (time.monotonic(), cached)
             return cached
 
-    def _peaks(self, gpu: dict) -> dict:
+    def _history_read(self, method: str, *args) -> tuple:
+        """One number out of the telemetry, or (None, why it isn't there). The history is what the
+        page draws pictures from, never what the card is decided on: a database another process has
+        locked, or one that has gone corrupt, may cost the page its history line, but the live card,
+        the holders, the open claim and the pressure episode underneath it all still answer. That is
+        the same rule the arbiter applies to the pressure readings."""
+        if self.telemetry is None:
+            return None, None
+        try:
+            return getattr(self.telemetry, method)(*args), None
+        except READ_ERRORS as e:
+            return None, str(e) or type(e).__name__
+
+    def _peaks(self, gpu: dict) -> tuple[dict, str | None]:
         """The most VRAM each workload has been seen holding: what telemetry recorded over the
         retention window, floored by what the card shows right now - a 14 GB model sitting on the
-        card today has cost at least that much, whatever the sampled window happened to catch."""
-        recorded = self.telemetry.peaks(list(self.arbiter.workloads)) if self.telemetry else {}
+        card today has cost at least that much, whatever the sampled window happened to catch. When
+        nothing was recorded, the card's own reading is the whole answer, which is the fit at its
+        most optimistic: `history_error` is what says whether that is a fresh box or a file that
+        couldn't be read."""
+        recorded, err = self._history_read("peaks", list(self.arbiter.workloads))
+        recorded = recorded or {}
 
         def highest(*values):
             return max((v for v in values if v is not None), default=None)
 
-        return {n: highest(recorded.get(n), gpu.get(f"{n}_mib")) for n in self.arbiter.workloads}
+        return ({n: highest(recorded.get(n), gpu.get(f"{n}_mib")) for n in self.arbiter.workloads},
+                err)
 
-    def _floor(self, gpu: dict) -> int:
+    def _floor(self, gpu: dict) -> tuple[int, str | None]:
         """What the processes vhotseat doesn't manage usually hold on this card. The median over
-        the telemetry window; the current reading when there are no samples yet, which is the
-        best available the first time anything asks. Not the peak: see Telemetry.floor_mib()."""
-        recorded = self.telemetry.floor_mib() if self.telemetry else None
-        return recorded if recorded is not None else (gpu.get("other_mib") or 0)
+        the telemetry window; the current reading when there are no samples yet, or none can be
+        read, which is the best available the first time anything asks. Not the peak: see
+        Telemetry.floor_mib()."""
+        recorded, err = self._history_read("floor_mib")
+        return (recorded if recorded is not None else (gpu.get("other_mib") or 0)), err
 
     def why(self) -> dict:
         with self._why_lock:
@@ -199,7 +227,11 @@ class Dashboard:
             price = self.arbiter.power.get("price_per_kwh")
             if not price:
                 return 404, {"error": "no power.price_per_kwh in the config"}
-            report = cost(self.telemetry.samples(since, until), price)
+            # The cadence this history was kept at, so an hour nobody sampled is a hole in the
+            # range rather than an hour the card drew its last reading for: `hours` then says what
+            # was sampled, which is what the page's "this is a floor" note is measured against.
+            report = cost(self.telemetry.samples(since, until), price,
+                          step_s=self.telemetry.interval_s)
             extra = {k: v for k, v in self.arbiter.power.items() if k != "price_per_kwh"}
             return 200, {"price": price, "window_s": until - since, **extra, **report}
         if path == "/api/history":

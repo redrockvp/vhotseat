@@ -59,6 +59,18 @@ def launcher_path() -> Path:
     return state_dir() / f"{NAME}-autostart.vbs"
 
 
+def _exec_path(path: str) -> str:
+    """A path as systemd's `ExecStart` wants it. The line is split on whitespace before anything is
+    run - there is no shell behind a unit - so a `vhotseat` under a directory with a space in it
+    (a profile, a mounted volume, a home directory with somebody's name in it) leaves the unit
+    holding half a path and a second word systemd has never heard of: `install` says it worked and
+    nothing is up after the next logon. systemd takes double quotes, and inside them a backslash
+    escapes, so both have to be doubled up to survive as themselves."""
+    if path and not any(c.isspace() for c in path) and '"' not in path and "\\" not in path:
+        return path
+    return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def install(command: str = "web", exe: str | None = None, at: str | None = None,
             run=subprocess.run, units: Path | None = None, vbs: Path | None = None) -> int:
     """Register `vhotseat <command>` to run at logon, replacing any earlier one."""
@@ -82,7 +94,7 @@ def install(command: str = "web", exe: str | None = None, at: str | None = None,
     else:
         path = (units or unit_dir()) / f"{NAME}.service"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(UNIT.format(exe=exe, command=command), encoding="utf-8")
+        path.write_text(UNIT.format(exe=_exec_path(exe), command=command), encoding="utf-8")
         rc, out = _run(run, ["systemctl", "--user", "daemon-reload"])
         if rc == 0:
             rc, out = _run(run, ["systemctl", "--user", "enable", "--now", f"{NAME}.service"])

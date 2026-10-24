@@ -106,6 +106,30 @@ def test_the_two_gpu_memory_counters_never_become_one_number():
     assert reader.shared() == {1: 4000, 2: 0}
 
 
+def test_a_shared_counter_that_cant_be_read_keeps_the_dedicated_one(monkeypatch):
+    """Dedicated is what attribution is built on; shared is one extra number in a pressure row. The
+    two were added to one PDH query, so a driver or counter set that wouldn't give up `Shared Usage`
+    raised out of the whole read and took the dedicated figures with it: every process came back with
+    no VRAM, every workload read as unattributable, and `other_mib` swallowed the card over a figure
+    that only ever goes in the record."""
+    def read(path):
+        if path == gpu.SHARED_USAGE:
+            raise gpu.GpuError("PDH: no counter for Shared Usage (0xC0000BC6)")
+        return {1: 20000, 2: 999}
+
+    monkeypatch.setattr(gpu, "_counter_by_pid", read)
+    assert gpu.wddm_process_counters() == ({1: 20000, 2: 999}, {})
+    assert gpu.wddm_process_vram() == {1: 20000, 2: 999}
+    assert gpu.wddm_process_shared() == {}
+
+    def no_card(path):
+        raise gpu.GpuError("PDH: no counter for Dedicated Usage (0xC0000BC6)")
+
+    monkeypatch.setattr(gpu, "_counter_by_pid", no_card)
+    with pytest.raises(gpu.GpuError):
+        gpu.wddm_process_counters()          # the one that is the card still fails loudly
+
+
 def test_a_backend_with_no_shared_counter_says_so_without_a_fuss():
     """Linux's NVML reports no such figure, and a counter that can't be read is a missing number
     in a report, not a reason to fail whatever was being decided."""
@@ -263,6 +287,24 @@ def test_autostart_systemd_user_unit(tmp_path, capsys):
     assert autostart.status(at="systemd", run=run, units=tmp_path) == 0
     assert autostart.remove(at="systemd", run=run, units=tmp_path) == 0
     assert not unit.exists()
+
+
+def test_autostart_systemd_quotes_an_exe_path_with_a_space_in_it(tmp_path, capsys):
+    """The unit names whichever `vhotseat` is on PATH, or the one running now, and either can sit
+    under a directory with a space in it: a profile, a mounted volume, a home directory with a name
+    in it. systemd splits `ExecStart` on whitespace before it runs anything, so the unit was left
+    holding half a path plus a second word it knew nothing about: the install reported success, and
+    nothing was serving or sampling after the next logon."""
+    calls, run = _spy()
+    exe = "/home/peter m/My Apps/vhotseat"
+    assert autostart.install("web", exe=exe, at="systemd", run=run, units=tmp_path) == 0
+    assert f'ExecStart="{exe}" web' in (tmp_path / "vhotseat.service").read_text()
+    assert autostart.status(at="systemd", run=run, units=tmp_path) == 0
+
+    weird = '/home/peter/we"ird\\bin/vhotseat'
+    assert autostart.install("record", exe=weird, at="systemd", run=run, units=tmp_path) == 0
+    unit = (tmp_path / "vhotseat.service").read_text()
+    assert 'ExecStart="/home/peter/we\\"ird\\\\bin/vhotseat" record' in unit
 
 
 def test_autostart_status_says_when_nothing_is_registered(tmp_path, capsys):

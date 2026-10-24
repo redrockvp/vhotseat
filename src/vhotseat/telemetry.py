@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS logs (t REAL NOT NULL, source TEXT, pid INTEGER, mess
 CREATE INDEX IF NOT EXISTS logs_t ON logs (t);
 """
 TABLES = ("samples", "events", "logs")
+# How a read fails when the file is locked by another process or has gone: telemetry itself swallows
+# writes, so this is for whoever *asks* for a number, who decides what a missing one means. Reading
+# it is optional - a decision that falls over because the history is unreadable is a bug.
+READ_ERRORS = (sqlite3.Error, OSError)
 # The status keys that aren't a workload's.
 NOT_WORKLOADS = {"mode", "gpu", "ram", "holders", "claims", "claims_state", "last_event",
                  "policy", "pressure"}
@@ -65,15 +69,21 @@ def cost(samples: list[dict], price_per_kwh: float, step_s: float | None = None)
 
     Each gap between two samples that both carry a wattage is integrated (their mean
     over that gap) and charged to whoever held the card at the start of it. What counts
-    as a hole is measured from the samples themselves - their median spacing, the pace
-    this window was actually sampled at - because a stretch with no samples is no data,
-    not a card that drew nothing; gaps over six steps are skipped. Pass `step_s` to
-    override that. What this counts is the card's own draw as the driver reports it:
+    as a hole is judged against the cadence the history is kept at - callers pass it as
+    `step_s`, because it is their own sampler's `interval_s` - falling back on the
+    samples' median spacing when nobody says, because a stretch with no samples is no
+    data, not a card that drew nothing; gaps over six steps are skipped. The median is
+    the fallback, not the rule: ask it of a window holding three samples an hour apart
+    and it answers "this history is kept hourly", and the outage becomes an hour of
+    watts. What this counts is the card's own draw as the driver reports it:
     the rest of the machine, and the PSU burning some of it on the way in, are not in
     the number - so treat it as a floor, not the line on your bill."""
     out: dict[str, dict] = {}
     total = 0.0
     gaps = sorted(g for g in (b["t"] - a["t"] for a, b in zip(samples, samples[1:])) if g > 0)
+    # Six steps of the cadence the history is kept at, whoever read it last saying what that is:
+    # the median spacing is the fallback, and on a window with three samples in it the fallback is
+    # the outage itself.
     limit = 6 * max(step_s or (gaps[len(gaps) // 2] if gaps else 1.0), 1.0)
     for a, b in zip(samples, samples[1:]):
         w1, w2, dt = a.get("gpu_power_w"), b.get("gpu_power_w"), b["t"] - a["t"]
@@ -145,7 +155,7 @@ class Telemetry:
                     self._last_prune = now
                     for table in TABLES:
                         db.execute(f"DELETE FROM {table} WHERE t < ?", (now - self.retention_s,))
-        except (sqlite3.Error, OSError):
+        except READ_ERRORS:
             pass
 
     def _read(self, sql: str, args: tuple) -> list:
@@ -177,7 +187,7 @@ class Telemetry:
         """Whether a sampler should take a sample now: no process wrote one for an interval."""
         try:
             last = self._read("SELECT max(t) FROM samples", ())[0][0] or 0
-        except (sqlite3.Error, OSError):
+        except READ_ERRORS:
             last = 0
         return time.time() - max(last, self._last_sample) >= self.interval_s * 0.8
 

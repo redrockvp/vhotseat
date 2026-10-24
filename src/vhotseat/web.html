@@ -364,6 +364,9 @@ function renderHeader() {
   if (!s) return;
   const parts = [`updated ${fmtTime(s.now)}`];
   if (s.retention_hours != null) parts.push(`keeping ${s.retention_hours} h`);
+  // "no history yet" and "a telemetry.db I can't open" look the same on the page unless the
+  // status says which one it is: the tiles fall back to this second's card reading either way.
+  if (s.history_error) parts.push(`history couldn't be read: ${s.history_error}`);
   sub.textContent = parts.join(" · ");
   const ranges = $("ranges");
   ranges.replaceChildren();

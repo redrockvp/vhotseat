@@ -369,7 +369,8 @@ what was unloaded for it, and what is still holding.
 What counts as a claim is deliberately narrow, because a wrong rule is worse than no
 rule: the game process itself, by its directory or its exe name, and never the launcher.
 Steam, Epic, EA, Riot and Battle.net run all day, and their helpers live inside the same
-directories the game rules point at, so launchers and helpers are excluded by name. When
+directories the game rules point at, so the built-ins exclude them by name. A rule of your
+own can still name one - if a Steam box on the TV is what you are using, say so. When
 a title is missed, `vhotseat claims` shows what the rules can see, and one `path:` line
 adds it.
 

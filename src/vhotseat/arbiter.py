@@ -24,6 +24,7 @@ from .drivers.base import Workload
 from .errors import Busy, PolicyRefused, ReleaseFailed, SwitchError
 from .events import EventLog, row_time
 from .lock import GpuLock, Held
+from .telemetry import READ_ERRORS
 
 NONE = "none"
 
@@ -762,6 +763,18 @@ class Arbiter:
 
     PRESSURE_LOCK = "pressure release"     # the lock's label, and how a sister actor is spotted
 
+    def _sample_read(self, method: str, *args):
+        """One number from the telemetry, or (None, what went wrong). The samples are an optional
+        feature: a database another process has locked, or a file that has gone corrupt, is not a
+        reason for `status`, a switch or the Strata gate to fail. Whoever reads it decides what the
+        missing number means - for the pressure trigger it is "no usable samples", and it stops."""
+        if self.telemetry is None:
+            return None, None
+        try:
+            return getattr(self.telemetry, method)(*args), None
+        except READ_ERRORS as e:
+            return None, str(e) or type(e).__name__
+
     def pressure_readings(self, claimed=frozenset(), card: tuple | None = None) -> dict:
         """What the card, the samples and the config say about pressure, in one place so the trigger
         and the reports can't drift apart. It reads: it never takes the lock, releases nothing and
@@ -779,6 +792,10 @@ class Arbiter:
         `claimed` are the pids an open claim already covers: a game is phase 1's, already given the
         card by its rule, and counting its memory again would write a second episode over the same
         gigabytes.
+
+        A telemetry file that can't be read is the same answer as no samples in it, with the error
+        named: the history is optional, and every probe comes through here, so a locked database may
+        not take `status`, a switch and the gate down with it.
         """
         cfg = self.pressure_cfg
         out = {"enabled": cfg["enabled"], "min_free_mib": cfg["min_free_mib"], "grow_mib": cfg["grow_mib"],
@@ -801,7 +818,9 @@ class Arbiter:
             shared = getattr(self.gpu, "shared", lambda: {})()
             grower["shared_mib"] = (shared or {}).get(grower["pid"]) or 0
             out["grower"] = grower
-        floor = self.telemetry.floor_mib() if self.telemetry else None
+        floor, unreadable = self._sample_read("floor_mib")
+        if unreadable:
+            return {**out, "why": f"no usable samples: the telemetry couldn't be read ({unreadable})"}
         grew = pressure.grow_mib(rows, floor, ignore, claimed)
         out.update({"floor_mib": floor, "grew_mib": grew})
         if floor is None:
@@ -813,8 +832,10 @@ class Arbiter:
         if grew < cfg["grow_mib"]:
             return {**out, "why": f"the memory vhotseat doesn't manage is only {grew} MiB over its "
                                   f"usual {floor} MiB floor, needs {cfg['grow_mib']} MiB"}
-        low = (self.telemetry.below_free(cfg["min_free_mib"], max(2 * cfg["sustain_s"], 120))
-               if self.telemetry else None)
+        low, unreadable = self._sample_read("below_free", cfg["min_free_mib"],
+                                            max(2 * cfg["sustain_s"], 120))
+        if unreadable:
+            return {**out, "why": f"no usable samples: the telemetry couldn't be read ({unreadable})"}
         if not low:
             return {**out, "why": f"the card hasn't been under {cfg['min_free_mib']} MiB free for "
                                   f"long enough to tell"}
@@ -884,7 +905,9 @@ class Arbiter:
         The readings are taken twice: outside the lock, so a box that isn't short pays one card read
         per poll and no lock at all, and again inside it. The second reading is what makes two
         pollers safe - whichever takes the lock first writes the episode and frees the card, and the
-        other finds nothing left holding, writes nothing, and declines as `by_actor`.
+        other finds nothing left holding, writes nothing, and declines as `by_actor`. So is the
+        episode check: both can be told "nothing is open" in the same moment before either has
+        written a row, and the one that arrives second at the lock has to find the first one's.
 
         The episode row is written before anything is released, and it carries the workloads that
         were decided would pay for the room. Later polls act on that record and not on a fresh look
@@ -904,6 +927,12 @@ class Arbiter:
             return _declined(f"{got or 'a switch'} in progress",
                              by_actor=bool(got and got.startswith(self.PRESSURE_LOCK)))
         with got:
+            blocked = self.pressure_can_start()       # the log as whoever held the lock left it
+            if blocked:
+                # The other actor got its row down while this one was queueing for the lock. It is
+                # the one doing this release: say so quietly rather than write a second episode over
+                # the same memory and ask for the same workloads a second time.
+                return _declined(blocked, by_actor=self.events.episode_open() is not None)
             readings = self.pressure_readings(claimed)      # the card as whoever held the lock left it
             if readings.get("why"):
                 return _declined(readings["why"])

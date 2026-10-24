@@ -10,7 +10,7 @@ import urllib.request
 
 import pytest
 
-from fakes import COMFY_MODEL_VRAM, STRATA_VRAM
+from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, STRATA_VRAM
 from vhotseat import claims, config, host, telemetry, util, web
 from vhotseat.telemetry import Telemetry
 
@@ -283,6 +283,45 @@ def test_web_serves_the_power_cost(rig, server):
     assert out["w_now"] == 250.0 and out["by_mode"]
 
 
+def test_an_hour_with_no_samples_in_it_is_not_an_hour_on_the_card():
+    """How big a hole counts as a hole was measured from the samples in the window, so a window with
+    a handful in it - a box that stopped sampling, a range that starts where the retention does -
+    said the history was kept an hour apart, and integrated the hour that wasn't there: the mean of
+    the two readings for sixty minutes of a card nobody was looking at. The cadence is in the config
+    as `telemetry.interval_s`, so it is what a gap gets judged against."""
+    samples = [{"t": 0, "mode": "strata", "gpu_power_w": 300},
+               {"t": 3600, "mode": "strata", "gpu_power_w": 300}]
+    invented = telemetry.cost(samples, 4.0)                   # no cadence: the samples' own spacing
+    assert invented["hours"] == 1.0 and invented["kwh"] == 0.3
+    honest = telemetry.cost(samples, 4.0, step_s=5)           # the 5 s the sampler records at
+    assert honest == {"kwh": 0.0, "cost": 0.0, "hours": 0.0, "w_now": 300, "by_mode": {}}
+
+
+def test_the_cost_answers_pass_the_cadence_the_history_is_kept_at(rig, server, monkeypatch):
+    """Both callers know what interval recorded the samples they just read, and neither said: the
+    dashboard's Power cost card and `vhotseat cost` each priced an outage as if the card had been
+    watched through it. Once the gap is a gap, `hours` is what was actually sampled, which is what
+    both of them already use to say "this is a floor, not the whole cost"."""
+    seen, real = [], telemetry.cost
+
+    def spy(samples, price, step_s=None):
+        seen.append(step_s)
+        return real(samples, price, step_s)
+
+    rig.gpu.health = lambda: {"power_w": 300.0}
+    rig.arb.power = {"price_per_kwh": 4.0}
+    rig.cli("status")
+    time.sleep(1.1)
+    rig.cli("status")
+    monkeypatch.setattr(telemetry, "cost", spy)                # `cost` is imported inside the CLI
+    monkeypatch.setattr(web, "cost", spy)                      # ... and at the top of web.py
+    assert rig.cli("cost", "--since", "1h", "--json") == 0
+    code, _ = get(server + "/api/cost?since=0&until=99999999999")
+    assert code == 200
+    cadence = rig.arb.telemetry.interval_s
+    assert seen == [cadence, cadence], "the CLI and the dashboard both said it"
+
+
 def test_a_backend_without_health_still_records(rig):
     rig.cli("status")
     s = rig.arb.telemetry.samples(0, time.time() + 1)[-1]
@@ -359,6 +398,33 @@ def test_the_dashboard_shows_which_two_workloads_fit_on_the_card_together(rig, s
     assert out["floor"] == 0                        # the fakes' card has nothing else on it
     assert out["fits"] == [{"a": "strata", "b": "comfy", "mib": STRATA_VRAM + COMFY_MODEL_VRAM,
                             "fits": False, "why": None}]
+
+
+def test_a_telemetry_that_cant_be_read_costs_the_page_its_history_not_its_status(rig, server,
+                                                                                 monkeypatch):
+    """Every status poll asks the history for three numbers: how far back it goes, what the card
+    usually carries that nothing here can free, and what each workload has been seen holding. A
+    database another process has locked - or one that has gone corrupt - raised through all three,
+    /api/status answered 500, and the page went blank: the card in front of the owner, the holders,
+    the open claim and the pressure episode all unreadable, because a file the page only draws
+    pictures from could not be opened. It falls back the way the pressure readings do, and says which
+    of the two - no samples yet, or a file that can't be read - the blank history means."""
+    rig.gpu.other = 1200                             # memory nothing on this box can free
+    rig.strata.loaded = True
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    for read in ("oldest", "floor_mib", "peaks"):
+        monkeypatch.setattr(rig.arb.telemetry, read, locked)
+    code, body = get(server + "/api/status")
+    st = json.loads(body)
+    assert code == 200, st
+    assert st["mode"] == "strata"                    # the live answer is still the live answer
+    assert st["oldest"] is None and st["interval_s"] == 5
+    assert st["floor"] == 1200                       # the card as it reads now, as with no samples
+    assert st["peaks"] == {"strata": STRATA_VRAM, "comfy": COMFY_CONTEXT_VRAM}
+    assert "database is locked" in st["history_error"]
 
 
 def test_an_evening_of_gaming_doesnt_make_every_pair_read_no_room(tmp_path):
