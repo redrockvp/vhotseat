@@ -364,7 +364,7 @@ running process.
 | Route | Returns |
 |---|---|
 | `GET /api/policy` | what the grid needs: the workloads in the order a handover unloads them, the columns a pair can be asked for (each other workload, `claims`, `pressure`), each cell's choice (`yes` / `ask` / `keep`) with the sentence saying what it does and why, the `ask:` and `pressure:` numbers, and a `version` (sha256 of the config file) to send back with a save |
-| `POST /api/policy` | `{"version": "..."}` when the file now says what was posted. Body: `version` (required) and any of `priorities` (the unload order), `matrix` (`{workload: {requester: "yes"\|"ask"\|"keep"}}`), `ask`, `pressure` - a key left out is left alone. `409` with the version that's on disk when the file changed since it was read; `400` with what `doctor` would say, when the result wouldn't load |
+| `POST /api/policy` | `{"version": "..."}` when the file now says what was posted. Body: `version` (required) and any of `priorities` (the unload order), `matrix` (`{workload: {requester: "yes"\|"ask"\|"keep"}}`), `ask`, `pressure` - a key left out is left alone. `409` with the version that's on disk when the file changed since it was read (or without one, when another save is midway through the file and this one should simply try again); `400` with what `doctor` would say, when the result wouldn't load |
 
 The POST is guarded three ways, because a config is not a page-refresh: the
 `X-Vhotseat-Edit: 1` header, `Content-Type: application/json` - a page on another origin
@@ -378,7 +378,11 @@ result is checked by the same `config.parse` the CLI loads with before a byte is
 that goes back to its default is dropped, since an absent key says it - unless the owner left a
 note on that line, in which case the line stays, says the default, and keeps their note: the note is
 the reason for a decision that was changed, and deleting the key with it would lose something the
-owner wrote. The file that was there is kept beside it as `config.yaml.bak-<time>` (the newest ten).
+owner wrote. The file that was there is kept beside it as `config.yaml.bak-<time>` (the newest ten),
+and the save takes a turn on `config.yaml.lock` beside the config - the same operating-system lock
+the handover takes - so two pages, or a page and a dashboard in another process, can't both save
+from the same reading and quietly undo one another: whoever arrives second is refused and tries
+again. `vhotseat doctor` and `git diff` still make sense of the file afterwards.
 `vhotseat doctor` and `git diff` still make sense of the file afterwards.
 
 A save reaches the processes that are already running. `vhotseat web`, `vhotseat watch` and

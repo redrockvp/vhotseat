@@ -21,23 +21,35 @@ validator. What this module adds is the arithmetic that turns an editor's grid i
 per workload, and the care around the write.
 """
 
+import contextlib
 import hashlib
 import io
 import os
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedSeq
 
-from . import policy, pressure
+from . import policy, pressure, util
 from .config import ConfigError, _check, parse
+from .lock import try_lock, unlock
 
 # Backups kept beside the config file: enough that "what was my order before I started fiddling"
 # reaches back over a session of saving, few enough that a year of dashboards doesn't leave a
 # hundred copies of a 100-line file behind.
 BACKUP_KEEP = 10
+# A save reads the file, checks the version, copies the old one and replaces it. Two of those, in
+# two threads or two processes, can both pass the check and the later one then writes over what
+# the earlier one saved, with both answers saying it worked. So a save takes a turn on a lock file
+# beside the config - the same OS-level lock the handover takes - and waits only a short while:
+# the lock is held for one save, so a wait past this is a wedged process, and the owner is better
+# served by a refusal they can retry than by a page that hangs.
+LOCK_SUFFIX = ".lock"
+LOCK_WAIT_S = 5.0
+LOCK_POLL_S = 0.05
 # A key the edit removes rather than writes: what it would hold is the default, and an absent key
 # says the default without filling the file with lines that say nothing.
 DROP = object()
@@ -61,6 +73,12 @@ class Conflict(Exception):
     def __init__(self, message: str, version: str):
         super().__init__(message)
         self.version = version
+
+
+class Locked(Exception):
+    """Another process is saving this config and wouldn't let go inside `LOCK_WAIT_S`. Nothing was
+    written, and this one is worth trying again - unlike a `Conflict`, there's nothing to re-read:
+    the file is still the one the caller holds."""
 
 
 def read(path) -> tuple[str, str]:
@@ -203,6 +221,43 @@ def apply(text: str, edits: dict) -> str:
     return out
 
 
+@contextlib.contextmanager
+def _write_turn(path: Path):
+    """One save of the config at a time, across processes as well as threads.
+
+    A save is four steps with a gap in the middle - read the file, check the caller's version
+    against what's there, copy the old one, replace it. A second saver that reads inside that gap
+    passes the same check, writes over what the first one just saved, and is told it worked too:
+    the owner has two "saved" answers and a file holding one of the two decisions. `web` answers
+    each request on its own thread, and a second dashboard on the box is another process, so the
+    turn is taken with the operating system's lock on a file beside the config rather than a
+    `threading.Lock` this process can see.
+
+    It waits a short while rather than failing at once, because the other saver is a save and a
+    save is milliseconds. It gives up rather than waiting forever, because the other saver might be
+    wedged, and a refused save the owner can try again is better than a page that hangs. The lock
+    file stays where it is: removing a lock file is the race this is closing.
+    """
+    lock_path = path.with_name(path.name + LOCK_SUFFIX)
+    f = open(lock_path, "a+", encoding="utf-8")
+    try:
+        deadline = time.monotonic() + LOCK_WAIT_S
+        while not try_lock(f):
+            if time.monotonic() >= deadline:
+                raise Locked(f"{path}: something else is still saving it - nothing was written")
+            util.sleep(LOCK_POLL_S)
+    except BaseException:
+        # Not ours: close without touching the range, which belongs to whoever has it - on
+        # Windows, unlocking a range you don't hold is an error of its own.
+        f.close()
+        raise
+    try:
+        yield
+    finally:
+        unlock(f)
+        f.close()
+
+
 def save(path, version: str, *, priorities=None, matrix=None, ask=None, pressure=None) -> str:
     """Apply an editor's changes to the config file and return the new version.
 
@@ -211,24 +266,28 @@ def save(path, version: str, *, priorities=None, matrix=None, ask=None, pressure
     not paint over what they typed. The file being replaced is copied beside it first, newest ten
     kept.
 
-    Raises Conflict (carrying the version now on disk) or ConfigError (carrying the message
-    doctor prints).
+    Raises Conflict (carrying the version now on disk), Locked (someone else is mid-save and
+    wouldn't let go) or ConfigError (carrying the message doctor prints).
     """
     path = Path(path)
-    text, current = read(path)
-    if version != current:
-        raise Conflict(f"{path}: changed since you read it - nothing was written", current)
-    cfg = parse(text)
-    edits = policy_edits(cfg, priorities, matrix, ask, pressure)
-    try:
-        new_text = apply(text, edits)
-    except ConfigError as e:
-        # The line `doctor` prints for this file, and nothing written: the owner's own
-        # validation, at the moment they'd otherwise lose their config.
-        raise ConfigError(f"{path}: {e}") from None
-    if new_text != text:
-        _backup(path)
-        _write(path, new_text)
+    with _write_turn(path):
+        # Everything that decides what the file should hold happens inside the turn, the version
+        # check included: read it here, check it there, and the check is a photo of a file that
+        # has already moved.
+        text, current = read(path)
+        if version != current:
+            raise Conflict(f"{path}: changed since you read it - nothing was written", current)
+        cfg = parse(text)
+        edits = policy_edits(cfg, priorities, matrix, ask, pressure)
+        try:
+            new_text = apply(text, edits)
+        except ConfigError as e:
+            # The line `doctor` prints for this file, and nothing written: the owner's own
+            # validation, at the moment they'd otherwise lose their config.
+            raise ConfigError(f"{path}: {e}") from None
+        if new_text != text:
+            _backup(path)
+            _write(path, new_text)
     return version_of(new_text)
 
 

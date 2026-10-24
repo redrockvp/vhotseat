@@ -8,6 +8,8 @@ ships commented is the file the writer has to survive.
 """
 
 import shutil
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -292,6 +294,38 @@ def test_a_save_against_a_file_that_changed_under_it_writes_nothing(cfg_file):
     assert got.value.version == config_edit.version_of(hand_edited)
     assert "changed since you read it" in str(got.value)
     assert list(cfg_file.parent.glob("config.yaml.bak-*")) == []
+
+
+def test_two_saves_that_read_the_file_at_once_take_turns(cfg_file, monkeypatch):
+    """Two pages open, or one page and another process: both read the config at the same moment and
+    post a different answer. The version check passes for both, because neither has written yet - so
+    one of them writes over the other's answer and both are told it saved. Reading, checking and
+    replacing are one turn instead: the owner gets one saved and one "the file changed", and only
+    one of the two settings is in the file, because the other was refused before it wrote."""
+    _, version = config_edit.read(cfg_file)
+    slow = config_edit._backup
+    monkeypatch.setattr(config_edit, "_backup",
+                        lambda path: (slow(path), time.sleep(0.2)))
+    started, outcomes = threading.Barrier(2), {}
+
+    def save(who, **edits):
+        started.wait()
+        try:
+            outcomes[who] = config_edit.save(cfg_file, version, **edits)
+        except config_edit.Conflict:
+            outcomes[who] = "refused"
+
+    both = [threading.Thread(target=save, args=("ask",), kwargs={"ask": {"timeout_s": 300}}),
+            threading.Thread(target=save, args=("pressure",),
+                             kwargs={"pressure": {"grow_mib": 5000}})]
+    for t in both:
+        t.start()
+    for t in both:
+        t.join(timeout=30)
+    assert list(outcomes.values()).count("refused") == 1, outcomes
+    cfg = config.load(cfg_file)
+    saved = [k for k in ("ask", "pressure") if k in cfg]
+    assert saved == ["ask"] or saved == ["pressure"], saved
 
 
 def test_every_save_copies_the_file_it_replaced_and_keeps_the_newest_ten(cfg_file, tmp_path,

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from vhotseat import api, config, config_edit, policy, web
+from vhotseat import api, config, config_edit, lock as lockmod, policy, web
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -231,6 +231,28 @@ def test_a_save_the_config_validator_refuses_is_the_message_doctor_prints(served
     assert code == 400
     assert "ask.timeout_s: expected a number of seconds > 0" in body["error"]
     assert rig.arb.config_path.read_text(encoding="utf-8") == before
+
+
+def test_a_save_someone_else_is_midway_through_is_a_try_again(served, rig, monkeypatch):
+    """The other saver isn't always in this process: a second dashboard, or a save from another,
+    holds the turn on the config. The answer is 409 with a reason that says try again - and no write,
+    because the file is still the one the page holds and re-reading it would throw the owner's
+    answer away."""
+    monkeypatch.setattr(config_edit, "LOCK_WAIT_S", 0.2)
+    held = open(str(rig.arb.config_path) + config_edit.LOCK_SUFFIX, "a+", encoding="utf-8")
+    assert lockmod.try_lock(held)
+    before = rig.arb.config_path.read_bytes()
+    try:
+        version = get(served + "/api/policy")[1]["version"]
+        code, body = post(served + "/api/policy", {"version": version, "matrix": GRID})
+        assert code == 409 and "still saving" in body["error"]
+        assert "version" not in body              # nothing to re-read: their reading is still good
+        assert rig.arb.config_path.read_bytes() == before
+    finally:
+        lockmod.unlock(held)
+        held.close()
+    code, body = post(served + "/api/policy", {"version": version, "matrix": GRID})
+    assert code == 200                            # and the retry after it lets go gets through
 
 
 def test_a_dashboard_that_wasn_t_given_its_config_file_says_so(rig):

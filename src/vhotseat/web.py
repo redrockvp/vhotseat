@@ -286,6 +286,10 @@ class Dashboard:
                                        pressure=posted.get("pressure"))
         except config_edit.Conflict as e:
             return 409, {"error": str(e), "version": e.version}
+        except config_edit.Locked as e:
+            # Another save, in this process or another one. Nothing was written and the caller's
+            # reading is still good, so this is a try-again rather than a re-read.
+            return 409, {"error": str(e)}
         except ConfigError as e:
             return 400, {"error": str(e)}
         self.arbiter.reload_policy(force=True)
