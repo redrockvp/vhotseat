@@ -302,6 +302,19 @@ def test_asks_for_takes_the_same_names_as_yields_to_less_the_star(rig):
             config.validate(raw)
 
 
+def test_an_asks_for_left_empty_is_the_message_doctor_prints(rig):
+    """`asks_for:` written with nothing after it - or with `null` - is the mistake an owner makes
+    meaning to write the list. It has to be answered the way an empty `yields_to:` is answered: the
+    key named, what a list of them looks like. A present key that skips validation instead reaches
+    `tuple(None)` where the workloads are built, and then nothing reads the file: a fresh command
+    dies on a traceback, and a `watch` that has been up all day exits on the poll after the save."""
+    example = (ROOT / "config.example.yaml").read_text()
+    for written in ("asks_for:", "asks_for: null", "asks_for:   # I'll write it after lunch"):
+        text = example.replace("    allow_restart: true", f"    {written}", 1)
+        with pytest.raises(config.ConfigError, match="asks_for: expected a list"):
+            config.parse(text)
+
+
 def test_a_workload_isnt_named_in_both_lists(rig):
     """`yields_to: [comfy]` next to `asks_for: [comfy]` says it makes room for ComfyUI and
     that it waits for an answer first. One of the two has to be what it means, so the config

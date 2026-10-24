@@ -229,8 +229,8 @@ def validate(raw) -> dict:
                 _check(entry in known | set(policy.SPECIAL), f"{where}.yields_to[{i}]",
                        f"no workload named {entry!r} in this config; configured: "
                        f"{', '.join(sorted(known))} (plus claims, pressure and \"*\")")
-        asks = w.get("asks_for")
-        if asks is not None:
+        if "asks_for" in w:
+            asks = w["asks_for"]
             _check(isinstance(asks, list), f"{where}.asks_for",
                    'expected a list of workload names, or of "claims" and "pressure"')
             for i, entry in enumerate(asks):

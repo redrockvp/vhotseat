@@ -237,8 +237,8 @@ class Arbiter:
         return self.adopt_policy(text)
 
     def adopt_policy(self, text: str) -> str | None:
-        """Put the policy written in `text` in force, without reading anything. Returns why it isn't
-        a config, or None that it is.
+        """Put the policy written in `text` in force, without reading anything. Returns why this text
+        can't be used - a config error or anything else that went wrong - or None that it was.
 
         The dashboard calls this with the same text it took the version from. What the page is shown
         is the rules and, beside them, the version of the file they came from, and it sends that
@@ -249,9 +249,14 @@ class Arbiter:
         """
         try:
             cfg = cfgmod.parse(text)
-        except (cfgmod.ConfigError, UnicodeDecodeError) as e:
-            return self._config_error(f"{self.config_path}: {e}")
-        changed = self._swap_policy(cfg)
+            changed = self._swap_policy(cfg)
+        except Exception as e:  # noqa: BLE001 - a file we can't use isn't a reason to stop watching
+            # Whatever it is - the validator missing something, a value the swap can't use, a bug in
+            # the swap itself - it goes to the owner as `config_error` and the rules already in force
+            # carry on. This is called from `probe()` and from the watcher's pass: letting it out
+            # takes down the process that is looking after the card, which is the one thing a bad
+            # config must never buy.
+            return self._config_error(f"{self.config_path}: {type(e).__name__}: {e}")
         if self.config_error is not None:        # the file reads again: say so once, the same way
             util.log("policy: the config reads again" + (f" - {changed}" if changed else ""))
         self.config_error = None

@@ -357,6 +357,34 @@ def test_a_hand_edit_that_broke_the_config_keeps_the_old_rules_and_says_so(serve
     assert "no longer reads" not in capsys.readouterr().err
 
 
+def test_a_file_that_stopped_reading_is_told_about_not_thrown(served, rig):
+    """A config that has stopped being a config is the owner's problem to fix, not this process's
+    reason to stop: the watcher and the page have a card to look after with the rules that were in
+    force. A `TypeError` out of a reload is a `watch` that exits, and nobody unloading anything for
+    the rest of the day."""
+    write(rig, after="    allow_restart: true", lines=["    asks_for:"])
+    code, body, _ = get(served + "/api/status")
+    assert code == 200 and "asks_for" in body.get("config_error", ""), body
+    assert rig.arb.workloads["strata"].yields_to == ("*",)
+    web.watch(rig.arb, polls=1)              # the watcher survives the poll it disagrees with
+    assert rig.arb.config_error
+
+
+def test_a_reload_that_failed_for_a_reason_nobody_predicted_still_keeps_the_rules(served, rig,
+                                                                                 monkeypatch):
+    """The parser and the validator aren't the only place a reload can go wrong: a number read as
+    the wrong kind of thing, a key the swap can't use. Whatever it is, it belongs in `config_error`
+    beside the rules that are still running - a reload that lets it out takes the watcher with it."""
+    def choke(cfg):
+        raise ZeroDivisionError("the swap choked on something")
+    monkeypatch.setattr(rig.arb, "_swap_policy", choke)
+    write(rig, after="    allow_restart: true", lines=["    yields_to: [comfy]"])
+    code, body, _ = get(served + "/api/status")
+    assert code == 200 and "ZeroDivisionError" in body.get("config_error", ""), body
+    assert rig.arb.workloads["strata"].yields_to == ("*",)   # the rules it had, still in force
+    web.watch(rig.arb, polls=1)
+
+
 def test_the_old_rules_come_back_when_the_file_is_fixed(served, rig):
     """Fixing the file is a reload too: the error goes, and what's in force is what the file says
     now - in the watcher, which is the process that would otherwise unload the wrong thing."""
