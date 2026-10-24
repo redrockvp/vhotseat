@@ -79,6 +79,20 @@ def test_bad_yaml():
         config.parse("workloads: [")
 
 
+def test_a_config_that_isnt_utf8(tmp_path):
+    """`test_bad_yaml`'s neighbour one level down in the file: an editor that saved it as
+    Windows-1252 - where an en dash in a comment is one byte, and that byte isn't a UTF-8 sequence -
+    leaves a file that exists and isn't text. Every command reads the config through `load`, and a
+    decode error that isn't a ConfigError is a traceback where the owner should have been told which
+    file and what's wrong with it."""
+    path = tmp_path / "config.yaml"
+    raw = (ROOT / "config.example.yaml").read_bytes()
+    assert b"# priority" in raw
+    path.write_bytes(raw.replace(b"# priority", b"# \x96 priority", 1))
+    with pytest.raises(config.ConfigError, match="not utf-8 text"):
+        config.load(path)
+
+
 def test_state_moves_from_gpu_workload(tmp_path):
     old = tmp_path / "gpu-workload"
     old.mkdir()

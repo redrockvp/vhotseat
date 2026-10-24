@@ -339,6 +339,11 @@ def parse(text: str) -> dict:
 def load(path: Path) -> dict:
     try:
         return parse(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError:
+        # Bytes that aren't text: an editor that saved the file as Windows-1252, where an en dash in
+        # a comment is one byte that isn't a UTF-8 sequence. Named the way `config_edit` names it, so
+        # a command says which file and what's wrong with it instead of a traceback.
+        raise ConfigError(f"{path}: not utf-8 text") from None
     except OSError as e:
         raise ConfigError(f"{path}: {e.strerror}") from None
     except ConfigError as e:

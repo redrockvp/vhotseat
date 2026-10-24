@@ -383,16 +383,20 @@ and the save takes a turn on `config.yaml.lock` beside the config - the same ope
 the handover takes - so two pages, or a page and a dashboard in another process, can't both save
 from the same reading and quietly undo one another: whoever arrives second is refused and tries
 again. `vhotseat doctor` and `git diff` still make sense of the file afterwards.
-`vhotseat doctor` and `git diff` still make sense of the file afterwards.
 
 A save reaches the processes that are already running. `vhotseat web`, `vhotseat watch` and
 `vhotseat record` notice the file's mtime and size change - each samples through the same probe -
 and put the new policy, `pressure:` and `ask:` numbers in force; every gate, guard and `switch` is a
 fresh process that read the config as it started. Which workloads exist, how to reach them and what
 claims the card are not reloaded - that is a restart.
-If the file stops being a config, the rules already in force keep running and `/api/status` carries
+If the file stops being a config — a half-typed edit, or bytes that aren't utf-8 because an editor
+saved the file as Windows-1252 and turned a comment's en dash into a byte nothing here can decode —
+the rules already in force keep running and `/api/status` carries
 `config_error` saying so: a config that doesn't read is not a reason to unload anything, and a
-dashboard that quietly kept showing the old policy would be worse. `api.py`'s `Seat` - a proxy's
+dashboard that quietly kept showing the old policy would be worse. A command reading such a file
+says the same thing instead of a traceback, and neither `vhotseat watch` nor the dashboard's
+background check ends on one pass that raised: it logs the failure and carries on, because the
+watcher is the thing that releases the card for a game that asks. `api.py`'s `Seat` - a proxy's
 gate, opened once and asked before every request - reloads the same way, on each `acquire()`.
 
 ![The dashboard on an RTX 5070 Ti: Strata hands the GPU to ComfyUI at 01:04, and a render is running.](https://raw.githubusercontent.com/wandermyz/vhotseat/24999a8e62e3a6342e9af6c3bc70042e77765c60/web-dashboard/desktop.png)

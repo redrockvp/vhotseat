@@ -370,6 +370,22 @@ def test_a_file_that_stopped_reading_is_told_about_not_thrown(served, rig):
     assert rig.arb.config_error
 
 
+def test_a_file_that_isnt_utf8_is_an_error_about_the_file(served, rig):
+    """An editor that saved the config as Windows-1252 leaves a file that is there, is YAML, and is
+    not text we can read: an en dash in a comment is one byte there, and that byte is not a UTF-8
+    sequence. It belongs in `config_error`, named the way `config_edit` names it when the dashboard
+    tries to save over such a file. A reload that dies on the decode instead is the watcher ending:
+    the rules stay in force in every other process, but nothing is unloading for a game."""
+    write(rig, after="    driver: comfyui", lines=["    yields_to: [strata]"])
+    path = rig.arb.config_path
+    path.write_bytes(path.read_bytes().replace(b"# priority", b"# \x96 priority", 1))
+    code, body, _ = get(served + "/api/status")
+    assert code == 200 and "not utf-8 text" in body.get("config_error", ""), body
+    assert rig.arb.workloads["strata"].yields_to == ("*",)      # the rules it had, still
+    assert rig.arb.workloads["comfy"].yields_to == ("*",)
+    web.watch(rig.arb, polls=1)              # and the watcher is still a watcher afterwards
+    assert rig.arb.config_error
+
 def test_a_reload_that_failed_for_a_reason_nobody_predicted_still_keeps_the_rules(served, rig,
                                                                                  monkeypatch):
     """The parser and the validator aren't the only place a reload can go wrong: a number read as

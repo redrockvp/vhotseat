@@ -466,6 +466,11 @@ def watch(arbiter, polls: int | None = None) -> int:
 
     `polls` stops it after that many polls: what the tests use, and what a scheduled
     claim log can use instead of a resident process.
+
+    A pass that raises is logged and the loop carries on, the way the dashboard's background check
+    has always done it. On most boxes this is the only actor, and the one that releases the card for
+    a game that asks: a poll tripping over a driver, a log file that moved, or a process that
+    vanished mid-scan shouldn't end that for the rest of the day.
     """
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -479,7 +484,10 @@ def watch(arbiter, polls: int | None = None) -> int:
     with Sampler(arbiter) if arbiter.telemetry else contextlib.nullcontext():
         while polls is None or polls > 0:
             polls = None if polls is None else polls - 1
-            watch_pass(arbiter, arbiter.claim_hits())
+            try:
+                watch_pass(arbiter, arbiter.claim_hits())
+            except Exception as e:                              # a bad poll must not stop the watcher
+                util.log(f"check failed: {type(e).__name__}: {e}")
             if polls is not None and polls <= 0:
                 break
             stop.wait(claim_every)

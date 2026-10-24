@@ -228,6 +228,14 @@ class Arbiter:
             return self.config_error
         try:
             text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            # The file is there and it isn't text: an editor that saved it as Windows-1252 leaves an
+            # en dash as one byte, and that byte is not a UTF-8 sequence. It's a config error named
+            # the way `config_edit` names it when the dashboard tries to save over such a file, not a
+            # reason for the reload to die in the middle of the process that is looking after the
+            # card. Not recorded as seen either: a file caught mid-write by an editor that doesn't
+            # write atomically looks like this too, and the next poll should look again.
+            return self._config_error(f"{path}: not utf-8 text")
         except OSError as e:
             # Not recorded as seen: a file we couldn't read isn't a file we've handled. A moment
             # when someone else's atomic write has the file half-present is a moment to try again
