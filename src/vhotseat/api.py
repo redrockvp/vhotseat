@@ -107,6 +107,11 @@ class Seat:
         return self._switch(NONE, wait)
 
     def _switch(self, name: str, wait: float) -> list[str]:
+        # A Seat is opened once and used by every request that follows, so it is the one reader of
+        # the policy on this box that isn't a fresh process: an owner who saves the policy from the
+        # dashboard shouldn't have to restart their proxy for the gate to obey it. Until the file
+        # changes this is one `stat`, and a file that no longer reads keeps the rules that were.
+        self.arbiter.reload_policy()
         # A gate asking through the Seat API is a load nobody explicitly chose, so it is a
         # request and claims refuse it: a proxy must not put weights on the card under a game.
         # A typed `vhotseat switch` is an order, and goes through switch() without this flag.
@@ -123,4 +128,8 @@ class Seat:
 
 def open(config_path: str | os.PathLike | None = None) -> Seat:  # mirrors builtins.open on purpose
     path = Path(config_path) if config_path else cfgmod.default_path()
-    return Seat(build(cfgmod.load(path)))
+    # The path goes to the arbiter as well as the config: a Seat is held across many requests, so
+    # it is the one reader on this list that isn't a fresh process, and it needs to know which file
+    # its rules came from. `arbiter.reload_policy()` is what picks up a save; the gate's own
+    # decisions here are as of the last time it was called.
+    return Seat(build(cfgmod.load(path), config_path=path))

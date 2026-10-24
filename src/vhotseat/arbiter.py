@@ -18,8 +18,9 @@ import os
 import signal
 import subprocess
 import time
+from pathlib import Path
 
-from . import claims, host, policy, pressure, util
+from . import claims, config as cfgmod, host, policy, pressure, util
 from .drivers.base import Workload
 from .errors import Busy, PolicyRefused, ReleaseFailed, SwitchError
 from .events import EventLog, row_time
@@ -34,6 +35,13 @@ def _declined(why: str, by_actor: bool = False) -> dict:
     can read `released` without knowing which of four ways out was taken."""
     return {"declined": why, "by_actor": by_actor, "episode": None, "released": [],
             "waiting": [], "freed_mib": 0, "would": []}
+
+
+def _stamp(path: Path) -> tuple:
+    """What says the file is a different file: its length and its mtime to the nanosecond, so a
+    save inside the same second as the last look is still a change."""
+    st = path.stat()
+    return st.st_mtime_ns, st.st_size
 # Set in a hold's command's environment, so a nested switch to the held workload
 # is a no-op instead of waiting on the lock the hold owns.
 HOLD_ENV = "VHOTSEAT_HOLD"
@@ -44,7 +52,8 @@ class Arbiter:
                  gate_release_timeout_s: float = 20, release_timeout_s: float = 60,
                  machine_ram=host.machine_ram, telemetry=None, power: dict | None = None,
                  claim_rules: list | None = None, claim_ignore=(), claim_poll_s: float = 2.0,
-                 pressure_cfg: dict | None = None, ask_cfg: dict | None = None):
+                 pressure_cfg: dict | None = None, ask_cfg: dict | None = None,
+                 config_path=None):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
         self.lock = lock
@@ -76,6 +85,14 @@ class Arbiter:
         # waits or notifies yet, so no decision reads it; the dashboard shows it, and the
         # asking will be written against these numbers rather than its own.
         self.ask = policy.ask_cfg(ask_cfg)
+        # Where the config this was built from lives. A gate, a guard's `--request` and
+        # `Seat.acquire` read the config in the process that asks, so a save reaches them by
+        # itself; a `web` or a `watch` has been running since before it, and reloads from this
+        # path. None for an arbiter built from a dict by a library caller or a test: nothing to
+        # watch, and nothing to save back.
+        self.config_path = Path(config_path) if config_path else None
+        self._config_stamp: tuple | None = None
+        self.config_error: str | None = None
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
@@ -162,10 +179,10 @@ class Arbiter:
 
     def kept_why(self, reason: str, name: str, held_mib: int) -> str:
         """Why something stayed loaded, in the sentence the row and the banner show."""
-        return (f"{self.label(name)} holds {held_mib} MiB and "
-                f"{policy.why_not(self.workloads[name].yields_to, self.workloads[name].asks_for, reason, policy.PHRASE.get(reason, reason))}"
-                f": it keeps its model, and whatever "
-                f"asked for the card may be short of that")
+        w = self.workloads[name]
+        why = policy.why_not(w.yields_to, w.asks_for, reason, policy.PHRASE.get(reason, reason))
+        return (f"{self.label(name)} holds {held_mib} MiB and {why}: it keeps its model, and "
+                "whatever asked for the card may be short of that")
 
     def _policy_refused(self, source: str, requester: str, blockers: list[str], why: str) -> None:
         """One row for one refusal, so the dashboard can warn about it and `why` and
@@ -174,9 +191,97 @@ class Arbiter:
         self.events.record("policy-refused", source=source, requested=requester, ok=False,
                            workloads=blockers, why=why)
 
+    # --- picking up a saved policy -------------------------------------------------
+
+    def reload_policy(self, force: bool = False) -> str | None:
+        """Re-read the owner's config if the file has changed, and put the new rules in force.
+        Returns why the file isn't a config now, or None that it is.
+
+        Only the long-lived readers need this, and they all reach it the same way: `probe()` calls
+        it, so `record`, the dashboard and its sampler see the file as it is now; `watch_pass` calls
+        it before it acts on a claim or the pressure; and `Seat.acquire` (a proxy's gate, which is
+        not a new process) calls it before it switches. Every other command - a gate, the ComfyUI
+        guard's `--request`, a `switch` - is a new process that read the config as it started: for
+        them this is one `stat` on a file they parsed themselves a moment ago.
+
+        `web` and `watch` are where it matters: once the dashboard has saved a rule, the watcher on
+        the same box is the one that has to obey it, and waiting for a restart would leave the owner
+        looking at an editor that says one thing and a card that does another.
+
+        The check is cheap and the swap is safe: the whole file is parsed and validated before
+        anything is swapped, so a half-typed hand-edit changes nothing: the rules already running
+        keep running, and the caller is told (`/api/status`'s `config_error`, and one log line the
+        first time it notices, not one per poll).
+
+        What is re-read is the policy, the pressure numbers and the ask numbers. Which workloads
+        there are, how to reach them, and what claims the card are what a restart is for: those
+        build the objects and the probes rather than a number on them.
+        """
+        path = self.config_path
+        if path is None:
+            return None
+        try:
+            stamp = _stamp(path)
+        except OSError as e:
+            return self._config_error(f"{path}: {e.strerror or e}")
+        if stamp == self._config_stamp and not force:
+            return self.config_error
+        try:
+            cfg = cfgmod.parse(path.read_text(encoding="utf-8"))
+        except (cfgmod.ConfigError, UnicodeDecodeError) as e:
+            return self._config_error(f"{path}: {e}")
+        self._config_stamp = stamp
+        changed = self._swap_policy(cfg)
+        if self.config_error is not None:        # the file reads again: say so once, the same way
+            util.log("policy: the config reads again" + (f" - {changed}" if changed else ""))
+        self.config_error = None
+        if changed:
+            util.log("policy: " + changed)
+        return None
+
+    def _swap_policy(self, cfg: dict) -> str:
+        """The policy keys of a parsed config onto the live workloads. Returns what changed, in
+        the words `status` uses, because an owner who saves a rule and looks at `status` a second
+        later is checking the dashboard isn't showing them a stale answer."""
+        wls = cfg.get("workloads") or {}
+        notes = []
+        for name, w in self.workloads.items():
+            raw = wls.get(name)
+            if not isinstance(raw, dict):
+                continue          # a workload removed since this started: its rules stay
+            yields_to = (tuple(raw["yields_to"]) if "yields_to" in raw
+                         else policy.DEFAULT_YIELDS_TO)
+            asks_for = (tuple(raw["asks_for"]) if "asks_for" in raw
+                        else policy.DEFAULT_ASKS_FOR)
+            priority = raw.get("priority", policy.DEFAULT_PRIORITY)
+            if (w.yields_to, w.asks_for, w.priority) != (yields_to, asks_for, priority):
+                notes.append(f"{w.label} gives way for {policy.describe(yields_to, asks_for)}"
+                             f", priority {priority}")
+            w.yields_to, w.asks_for, w.priority = yields_to, asks_for, priority
+        self.pressure_cfg = pressure.cfg(cfg.get("pressure"))
+        self.ask = policy.ask_cfg(cfg.get("ask"))
+        return "; ".join(notes)
+
+    def _config_error(self, message: str | None) -> str | None:
+        """Remember what's wrong with the config, and say it once: a watcher that polls twice a
+        second would otherwise bury every other line it writes."""
+        if message and message != self.config_error:
+            util.log(f"the config file no longer reads: {message} - the rules it had before are "
+                     "still running")
+        self.config_error = message
+        return message
+
     # --- status --------------------------------------------------------------
 
     def probe(self) -> dict:
+        """What each workload is doing, the card's readings, and who owns it.
+
+        Also where a long-running process picks up a saved policy: `record`, the dashboard and its
+        sampler all sample through here. Until the file changes it costs one `stat`, and for a
+        command that read the config itself a moment ago it costs nothing - the stamp already
+        matches.
+        """
+        self.reload_policy()
         # One card read, every process in it: the pressure reading needs the app that grew, which
         # is not necessarily among the eight biggest holders, and the report has to be built from
         # the same numbers the trigger would act on.

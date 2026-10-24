@@ -82,7 +82,7 @@ def policy_edits(cfg: dict, priorities=None, matrix=None, ask=None, pressure_cfg
     """What to write, as config-key paths, from what an editor posted.
 
     `priorities` is the unload order, first gives way first; `matrix` is the grid, one row per
-    workload that can hold the card and one choice per column; `ask` and `block` are the two
+    workload that can hold the card and one choice per column; `ask` and `pressure` are the two
     top-level blocks. Each is skipped when it's None - a page that sends only the matrix must not
     reset the pressure numbers it was never shown.
 

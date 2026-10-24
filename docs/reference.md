@@ -50,7 +50,10 @@ server.
 
 **Config** is `~/.config/vhotseat/config.yaml`, or `$VHOTSEAT_CONFIG`. It's
 validated on load and every error names the key. A broken config makes every
-gate refuse rather than letting a load through unchecked.
+gate refuse rather than letting a load through unchecked. The dashboard's policy
+endpoints write pieces of it - the two policy keys, `ask:` and `pressure:` - in
+a way that leaves the rest of the file, comments included, exactly as it was
+(`config_edit.py`), and keep the previous file as `config.yaml.bak-<time>`.
 
 **State** is in `~/.local/state/vhotseat/` (`$XDG_STATE_HOME`): the lock
 (`switch.lock`, one per GPU) and the event log (`events.jsonl`, the last 500
@@ -337,7 +340,8 @@ One page, refreshed every 5 s, that works on a phone too:
 - **Who gives way for whom**: the policy as the config has it - each workload's priority,
   what it gives way for, what it holds on the card now and what the history has seen it
   holding at most - and for every pair of workloads a tile saying whether they fit on the
-  card at the same time. Read-only: the keys are still edited in `config.yaml`.
+  card at the same time. Read-only on the page for now; `GET`/`POST /api/policy` (below)
+  reads and writes the keys, and the page that edits them is the next part.
 - **Events / Logs**: every switch, hold and gate decision, and every line a
   vhotseat command logged, from any process (the guard's `switch comfy`,
   Strata's `gate strata`, your `hold`).
@@ -351,7 +355,38 @@ here too.
 Every chart marks each event with a dashed line: hover it to see the event,
 click it to open it in the table. Ranges run from 15 minutes to the whole
 retention window. A button in the header switches the theme (system, light or
-dark; kept in the browser). It only reads; it never switches anything.
+dark; kept in the browser). The page never switches or releases anything: the one
+write it makes is the policy, and that goes into `config.yaml`, not into a
+running process.
+
+### Reading and saving the policy
+
+| Route | Returns |
+|---|---|
+| `GET /api/policy` | what the grid needs: the workloads in the order a handover unloads them, the columns a pair can be asked for (each other workload, `claims`, `pressure`), each cell's choice (`yes` / `ask` / `keep`) with the sentence saying what it does and why, the `ask:` and `pressure:` numbers, and a `version` (sha256 of the config file) to send back with a save |
+| `POST /api/policy` | `{"version": "..."}` when the file now says what was posted. Body: `version` (required) and any of `priorities` (the unload order), `matrix` (`{workload: {requester: "yes"\|"ask"\|"keep"}}`), `ask`, `pressure` - a key left out is left alone. `409` with the version that's on disk when the file changed since it was read; `400` with what `doctor` would say, when the result wouldn't load |
+
+The POST is guarded three ways, because a config is not a page-refresh: the
+`X-Vhotseat-Edit: 1` header, `Content-Type: application/json` - a page on another origin
+can set neither from a form, and to set both from a script it needs a preflight this server
+never answers - and an `Origin` that is this dashboard's own port when an `Origin` is sent at
+all. No CORS header is ever sent, so nothing here is readable from another origin either.
+
+The file is rewritten a line at a time, only where a policy key lives: comments, key order,
+quoting style and CRLF survive a save, a key that wasn't touched isn't rewritten, and the whole
+result is checked by the same `config.parse` the CLI loads with before a byte is written. The file
+that was there is kept beside it as `config.yaml.bak-<time>` (the newest ten). `vhotseat doctor`
+and `git diff` still make sense of the file afterwards.
+
+A save reaches the processes that are already running. `vhotseat web`, `vhotseat watch` and
+`vhotseat record` notice the file's mtime and size change - each samples through the same probe -
+and put the new policy, `pressure:` and `ask:` numbers in force; every gate, guard and `switch` is a
+fresh process that read the config as it started. Which workloads exist, how to reach them and what
+claims the card are not reloaded - that is a restart.
+If the file stops being a config, the rules already in force keep running and `/api/status` carries
+`config_error` saying so: a config that doesn't read is not a reason to unload anything, and a
+dashboard that quietly kept showing the old policy would be worse. `api.py`'s `Seat` - a proxy's
+gate, opened once and asked before every request - reloads the same way, on each `acquire()`.
 
 ![The dashboard on an RTX 5070 Ti: Strata hands the GPU to ComfyUI at 01:04, and a render is running.](https://raw.githubusercontent.com/wandermyz/vhotseat/24999a8e62e3a6342e9af6c3bc70042e77765c60/web-dashboard/desktop.png)
 
