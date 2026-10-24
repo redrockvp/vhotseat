@@ -44,9 +44,11 @@ PRIORITY_MIN, PRIORITY_MAX = 0, 100
 
 def priorities_for(order) -> dict:
     """The unload order an owner dragged into shape, as the `priority:` numbers the config
-    holds: first gives way first.
+    holds. The arbiter asks the *lowest* priority to let go of its models first, so the first
+    workload of the order gets the lowest number - the same order `GET /api/policy` reports, so
+    an editor that reads the order and posts it back writes the same numbers it was shown.
 
-    The ends sit at 90 and 10 rather than 100 and 0 so that putting one workload above or below
+    The ends sit at 10 and 90 rather than 0 and 100 so that putting one workload above or below
     the rest later doesn't mean renumbering the file, and so that the middle of a three-workload
     order lands exactly on the default 50 - which the writer then leaves out of the file rather
     than writing a default out. Ties keep the config's own order, which is what `priority:`
@@ -54,7 +56,7 @@ def priorities_for(order) -> dict:
     n = len(order)
     if n <= 1:
         return {name: DEFAULT_PRIORITY for name in order}
-    return {name: round(90 - i * (80 / (n - 1))) for i, name in enumerate(order)}
+    return {name: round(10 + i * (80 / (n - 1))) for i, name in enumerate(order)}
 
 DEFAULT_YIELDS_TO = ("*",)
 # `asks_for:` has no `*`: "ask me before unloading me for anyone" is not a question anyone

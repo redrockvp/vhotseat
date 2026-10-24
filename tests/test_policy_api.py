@@ -83,6 +83,12 @@ def on_disk(rig) -> str:
     return config_edit.read(rig.arb.config_path)[1]
 
 
+def numbers_in(path) -> dict:
+    """What the file's `priority:` numbers are, per workload (None where it wrote none)."""
+    cfg, _ = read_policy(path)
+    return {n: (w or {}).get("priority") for n, w in cfg["workloads"].items()}
+
+
 # --- what the page is shown ----------------------------------------------------------
 
 
@@ -141,11 +147,32 @@ def test_saving_the_policy_writes_the_config_and_the_running_rules(served, rig):
     assert cfg["workloads"]["strata"]["asks_for"] == ["claims"]
     assert cfg["workloads"]["comfy"]["yields_to"] == ["strata"]
     assert cfg["workloads"]["comfy"]["asks_for"] == ["pressure"]
-    assert cfg["workloads"]["comfy"]["priority"] == 90
+    assert cfg["workloads"]["comfy"]["priority"] == 10
+    assert cfg["workloads"]["strata"]["priority"] == 90
     w = rig.arb.workloads
     assert policy.choice(w["strata"].yields_to, w["strata"].asks_for, "comfy") == "keep"
     assert policy.choice(w["strata"].yields_to, w["strata"].asks_for, "claims") == "ask"
-    assert w["comfy"].priority == 90
+    assert w["comfy"].priority == 10
+
+
+def test_reading_the_order_and_posting_it_back_writes_the_same_numbers(served, rig):
+    """The page reads the order - lowest priority first, because that is who the arbiter asks to
+    let go first - and sends it back as `priorities:`. So the direction has to match, and an order
+    that is only re-read and re-saved must not move anybody: an editor that inverted it on every
+    save would flip every pair in the file each time the page was opened, and the next handover
+    would unload the workload the owner had just put last."""
+    code, body = post(served + "/api/policy", {"version": get(served + "/api/policy")[1]["version"],
+                                               "priorities": ["comfy", "strata"]})
+    assert code == 200 and numbers_in(rig.arb.config_path) == {"strata": 90, "comfy": 10}
+    _, shown, _ = get(served + "/api/policy")
+    order = [w["workload"] for w in shown["order"]]
+    assert order == ["comfy", "strata"]            # the order it just wrote, lowest first
+    code, again = post(served + "/api/policy",
+                       {"version": shown["version"], "priorities": order})
+    assert code == 200
+    assert numbers_in(rig.arb.config_path) == {"strata": 90, "comfy": 10}
+    _, after, _ = get(served + "/api/policy")
+    assert after["order"] == shown["order"]
 
 
 def test_the_saved_grid_is_shown_back_on_the_next_read(served, rig):

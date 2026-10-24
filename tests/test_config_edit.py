@@ -110,7 +110,7 @@ def test_a_saved_policy_keeps_every_comment_and_the_key_order(cfg_file):
 
     # the three keys of one row in the order the docs list them, not the order the save happened
     # to be told about them
-    assert policy_lines(after)[:3] == ["priority: 10", "yields_to: [pressure]",
+    assert policy_lines(after)[:3] == ["priority: 90", "yields_to: [pressure]",
                                        "asks_for: [claims]"]
     strata, comfy, patches = at("strata:"), at("comfy:"), at("patches: []")
     assert strata < at("yields_to: [pressure]") < comfy
@@ -183,9 +183,9 @@ def test_a_note_at_the_end_of_a_policy_line_survives_the_value_it_describes(cfg_
     cfg_file.write_bytes(hand.encode("utf-8"))
     save(cfg_file, priorities=["comfy", "strata"])
     line = next(ln for ln in text_of(cfg_file).splitlines()
-                if ln.strip().startswith("priority: 10"))
-    assert line.startswith("    priority: 10") and line.endswith("# idle and cheap to reload")
-    assert config.load(cfg_file)["workloads"]["strata"]["priority"] == 10
+                if ln.strip().startswith("priority: 90"))
+    assert line.startswith("    priority: 90") and line.endswith("# idle and cheap to reload")
+    assert config.load(cfg_file)["workloads"]["strata"]["priority"] == 90
 
 
 def test_a_key_at_its_default_is_left_alone_when_its_note_would_go_with_it(cfg_file):
@@ -320,17 +320,18 @@ def test_the_written_lists_are_read_back_as_the_same_policy(cfg_file):
         for column in ("comfy", "strata", "claims", "pressure"):
             if column != name:
                 assert policy.choice(w.yields_to, w.asks_for, column) == grid[name][column]
-    assert workloads["strata"].priority == 90 and workloads["comfy"].priority == 10
+    assert workloads["strata"].priority == 10 and workloads["comfy"].priority == 90
     assert policy.ask_cfg(cfg.get("ask"))["timeout_s"] == 30
     assert cfg["pressure"]["grow_mib"] == 5000
 
 
 def test_the_order_an_editor_chooses_becomes_priorities_with_room_left():
-    """First gives way first, and the ends stop at 90 and 10: putting one workload above or below
-    the others later shouldn't mean renumbering the whole file, and a middle workload lands on the
-    default, which the writer leaves out."""
-    assert policy.priorities_for(["comfy", "strata"]) == {"comfy": 90, "strata": 10}
+    """First gives way first, and the arbiter asks the lowest priority first, so first is the
+    lowest number. The ends stop at 10 and 90: putting one workload above or below the others
+    later shouldn't mean renumbering the whole file, and a middle workload lands on the default,
+    which the writer leaves out."""
+    assert policy.priorities_for(["comfy", "strata"]) == {"comfy": 10, "strata": 90}
     three = policy.priorities_for(["comfy", "unsloth", "strata"])
-    assert three == {"comfy": 90, "unsloth": 50, "strata": 10}
+    assert three == {"comfy": 10, "unsloth": 50, "strata": 90}
     assert all(policy.PRIORITY_MIN <= v <= policy.PRIORITY_MAX
                for v in policy.priorities_for(list("abcdefgh")).values())
