@@ -363,7 +363,7 @@ running process.
 
 | Route | Returns |
 |---|---|
-| `GET /api/policy` | what the grid needs: the workloads in the order a handover unloads them, the columns a pair can be asked for (each other workload, `claims`, `pressure`), each cell's choice (`yes` / `ask` / `keep`) with the sentence saying what it does and why, the `ask:` and `pressure:` numbers, and a `version` (sha256 of the config file) to send back with a save |
+| `GET /api/policy` | what the grid needs: the workloads in the order a handover unloads them, the columns a pair can be asked for (each other workload, `claims`, `pressure`), each cell's choice (`yes` / `ask` / `keep`) with the sentence saying what it does and why, the `ask:` and `pressure:` numbers, and a `version` (sha256 of the config file) to send back with a save. Grid and version are read from the file in one go, and those rules are what this process then acts on: rules remembered from an older file beside a version read fresh is how a save would write someone's hand-edit away and report success. A file that stopped being a config keeps the rules that were in force and carries `config_error` in the answer |
 | `POST /api/policy` | `{"version": "..."}` when the file now says what was posted. Body: `version` (required) and any of `priorities` (the unload order), `matrix` (`{workload: {requester: "yes"\|"ask"\|"keep"}}`), `ask`, `pressure` - a key left out is left alone. `409` with the version that's on disk when the file changed since it was read (or without one, when another save is midway through the file and this one should simply try again); `400` with what `doctor` would say, when the result wouldn't load |
 
 The POST is guarded three ways, because a config is not a page-refresh: the

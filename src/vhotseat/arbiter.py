@@ -227,10 +227,30 @@ class Arbiter:
         if stamp == self._config_stamp and not force:
             return self.config_error
         try:
-            cfg = cfgmod.parse(path.read_text(encoding="utf-8"))
-        except (cfgmod.ConfigError, UnicodeDecodeError) as e:
-            return self._config_error(f"{path}: {e}")
+            text = path.read_text(encoding="utf-8")
+        except OSError as e:
+            # Not recorded as seen: a file we couldn't read isn't a file we've handled. A moment
+            # when someone else's atomic write has the file half-present is a moment to try again
+            # on the next poll, not a state to sit in until the mtime changes again.
+            return self._config_error(f"{path}: {e.strerror or e}")
         self._config_stamp = stamp
+        return self.adopt_policy(text)
+
+    def adopt_policy(self, text: str) -> str | None:
+        """Put the policy written in `text` in force, without reading anything. Returns why it isn't
+        a config, or None that it is.
+
+        The dashboard calls this with the same text it took the version from. What the page is shown
+        is the rules and, beside them, the version of the file they came from, and it sends that
+        version back when it saves: if the rules come from this process's memory and the version
+        from a fresh read of the file, the pair stops meaning anything the moment the file is edited
+        elsewhere. The page posts rules it never saw alongside a version that matches, the save goes
+        through, and the hand-edit is written over with no 409 to say anyone else had an opinion.
+        """
+        try:
+            cfg = cfgmod.parse(text)
+        except (cfgmod.ConfigError, UnicodeDecodeError) as e:
+            return self._config_error(f"{self.config_path}: {e}")
         changed = self._swap_policy(cfg)
         if self.config_error is not None:        # the file reads again: say so once, the same way
             util.log("policy: the config reads again" + (f" - {changed}" if changed else ""))

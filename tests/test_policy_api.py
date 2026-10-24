@@ -116,10 +116,13 @@ def test_the_dashboard_shows_the_grid_the_arbiter_acts_on(served, rig):
 
 def test_the_order_is_the_one_the_arbiter_would_unload_in(served, rig):
     """The page's list is the order a handover asks in, not the order the config happens to type
-    them: priorities decide, and a tie keeps the config's order."""
-    rig.arb.workloads["comfy"].priority = 10
+    them: priorities decide, and a tie keeps the config's order. The file says it, because the file
+    is what the page is reading and what the next handover will read."""
+    write(rig, after="    driver: comfyui", lines=["    priority: 10"])
     code, body, _ = get(served + "/api/policy")
     assert [w["workload"] for w in body["order"]] == ["comfy", "strata"]
+    assert body["order"][0]["priority"] == 10
+    assert rig.arb.workloads["comfy"].priority == 10
 
 
 def test_the_api_answers_the_page_and_nobody_else(served):
@@ -253,6 +256,27 @@ def test_a_save_someone_else_is_midway_through_is_a_try_again(served, rig, monke
         held.close()
     code, body = post(served + "/api/policy", {"version": version, "matrix": GRID})
     assert code == 200                            # and the retry after it lets go gets through
+
+
+def test_the_grid_and_the_version_come_from_one_reading_of_the_file(served, rig):
+    """The page is given the rules and the version of the file they came from, and it sends that
+    version back with a save. If the rules are whatever this process has been holding and the
+    version is a fresh read of the file, the two disagree the moment someone edits the file in
+    another window: the page posts its stale rules with a version that matches, the save goes
+    through, and the hand-edit is written over with no 409 to tell anyone a second opinion existed.
+    """
+    first = get(served + "/api/policy")[1]["version"]
+    edited = rig_config_text(rig).replace(
+        "    allow_restart: true",
+        "    allow_restart: true\n    yields_to: []   # this one holds its model for everyone",
+        1)
+    rig.arb.config_path.write_text(edited, encoding="utf-8", newline="")
+    code, body, _ = get(served + "/api/policy")
+    assert body["version"] == on_disk(rig) and body["version"] != first
+    assert body["matrix"]["strata"]["comfy"]["choice"] == "keep", "the grid is the old rules"
+    assert body["matrix"]["strata"]["claims"]["choice"] == "keep"
+    # and the process agrees with what it showed, rather than acting on rules it stopped having
+    assert rig.arb.workloads["strata"].yields_to == ()
 
 
 def test_a_dashboard_that_wasn_t_given_its_config_file_says_so(rig):

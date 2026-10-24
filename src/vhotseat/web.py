@@ -234,24 +234,29 @@ class Dashboard:
         The choices and the sentences come from `policy.py`, not from anything the page works out,
         so what a cell claims before saving is what the next handover will do. `version` is the
         config file's: the page sends it back with a save, because the file may not still say what
-        the page is showing - a hand-edit between reading and saving is refused rather than
-        painted over."""
+        the page is showing - a hand-edit between reading and saving is refused rather than painted
+        over. Both halves come from one reading of that file for that reason: the rules taken from
+        memory alongside a version read fresh is how a save writes a hand-edit away and calls it a
+        success, and what this process puts in force is the text it just showed.
+        """
+        path = self.arbiter.config_path
+        version, error = None, None
+        if path:
+            try:
+                text, version = config_edit.read(path)
+            except ConfigError as e:
+                # Hand-edited into something that doesn't read: the grid keeps showing the rules in
+                # force, and a save comes back with the reason. `/api/status` says the same thing.
+                error, version = str(e), None
+            else:
+                error = self.arbiter.adopt_policy(text)
         wls = self.arbiter.workloads
         where = {n: i for i, n in enumerate(wls)}   # the config's order, for a tie on priority
         rows = [(w.name, w.label, w.yields_to, w.asks_for) for w in wls.values()]
         requesters = [{"id": w.name, "label": w.label} for w in wls.values()]
         requesters += [{"id": cid, "label": label, "sub": sub}
                        for cid, label, sub in policy.SPECIAL_REQUESTERS]
-        path = self.arbiter.config_path
-        version = None
-        if path:
-            try:
-                _, version = config_edit.read(path)
-            except ConfigError:
-                # Hand-edited into something that doesn't read: the grid still shows the rules in
-                # force, and a save comes back with the reason. `/api/status` says the same thing.
-                version = None
-        return {"version": version, "path": str(path) if path else None,
+        grid = {"version": version, "path": str(path) if path else None,
                 "order": [{"workload": w.name, "label": w.label, "priority": w.priority}
                           for w in sorted(wls.values(),
                                           key=lambda w: (w.priority, where[w.name]))],
@@ -259,6 +264,9 @@ class Dashboard:
                 "matrix": policy.matrix(rows, [(r["id"], r["label"]) for r in requesters]),
                 "ask": dict(self.arbiter.ask),
                 "pressure": dict(self.arbiter.pressure_cfg)}
+        if error:
+            grid["config_error"] = error
+        return grid
 
     def save_policy(self, body: bytes) -> tuple[int, dict]:
         """Write a posted policy to the config file. 200 with the new version, 400 with the reason
