@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ruamel.yaml import YAML
-from ruamel.yaml.comments import CommentedSeq
+from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
 from . import policy, pressure, util
 from .config import ConfigError, _check, parse
@@ -409,6 +409,9 @@ class _Doc:
         self.lines = text.splitlines()
         self.data = _yaml().load(text)
         self.patches: list[tuple[int, int, list[str]]] = []
+        # A mapping written with braces is one physical line, so an edit inside it is recorded here
+        # and the whole mapping is written back once, after every edit of the save has been made.
+        self.flows: dict[int, list[str]] = {}
 
     def node(self, path: list[str]):
         out = self.data
@@ -423,6 +426,10 @@ class _Doc:
         block it belongs to."""
         parent, key = self.node(path[:-1]), path[-1]
         _check(isinstance(parent, dict), ".".join(path[:-1]) or "config", "expected a mapping")
+        owner_path = self._flow_owner(path)
+        if owner_path is not None:
+            self._edit_flow(parent, key, owner_path, value)
+            return
         where = _where(parent)
         if key in where:
             line, col = int(where[key][0]), int(where[key][1])
@@ -473,6 +480,64 @@ class _Doc:
         for k, v in values.items():
             self.set(path + [k], v)
 
+    def _edit_flow(self, parent, key, owner_path: list[str], value) -> None:
+        """One key of a mapping written on a single line: change the parsed mapping and leave the
+        line to `_render_flows`, rather than writing anything here. One save can change three keys
+        of the same `{...}`, and all three own the same line, so writing the line once - after every
+        edit has landed - is what keeps it from holding that mapping three times over."""
+        if value is DROP:
+            if key in parent:
+                del parent[key]
+        else:
+            parent[key] = _flow_value(value)
+        self.flows[id(self.node(owner_path))] = owner_path
+
+    def _flow_owner(self, path: list[str]) -> list[str] | None:
+        """The outermost flow-style mapping the key at `path` sits inside, as the path to it, or None
+        when the key is in a block mapping and owns a line of its own.
+
+        A key inside `{...}` shares its physical line with the key that opened the braces and with
+        every sibling on that line: writing `sustain_s: 90` over the line of
+        `pressure: {enabled: true, sustain_s: 60}` leaves a line with no `pressure:` on it, and the
+        sibling is gone with everything else that was sharing it. The *outermost* flow mapping,
+        because a flow mapping inside a flow mapping shares the outer one's line too: a workload
+        written `{strata: {driver: http, ...}}` has to be rewritten from `workloads:` down."""
+        owner = None
+        for depth in range(len(path) - 1, -1, -1):
+            if not _is_flow(self.node(path[:depth])):
+                break
+            owner = path[:depth]
+        return owner
+
+    def _render_flows(self) -> None:
+        """Every flow mapping an edit touched, written back as one value over the lines its key owns.
+        The note the owner left at the end of the line stays; when the dump already carries a comment
+        from inside the braces nothing is appended. A mapping the edit emptied goes with its key: an
+        empty `{}` beside a name says what not writing the block says, and leaving it would be the
+        same answer written in a way nobody chose."""
+        for owner_path in self.flows.values():
+            node = self.node(owner_path)
+            if owner_path:
+                holder = self.node(owner_path[:-1]) if len(owner_path) > 1 else self.data
+                pos = _where(holder).get(owner_path[-1])
+                if pos is None:
+                    continue
+                start, col, key = int(pos[0]), int(pos[1]), owner_path[-1]
+            else:
+                start, col, key = 0, 0, None
+            end = self.value_end(node, start, col)
+            original = self.lines[start]
+            note = _eol_comment(original)
+            if not node and not note:
+                self.patches.append((start, end + 1, []))
+                continue
+            body = _dump(node).splitlines()
+            lines = [f"{' ' * col}{key}: {body[0]}"] if key is not None else list(body)
+            lines += body[1:]
+            if note and not _eol_comment(lines[-1]):
+                lines[-1] = _with_note(lines[-1], original)
+            self.patches.append((start, end + 1, lines))
+
     def value_end(self, node, line: int, col: int) -> int:
         """The last line of the value whose key starts on `line` - whichever of the two ways of
         measuring it reaches further down: the indentation rule, and what the parsed value says its
@@ -497,6 +562,7 @@ class _Doc:
         return _extent(self.lines, int(own[0]), int(own[1])), int(own[1]) + 2
 
     def text(self) -> str:
+        self._render_flows()
         out = list(self.lines)
         # Two keys new to the same block land at the same spot: they go in the order they were
         # asked for (priority, then yields_to, then asks_for), not in the order the edits happen to
@@ -549,6 +615,28 @@ def _extent(lines: list[str], start: int, col: int) -> int:
 
 def _col(line: str) -> int:
     return len(line) - len(line.lstrip())
+
+
+def _is_flow(node) -> bool:
+    """Was this mapping written with braces? `{enabled: true, sustain_s: 60}` is one physical line:
+    its keys belong to that line rather than each owning a line of its own."""
+    flow = getattr(node, "fa", None)
+    return isinstance(node, dict) and flow is not None and bool(flow.flow_style())
+
+
+def _flow_value(value):
+    """A value going into a mapping that was written on one line. A list has to become a flow
+    sequence too, or the mapping that was one line comes back with a block list hanging under it -
+    which is the same breakage in miniature that putting a block key inside braces is."""
+    if isinstance(value, list):
+        seq = CommentedSeq(list(value))
+        seq.fa.set_flow_style()
+        return seq
+    if isinstance(value, dict):
+        mapping = CommentedMap(value)
+        mapping.fa.set_flow_style()
+        return mapping
+    return value
 
 
 def _node_end(node, fallback: int) -> int:
@@ -612,11 +700,20 @@ def _dump(value) -> str:
     return text[len("v: "):]
 
 
+def _with_note(line: str, original: str) -> str:
+    """Put the note that was at the end of the line being replaced back at the end of the new one: at
+    its own column while the new line doesn't reach it, one space past the value when it does,
+    because a comment that drifts under the wrong key is worse than one that isn't lined up."""
+    note = _eol_comment(original)
+    if not note:
+        return line
+    was = original.index(note)
+    return line + " " * (max(2, was - len(line)) if was > len(line) else 2) + note
+
+
 def _value_lines(key: str, value, col: int, original: str = "") -> list[str]:
     """The line(s) for `key` at column `col`. A note the owner left at the end of the line being
-    replaced stays: at its own column while the new value doesn't reach it, one space past the
-    value when it does, because a comment that drifts under the wrong key is worse than one that
-    isn't lined up."""
+    replaced stays: see `_with_note`."""
     if value is DROP:
         return []
     indent = " " * col
@@ -626,8 +723,4 @@ def _value_lines(key: str, value, col: int, original: str = "") -> list[str]:
             out += _value_lines(k, v, col + 2)
         return out
     line = f"{indent}{key}: {_dump(list(value) if isinstance(value, list) else value)}"
-    note = _eol_comment(original)
-    if note:
-        was = original.index(note)
-        line += " " * (max(2, was - len(line)) if was > len(line) else 2) + note
-    return [line]
+    return [_with_note(line, original)]

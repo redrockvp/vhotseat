@@ -11,12 +11,14 @@ import os
 import shutil
 import threading
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from vhotseat import config, config_edit, policy
+from vhotseat import pressure as pressure_mod
 from vhotseat.drivers.base import Context
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -472,6 +474,106 @@ def test_a_save_leaves_the_file_and_its_backup_as_private_as_the_file_was(cfg_fi
     assert backups
     for backup in backups:
         assert backup.stat().st_mode & 0o7777 == mode, f"{backup.name} is more open than the file"
+
+
+def code(text: str, prefix: str) -> list[str]:
+    """The config lines that begin with `prefix`, unstripped: an inline mapping has to still be one
+    line, with its heading and its siblings on it."""
+    return [ln for ln in text.splitlines() if ln.startswith(prefix)]
+
+
+def changed(before: str, after: str) -> list[tuple[str, str]]:
+    """(old, new) for every line that differs, position by position: what a save touched. Pairing
+    them by position is what proves every other line is byte for byte what it was."""
+    return [(a, b) for a, b in zip(before.splitlines(), after.splitlines()) if a != b]
+
+
+def test_a_key_inside_an_inline_block_is_edited_in_the_line_it_shares(cfg_file):
+    """`pressure: {enabled: true, sustain_s: 60}` is one physical line, and every key inside it
+    shares that line instead of owning one of its own. Editing `sustain_s` the block way wrote
+    `sustain_s: 90` across the whole line: the `pressure:` heading and its sibling went with it and
+    the file stopped reading, so an owner who writes their config the compact way can't save any of
+    it from the page."""
+    hand = insert_after_line(text_of(EXAMPLE), "patches: []",
+                             ["pressure: {enabled: true, sustain_s: 60}",
+                              "ask: {timeout_s: 20, fallback: keep}   # how long I wait for an"
+                              " answer"], 1)
+    cfg_file.write_bytes(hand.encode("utf-8"))
+    assert config.parse(text_of(cfg_file))["pressure"] == {"enabled": True, "sustain_s": 60}
+
+    before = text_of(cfg_file)
+    save(cfg_file, pressure={"sustain_s": 90, "headroom_mib": 1500})    # one changed, one new
+    after = text_of(cfg_file)
+    assert config.parse(after)["pressure"] == {"enabled": True, "sustain_s": 90,
+                                               "headroom_mib": 1500}
+    assert len(after.splitlines()) == len(before.splitlines())
+    assert len(changed(before, after)) == 1, changed(before, after)
+    assert code(after, "pressure:") == ["pressure: {enabled: true, sustain_s: 90,"
+                                        " headroom_mib: 1500}"]
+
+    before = text_of(cfg_file)
+    save(cfg_file, pressure={"sustain_s": pressure_mod.DEFAULTS["sustain_s"]})   # back to default
+    after = text_of(cfg_file)
+    assert config.parse(after)["pressure"] == {"enabled": True, "headroom_mib": 1500}
+    assert len(changed(before, after)) == 1, changed(before, after)
+
+    before = text_of(cfg_file)
+    save(cfg_file, ask={"timeout_s": 45})
+    after = text_of(cfg_file)
+    assert config.parse(after)["ask"] == {"timeout_s": 45, "fallback": "keep"}
+    assert len(changed(before, after)) == 1, changed(before, after)
+    assert "# how long I wait for an" in code(after, "ask:")[0], "the note at the end went away"
+
+    before = text_of(cfg_file)
+    save(cfg_file, pressure=dict(pressure_mod.DEFAULTS))    # the block at defaults: the block goes
+    after = text_of(cfg_file)
+    assert config.parse(after).get("pressure") is None
+    assert code(after, "pressure:") == []
+    assert code(before, "ask:") == code(after, "ask:")      # the ask line was never the edit's
+
+
+def unchanged_apart_from(before: str, after: str, *starts: str) -> list[str]:
+    """The lines that differ once every line whose stripped form begins with one of `starts` is set
+    aside. Empty means the save left everything else in the file byte for byte as it was, and in the
+    same number of copies - which a line-by-line pairing can't say when the save also added a line."""
+    keep = lambda text: Counter(ln for ln in text.splitlines()
+                                if not ln.strip().startswith(starts))
+    diff = (keep(before) - keep(after)) + (keep(after) - keep(before))
+    return sorted(diff.elements())
+
+
+def test_a_key_of_a_workload_written_on_one_line_keeps_the_rest_of_it(cfg_file):
+    """A workload written as `strata: {driver: http, url: ..., priority: 40, yields_to: [comfy]}` -
+    one line, with a nested flow mapping and a flow list inside it - is how a short config looks
+    when someone prefers it that way, and its `priority` doesn't own a line either: writing that key
+    block-style over the line took the workload's name, its driver and its url out of the file."""
+    example = text_of(EXAMPLE)
+    nl = "\r\n" if "\r\n" in example else "\n"
+    lines = example.splitlines(keepends=True)
+    start = next(i for i, ln in enumerate(lines) if ln.rstrip("\r\n") == "  strata:")
+    stop = next(i for i, ln in enumerate(lines) if ln.rstrip("\r\n") == "  comfy:")
+    inline = ("  strata: {driver: http, url: http://127.0.0.1:2335, vram: {process: strata.exe}, "
+              "priority: 40, yields_to: [comfy], asks_for: [claims], "
+              "resident: {get: /health, path: loaded}, release: {post: /unload, always: true}, "
+              "gate: {kind: hook, config: ~/Strata/strata.json, timeout: 90}}")
+    cfg_file.write_bytes("".join(lines[:start] + [inline + nl] + lines[stop:]).encode("utf-8"))
+    cfg = config.parse(text_of(cfg_file))["workloads"]["strata"]
+    assert cfg["priority"] == 40 and cfg["yields_to"] == ["comfy"] and cfg["vram"]["process"]
+
+    before = text_of(cfg_file)
+    save(cfg_file, priorities=["comfy", "strata"],
+         matrix={"strata": STRATA_KEEPS_COMFY_ASKS_CLAIMS, "comfy": COMFY_ASKS_PRESSURE})
+    after = text_of(cfg_file)
+    written = code(after, "  strata:")
+    assert len(written) == 1, after
+    assert written[0].startswith("  strata: {driver: http, url: http://127.0.0.1:2335, "
+                                 "vram: {process: strata.exe}, "), written[0]
+    cfg = config.parse(after)["workloads"]["strata"]
+    assert cfg["priority"] == 90 and cfg["yields_to"] == ["pressure"]
+    assert cfg["asks_for"] == ["claims"]
+    # nothing but that line, and the policy keys comfy gained in its own block
+    assert unchanged_apart_from(before, after, "strata:", "priority:", "yields_to:",
+                                  "asks_for:") == []
 
 
 def test_the_written_lists_are_read_back_as_the_same_policy(cfg_file):

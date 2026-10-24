@@ -378,8 +378,14 @@ result is checked by the same `config.parse` the CLI loads with before a byte is
 that goes back to its default is dropped, since an absent key says it - unless the owner left a
 note on that line, in which case the line stays, says the default, and keeps their note: the note is
 the reason for a decision that was changed, and deleting the key with it would lose something the
-owner wrote. The file that was there is kept beside it as `config.yaml.bak-<time>` (the newest ten),
-and the save takes a turn on `config.yaml.lock` beside the config - the same operating-system lock
+owner wrote. A policy key inside a mapping written on one line - `pressure: {enabled: true,
+sustain_s: 60}`, or a workload written `{driver: http, ...}` - is rewritten as that same line: the
+mapping comes back with the change in it, and its heading, its siblings and the note at the end of
+the line stay on it. The file that was there is kept beside it as `config.yaml.bak-<time>` (the
+newest ten) with the permissions the config itself has - that backup holds the same `headers:` key
+if the config does - and the replacement file takes those bits too, so a save neither opens up a
+private config nor quietly shuts one. The
+save takes a turn on `config.yaml.lock` beside the config - the same operating-system lock
 the handover takes - so two pages, or a page and a dashboard in another process, can't both save
 from the same reading and quietly undo one another: whoever arrives second is refused and tries
 again. `vhotseat doctor` and `git diff` still make sense of the file afterwards.
