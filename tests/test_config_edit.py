@@ -228,6 +228,72 @@ def test_a_key_at_its_default_is_left_alone_when_its_note_would_go_with_it(cfg_f
     assert any("long enough to walk back" in ln for ln in after.splitlines())
 
 
+def test_a_block_list_written_at_its_key_s_own_column_is_replaced_whole(cfg_file):
+    """`yields_to:` with `- comfy` under it at the *same* column is valid YAML - a block sequence
+    needs no extra indent under a mapping key - and it's what someone typing the list gets. Only
+    counting lines indented deeper than the key stops at the key: the new list is written, the old
+    items stay underneath it, and the file has two answers for one key and stops reading. Same for
+    `asks_for:`, and for a top-level `ignore:` under `pressure:`."""
+    example = text_of(EXAMPLE)
+
+    def typed(lines):
+        cfg_file.write_bytes(insert_after_line(example, "allow_restart: true", lines, 1)
+                             .encode("utf-8"))
+
+    typed(["    yields_to:", "    - comfy", "    - claims"])
+    assert config.parse(text_of(cfg_file))["workloads"]["strata"]["yields_to"] == ["comfy", "claims"]
+    save(cfg_file, matrix={"strata": {"comfy": "keep", "claims": "keep", "pressure": "yes"},
+                           "comfy": COMFY_ASKS_PRESSURE})
+    written = text_of(cfg_file)
+    assert config.parse(written)["workloads"]["strata"]["yields_to"] == ["pressure"]
+    assert [ln for ln in code_lines(written) if ln.strip().startswith("-")] == []
+    assert comments(written) == comments(example)
+
+    typed(["    yields_to:", "    - comfy", "    - claims"])
+    save(cfg_file, matrix={"strata": ALL_YES, "comfy": COMFY_ASKS_PRESSURE})
+    written = text_of(cfg_file)
+    assert config.parse(written)["workloads"]["strata"].get("yields_to") is None
+    assert "- comfy" not in [ln.strip() for ln in code_lines(written)], written
+    assert comments(written) == comments(example)
+
+    typed(["    asks_for:", "    - comfy"])
+    save(cfg_file, matrix={"strata": STRATA_KEEPS_COMFY_ASKS_CLAIMS, "comfy": COMFY_ASKS_PRESSURE})
+    written = text_of(cfg_file)
+    assert config.parse(written)["workloads"]["strata"]["asks_for"] == ["claims"]
+    assert "- comfy" not in [ln.strip() for ln in code_lines(written)]
+    assert comments(written) == comments(example)
+
+
+def test_an_indentless_list_under_a_top_level_block_is_edited_like_any_other(cfg_file):
+    """The example writes `ignore:` on one line; written as a block at its key's own column it has
+    nothing indented deeper than that key either, so each of these edits has to come from where the
+    parsed list says its items are. A new key goes after the whole list rather than into the middle
+    of it, an updated list loses the old names, and a dropped one loses the list with it."""
+    example = text_of(EXAMPLE)
+    hand = insert_after_line(example, "patches: []",
+                             ["pressure:", "  ignore:", "  - vmware-vmx.exe", "  - '*cudaball*'"], 1)
+    cfg_file.write_bytes(hand.encode("utf-8"))
+    assert config.parse(text_of(cfg_file))["pressure"]["ignore"] == ["vmware-vmx.exe", "*cudaball*"]
+
+    save(cfg_file, pressure={"grow_mib": 5000})          # a key after the list, not inside it
+    cfg = config.parse(text_of(cfg_file))["pressure"]
+    assert cfg == {"ignore": ["vmware-vmx.exe", "*cudaball*"], "grow_mib": 5000}, cfg
+
+    save(cfg_file, pressure={"ignore": ["thing.exe"], "min_free_mib": 900})
+    written = text_of(cfg_file)
+    cfg = config.parse(written)["pressure"]
+    assert cfg["ignore"] == ["thing.exe"] and cfg["min_free_mib"] == 900, cfg
+    hold = [ln.strip() for ln in code_lines(written)]
+    assert "- vmware-vmx.exe" not in hold and "- '*cudaball*'" not in hold, written
+    assert comments(written) == comments(example)
+
+    save(cfg_file, pressure={"ignore": []})               # back to the default: the list goes too
+    written = text_of(cfg_file)
+    assert "ignore" not in [ln.strip().split(":")[0] for ln in code_lines(written)]
+    assert config.parse(written)["pressure"]["min_free_mib"] == 900
+    assert comments(written) == comments(example)
+
+
 def test_a_policy_key_written_as_a_block_list_is_replaced_whole(cfg_file):
     """`yields_to:` spread over three lines is a valid way to write it. Replacing it leaves one
     line, not a line plus the two list entries that were under it - which would have parsed as

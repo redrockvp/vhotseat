@@ -378,6 +378,7 @@ class _Doc:
         where = _where(parent)
         if key in where:
             line, col = int(where[key][0]), int(where[key][1])
+            end = self.value_end(parent[key], line, col)
             if value is DROP:
                 # A key whose note the owner wrote stays: dropping the key would drop their
                 # comment with it. What stays is the note and the *new* answer written out, not
@@ -385,13 +386,13 @@ class _Doc:
                 # decision, and `yields_to: []   # keep my model` left in the file while the page
                 # says it makes room for everyone is a config that keeps unloading them.
                 if _eol_comment(self.lines[line]):
-                    self.patches.append((line, _extent(self.lines, line, col) + 1,
+                    self.patches.append((line, end + 1,
                                          _value_lines(key, _default_for(path), col,
                                                       self.lines[line])))
                     return
-                self.patches.append((line, _extent(self.lines, line, col) + 1, []))
+                self.patches.append((line, end + 1, []))
                 return
-            self.patches.append((line, _extent(self.lines, line, col) + 1,
+            self.patches.append((line, end + 1,
                                  _value_lines(key, value, col, self.lines[line])))
             return
         if value is DROP or (isinstance(value, dict) and not
@@ -424,6 +425,12 @@ class _Doc:
         for k, v in values.items():
             self.set(path + [k], v)
 
+    def value_end(self, node, line: int, col: int) -> int:
+        """The last line of the value whose key starts on `line` - whichever of the two ways of
+        measuring it reaches further down: the indentation rule, and what the parsed value says its
+        own lines are. See `_node_end` for the shape only the second one sees."""
+        return max(_extent(self.lines, line, col), _node_end(node, line))
+
     def _new_key_spot(self, path: list[str]) -> tuple[int, int]:
         """(last line of the block, column for a new key) for the mapping at `path`: after its
         last key and everything that key's value spans, so a new key lands inside the block and
@@ -431,9 +438,9 @@ class _Doc:
         node = self.node(path)
         where = _where(node)
         if where:
-            last = max(where.values(), key=lambda v: int(v[0]))
+            last = max(where, key=lambda k: int(where[k][0]))
             col = min(int(v[1]) for v in where.values())
-            return _extent(self.lines, int(last[0]), int(last[1])), col
+            return self.value_end(node[last], int(where[last][0]), int(where[last][1])), col
         # An empty mapping: the line the mapping itself was written on, or the top of the file.
         parent = self.node(path[:-1]) if path else self.data
         own = _where(parent).get(path[-1]) if path else None
@@ -494,6 +501,34 @@ def _extent(lines: list[str], start: int, col: int) -> int:
 
 def _col(line: str) -> int:
     return len(line) - len(line.lstrip())
+
+
+def _node_end(node, fallback: int) -> int:
+    """The lowest line a parsed value's own writing reaches, from the positions the round-trip
+    parser kept for it: every key of a mapping and every item of a sequence knows its line, and a
+    mapping entry knows where its value begins as well. Comments aren't in there, which is half the
+    point: a note introducing the next key belongs to that key and isn't taken along with the value
+    above it.
+
+    Asking the structure is what catches the shape indentation can't see - a block sequence written
+    at its key's own column, `yields_to:` with `- comfy` under it at the same indent, which is valid
+    YAML and what someone typing a list gets. Nothing under that key is indented deeper than the
+    key, so counting indentation stops at the key: the new list is written and the old items stay
+    below it, two answers for one key, and the file stops reading. A new key after such a list lands
+    in the middle of it the same way."""
+    ends = [fallback]
+    lc = getattr(node, "lc", None)
+    if getattr(lc, "line", None) is not None:
+        ends.append(int(lc.line))
+    for pos in (getattr(lc, "data", None) or {}).values():
+        ends.append(int(pos[0]))
+        if len(pos) > 2:
+            ends.append(int(pos[2]))
+    if isinstance(node, dict):
+        ends += [_node_end(v, fallback) for v in node.values()]
+    elif isinstance(node, (list, CommentedSeq)):
+        ends += [_node_end(v, fallback) for v in node]
+    return max(ends)
 
 
 def _eol_comment(line: str) -> str:
