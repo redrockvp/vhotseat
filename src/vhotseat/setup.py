@@ -27,7 +27,8 @@ def migrate_state(new: Path, env=os.environ) -> None:
     old.symlink_to(new.name)
 
 
-def build(cfg: dict, *, env=os.environ, gpu=None, machine_ram=None, **arbiter_args) -> Arbiter:
+def build(cfg: dict, *, env=os.environ, gpu=None, machine_ram=None, config_path=None,
+          **arbiter_args) -> Arbiter:
     state = cfgmod.state_dir(env)
     migrate_state(state, env)
     g = cfg.get("gpu") or {}
@@ -50,6 +51,9 @@ def build(cfg: dict, *, env=os.environ, gpu=None, machine_ram=None, **arbiter_ar
         claim_ignore=cfg.get("claims_ignore") or [],
         claim_poll_s=cfg.get("claims_poll_s", 2.0),
         pressure_cfg=cfg.get("pressure"),
+        ask_cfg=cfg.get("ask"),
+        # So a long-lived `web` or `watch` can tell when the owner has saved the policy.
+        config_path=config_path,
         **arbiter_args,
     )
     return arbiter

@@ -285,6 +285,203 @@ def test_status_and_claims_say_what_a_claim_was_not_given(rig, monkeypatch, caps
     assert "kept for its policy: strata" in capsys.readouterr().out
 
 
+# --- asking first -------------------------------------------------------------------
+
+
+def test_asks_for_takes_the_same_names_as_yields_to_less_the_star(rig):
+    """The third answer takes the same vocabulary as the other two, so a row of the grid can
+    be written by hand as easily as it is clicked. Not the `"*"`: "ask me before unloading me
+    for anyone" is a question no owner can answer, and it would swallow the row."""
+    raw = config.parse((ROOT / "config.example.yaml").read_text())
+    for good in (["comfy"], ["claims"], ["pressure"], ["comfy", "pressure"], []):
+        raw["workloads"]["strata"]["asks_for"] = good
+        config.validate(raw)
+    for bad in (["*"], ["strat"], "comfy", [None]):
+        raw["workloads"]["strata"]["asks_for"] = bad
+        with pytest.raises(config.ConfigError, match="asks_for"):
+            config.validate(raw)
+
+
+def test_an_asks_for_left_empty_is_the_message_doctor_prints(rig):
+    """`asks_for:` written with nothing after it - or with `null` - is the mistake an owner makes
+    meaning to write the list. It has to be answered the way an empty `yields_to:` is answered: the
+    key named, what a list of them looks like. A present key that skips validation instead reaches
+    `tuple(None)` where the workloads are built, and then nothing reads the file: a fresh command
+    dies on a traceback, and a `watch` that has been up all day exits on the poll after the save."""
+    example = (ROOT / "config.example.yaml").read_text()
+    for written in ("asks_for:", "asks_for: null", "asks_for:   # I'll write it after lunch"):
+        text = example.replace("    allow_restart: true", f"    {written}", 1)
+        with pytest.raises(config.ConfigError, match="asks_for: expected a list"):
+            config.parse(text)
+
+
+def test_a_workload_isnt_named_in_both_lists(rig):
+    """`yields_to: [comfy]` next to `asks_for: [comfy]` says it makes room for ComfyUI and
+    that it waits for an answer first. One of the two has to be what it means, so the config
+    says so rather than picking a winner by key order."""
+    raw = config.parse((ROOT / "config.example.yaml").read_text())
+    raw["workloads"]["strata"]["yields_to"] = ["comfy", "claims"]
+    raw["workloads"]["strata"]["asks_for"] = ["claims"]
+    with pytest.raises(config.ConfigError, match="both yields_to: and asks_for:"):
+        config.validate(raw)
+    # `"*"` covers everyone, so it isn't naming the same newcomer twice; the ask is the
+    # narrower answer and the matrix reads it as the one that counts.
+    raw["workloads"]["strata"]["yields_to"] = ["*"]
+    config.validate(raw)
+
+
+def test_the_ask_block_is_a_wait_and_what_happens_with_no_answer(rig):
+    """Owner-side numbers, same style as `pressure:`: a wait and a fallback. Nothing waits
+    yet, so a typo here would be a typo in a feature the owner can't see working."""
+    raw = config.parse((ROOT / "config.example.yaml").read_text())
+    for good in ({"timeout_s": 120}, {"fallback": "release"},
+                 {"timeout_s": 5.5, "fallback": "keep"}):
+        raw["ask"] = good
+        assert config.validate(raw)["ask"] == good
+    for bad, why in (({"fallback": "ask"}, "ask.fallback"), ({"timeout_s": 0}, "ask.timeout_s"),
+                     ({"timeout_s": "2 min"}, "ask.timeout_s"), ({"ask_me": True}, "unknown key"),
+                     (["keep"], "expected a mapping")):
+        raw["ask"] = bad
+        with pytest.raises(config.ConfigError, match=why):
+            config.validate(raw)
+
+
+def test_the_ask_defaults_are_recorded_not_invented_by_the_reader(rig):
+    """One place says what an unanswered ask is worth, and the config's absence of a key means
+    that number rather than a second default somewhere else."""
+    assert policy.ask_cfg(None) == {"timeout_s": 120, "fallback": "keep"}
+    assert policy.ask_cfg({"timeout_s": 30, "fallback": "release"}) == {
+        "timeout_s": 30, "fallback": "release"}
+    assert policy.ask_cfg({"fallback": "release"})["timeout_s"] == 120
+
+
+# --- what an ask decides today ------------------------------------------------------
+
+
+def ask_first(rig, **per):
+    """Who wants asking first before it is unloaded, on the live arbiter: strata=["comfy"]
+    means a ComfyUI handover asks Strata first. Same shape as `give_way`."""
+    for name, spec in per.items():
+        rig.arb.workloads[name].asks_for = tuple(spec)
+
+
+def test_an_ask_keeps_its_workload_loaded_for_a_load_nobody_chose(rig, capsys):
+    """The asking isn't built, and that has to be a no-op rather than a surprise: Strata wants
+    to be asked before ComfyUI unloads it, so the guard's request is refused exactly as a keep
+    is - nothing partially unloads, because the card cannot be given to ComfyUI anyway. The
+    sentence says which of the two it is, so the owner isn't left waiting for a notification
+    that will never arrive."""
+    ask_first(rig, strata=["comfy"])
+    rig.strata.loaded = True
+    assert rig.cli("switch", "comfy", "--request") == 1
+    assert rig.strata.loaded
+    assert "POST /unload" not in rig.strata.calls
+    got = rows(rig, "policy-refused")
+    assert len(got) == 1 and got[0]["workloads"] == ["strata"]
+    assert "its asks_for asks ComfyUI first" in got[0]["why"]
+    assert "asking isn't built yet, so it stays loaded" in got[0]["why"]
+
+
+def test_a_workload_that_wants_asking_first_still_holds_for_a_game(rig, monkeypatch):
+    """A claim is never refused, so an ask in a game's row is the same as a keep: the game
+    starts short of whatever stayed put, and `policy-kept` is where that is recorded. Not
+    waiting: nothing is waiting for an answer, and a target list that named it anyway is not
+    asked either."""
+    claim_rule(rig, monkeypatch)
+    ask_first(rig, strata=["claims"])
+    rig.strata.loaded = True
+    rig.comfy.vram = COMFY_MODEL_VRAM
+    web.watch(rig.arb, polls=1)
+    assert rig.strata.loaded
+    assert [r["workloads"] for r in rows(rig, "claim-release")] == [["comfy"]]
+    assert rows(rig, "claim-release-targets")[0]["kept"] == ["strata"]
+    kept = rows(rig, "policy-kept")
+    assert len(kept) == 1 and kept[0]["workload"] == "strata"
+    assert "its asks_for asks a claim on the card first" in kept[0]["why"]
+    assert rig.arb.claim_release({"name": NAME, "note": NOTE}, only=["strata"])["released"] == []
+
+
+def test_a_switch_you_type_moves_a_workload_that_wants_asking_first(rig):
+    """An ask is not a second veto: a `switch` you typed is an order here exactly as it is for
+    a keep, and says whose policy it overrode. What is missing is the asking, not the owner's
+    ability to decide in person."""
+    ask_first(rig, strata=["comfy"])
+    rig.strata.loaded = True
+    assert rig.cli("switch", "comfy") == 0
+    assert not rig.strata.loaded
+    assert [r["requested"] for r in rows(rig, "policy-override")] == ["comfy"]
+
+
+def test_no_workload_is_owed_to_a_pressure_episode_it_wants_asked_for(rig):
+    """Same reasoning as a claim: pressure releases what may be released and refuses nothing,
+    so an ask takes that workload out of the eviction set rather than opening a question."""
+    ask_first(rig, strata=["pressure"])
+    rig.strata.loaded = True
+    rig.comfy.vram = COMFY_MODEL_VRAM
+    assert [n for n, _ in rig.arb.pressure_candidates()] == ["comfy"]
+
+
+def test_status_and_why_say_which_answer_an_ask_is_today(rig, monkeypatch, capsys):
+    """Both the owner's readings of the policy - `status` and `why` - name the key and say what
+    it does now, because "it gives way for anything, and asks a claim on the card first" read
+    next to a game running with the rest of the card is the difference between a mystery and a
+    config line to change."""
+    claim_rule(rig, monkeypatch)
+    ask_first(rig, strata=["claims"])
+    rig.strata.loaded = True
+    assert rig.cli("status") == 0
+    out = capsys.readouterr().out
+    assert "strata 50 (anything, and asks a claim on the card first " \
+           "(asking isn't built yet, so it stays loaded))" in out
+    assert rig.cli("why", "comfy") == 0
+    out = capsys.readouterr().out
+    assert "keeps its model for the claim: its asks_for asks a claim on the card first" in out
+    assert rig.cli("why", "--json") == 0
+    assert json.loads(capsys.readouterr().out)["strata"]["asks_for"] == ["claims"]
+
+
+# --- the grid the editor writes -----------------------------------------------------
+
+ROWS = [("strata", "Strata", ("*",), ()),
+        ("comfy", "ComfyUI", ("strata",), ()),
+        ("game", "Game", ("comfy",), ("claims", "pressure", "strata"))]
+REQUESTERS = [("strata", "Strata"), ("comfy", "ComfyUI"), ("game", "Game"),
+              ("claims", "A game"), ("pressure", "Low VRAM")]
+
+
+def test_a_grid_cell_holds_the_choice_and_what_it_does():
+    """The page shows a choice and a consequence per cell; both come from the two keys the
+    arbiter reads, so what an owner sees before saving is what the next handover does, and JS
+    never has a rule of its own to keep in sync."""
+    grid = policy.matrix(ROWS, REQUESTERS)
+    assert grid["strata"]["comfy"] == {"choice": "yes", "says": "Strata unloads once idle"}
+    assert grid["strata"]["claims"]["choice"] == "yes"
+    # The diagonal: nothing unloads itself.
+    assert "comfy" not in grid["comfy"]
+    keep = grid["comfy"]
+    assert keep["game"]["choice"] == "keep"
+    assert keep["game"]["says"] == "Game is refused"
+    assert keep["claims"]["says"] == "game runs with what's left"
+    assert keep["pressure"]["says"] == "nothing is freed"
+    ask = grid["game"]
+    assert ask["claims"]["choice"] == "ask"
+    assert ask["claims"]["says"] == "you decide; the game runs meanwhile"
+    assert ask["pressure"]["says"] == "you decide what to free"
+    assert ask["strata"]["says"] == "Strata waits for your answer"
+    assert ask["comfy"] == {"choice": "yes", "says": "Game unloads once idle"}
+
+
+def test_the_grid_and_the_arbiter_read_the_same_cells():
+    """One vocabulary, used by both: a cell the page paints Keep is a cell the handover
+    refuses, and the `"*"`/ask overlap resolves the same way in both, because it's the same
+    function answering."""
+    for yields_to, asks_for in ((("*",), ()), (("comfy",), ()), (("comfy",), ("claims",)),
+                                (("*",), ("claims",)), ((), ()), ((), ("pressure",))):
+        for reason in ("comfy", "claims", "pressure", "strata"):
+            c = policy.choice(yields_to, asks_for, reason)
+            assert policy.yields(yields_to, reason, asks_for) == (c == "yes")
+
+
 # --- saying it back -----------------------------------------------------------------
 
 

@@ -50,7 +50,10 @@ server.
 
 **Config** is `~/.config/vhotseat/config.yaml`, or `$VHOTSEAT_CONFIG`. It's
 validated on load and every error names the key. A broken config makes every
-gate refuse rather than letting a load through unchecked.
+gate refuse rather than letting a load through unchecked. The dashboard's policy
+endpoints write pieces of it - the two policy keys, `ask:` and `pressure:` - in
+a way that leaves the rest of the file, comments included, exactly as it was
+(`config_edit.py`), and keep the previous file as `config.yaml.bak-<time>`.
 
 **State** is in `~/.local/state/vhotseat/` (`$XDG_STATE_HOME`): the lock
 (`switch.lock`, one per GPU) and the event log (`events.jsonl`, the last 500
@@ -108,7 +111,7 @@ clients reading results have had time to.
 ## Who gives way for whom
 
 Which workloads get unloaded to make room used to be one rule for everything: whatever
-held memory on the card was a candidate for every handover. Two keys per workload make
+held memory on the card was a candidate for every handover. Three keys per workload make
 it a decision of yours instead:
 
 ```yaml
@@ -119,6 +122,9 @@ workloads:
   unsloth:
     priority: 20            # idle and cheap to reload: asked first
     yields_to: ["*"]        # the default: it gives way for anyone
+  comfy:
+    yields_to: ["*"]        # makes room for everyone...
+    asks_for: [claims]      # ...except a game, which asks first
 ```
 
 `yields_to:` lists the newcomers this workload will make room for. An entry is another
@@ -129,6 +135,21 @@ existed, so an existing config keeps behaving as it did. An empty list means it 
 way for nobody: only a command you type moves it. An entry naming a workload that isn't
 in the config is a config error, not a rule that quietly never matches; a workload can't
 be named `claims` or `pressure`, because those are words `yields_to:` already means.
+
+`asks_for:` is the third answer: *ask me before you unload me*. It takes the same entries
+as `yields_to:` without the `"*"` - an ask that means "anyone" is a question nobody can
+answer - and one entry named in both keys is a config error, because it would say two
+things at once. **The asking isn't built yet.** Until it is, a name in `asks_for:` keeps
+that workload loaded exactly as leaving it out of `yields_to:` does - a load nobody chose
+is refused, a claim leaves it holding and records `policy-kept` - and `vhotseat status`
+and `vhotseat why` say it asks first rather than pretending an answer is coming. What is
+not asked for is not unloaded, whichever way the question was meant.
+
+Top level, `ask:` is what an unanswered ask will be worth: `timeout_s` (default 120) how
+long to hold the handover for an answer, and `fallback` of `keep` (default, leave it
+loaded) or `release` (unload it anyway). Nothing waits or notifies yet; the two keys are
+read by the dashboard and recorded so the asking has something written to be built
+against.
 
 What the policy decides is **who gets unloaded, and who is refused instead**. It is
 enforced wherever vhotseat decides to unload something, and its direction matters:
@@ -150,8 +171,9 @@ enforced wherever vhotseat decides to unload something, and its direction matter
   shows; a load that hasn't put weights on the card yet isn't yet a holder.
 
 `priority:` orders the workloads that *may* be unloaded - the lowest is asked first - and
-never overrules `yields_to:`. Both are shown by `vhotseat status` and `vhotseat why`, and
-read-only on the dashboard until there's a way to edit them there.
+never overrules `yields_to:` or `asks_for:`. All three are shown by `vhotseat status` and
+`vhotseat why`, and edited through `GET`/`POST /api/policy`; the page that edits them is
+still to come.
 
 ## Talking to a server that isn't a plain server
 
@@ -318,7 +340,8 @@ One page, refreshed every 5 s, that works on a phone too:
 - **Who gives way for whom**: the policy as the config has it - each workload's priority,
   what it gives way for, what it holds on the card now and what the history has seen it
   holding at most - and for every pair of workloads a tile saying whether they fit on the
-  card at the same time. Read-only: the keys are still edited in `config.yaml`.
+  card at the same time. Read-only on the page for now; `GET`/`POST /api/policy` (below)
+  reads and writes the keys, and the page that edits them is the next part.
 - **Events / Logs**: every switch, hold and gate decision, and every line a
   vhotseat command logged, from any process (the guard's `switch comfy`,
   Strata's `gate strata`, your `hold`).
@@ -332,7 +355,65 @@ here too.
 Every chart marks each event with a dashed line: hover it to see the event,
 click it to open it in the table. Ranges run from 15 minutes to the whole
 retention window. A button in the header switches the theme (system, light or
-dark; kept in the browser). It only reads; it never switches anything.
+dark; kept in the browser). The page never switches or releases anything: the one
+write it makes is the policy, and that goes into `config.yaml`, not into a
+running process.
+
+### Reading and saving the policy
+
+| Route | Returns |
+|---|---|
+| `GET /api/policy` | what the grid needs: the workloads in the order a handover unloads them, the columns a pair can be asked for (each other workload, `claims`, `pressure`), each cell's choice (`yes` / `ask` / `keep`) with the sentence saying what it does and why, the `ask:` and `pressure:` numbers, and a `version` (sha256 of the config file) to send back with a save. Grid and version are read from the file in one go, and those rules are what this process then acts on: rules remembered from an older file beside a version read fresh is how a save would write someone's hand-edit away and report success. A file that stopped being a config keeps the rules that were in force and carries `config_error` in the answer |
+| `POST /api/policy` | `{"version": "..."}` when the file now says what was posted. Body: `version` (required) and any of `priorities` (the unload order), `matrix` (`{workload: {requester: "yes"\|"ask"\|"keep"}}`), `ask`, `pressure` - a key left out is left alone. `409` with the version that's on disk when the file changed since it was read (or without one, when another save is midway through the file and this one should simply try again); `400` with what `doctor` would say, when the result wouldn't load |
+
+The POST is guarded three ways, because a config is not a page-refresh: the
+`X-Vhotseat-Edit: 1` header, `Content-Type: application/json` - a page on another origin
+can set neither from a form, and to set both from a script it needs a preflight this server
+never answers - and an `Origin` that is this dashboard's own port when an `Origin` is sent at
+all. No CORS header is ever sent, so nothing here is readable from another origin either.
+
+The file is rewritten a line at a time, only where a policy key lives: comments, key order,
+quoting style and CRLF survive a save, a key that wasn't touched isn't rewritten, and the whole
+result is checked by the same `config.parse` the CLI loads with before a byte is written. A key
+that goes back to its default is dropped, since an absent key says it - unless the owner left a
+note on that line, in which case the line stays, says the default, and keeps their note: the note is
+the reason for a decision that was changed, and deleting the key with it would lose something the
+owner wrote. A policy key inside a mapping written on one line - `pressure: {enabled: true,
+sustain_s: 60}`, or a workload written `{driver: http, ...}` - is rewritten as that same line: the
+mapping comes back with the change in it, and its heading, its siblings and the note at the end of
+the line stay on it. A heading the file has with nothing under it - `pressure:` on its own, which is
+a valid way to write 'the defaults, fill this in later' - is where the keys the page sent go, at the
+heading's indent, note kept. Then the file as it was and the file as it would be are read with the
+same parser the arbiter uses, and unless everything that differs sits inside a key this save was
+asked to write, nothing is written and `web` answers with the line `doctor` prints for that file: a
+quote that would change a value's type, a re-rendered value that resolves the other way, a span one
+line too long - all of them arrive as a refusal rather than as a save nobody asked for. The file that
+was there is kept beside it as `config.yaml.bak-<time>` (the
+newest ten) with the permissions the config itself has - that backup holds the same `headers:` key
+if the config does - and the replacement file takes those bits too, so a save neither opens up a
+private config nor quietly shuts one. The
+save takes a turn on `config.yaml.lock` beside the config - the same operating-system lock
+the handover takes - so two pages, or a page and a dashboard in another process, can't both save
+from the same reading and quietly undo one another: whoever arrives second is refused and tries
+again. `vhotseat doctor` and `git diff` still make sense of the file afterwards.
+
+A save reaches the processes that are already running. `vhotseat web`, `vhotseat watch` and
+`vhotseat record` notice the file's mtime and size change - each samples through the same probe -
+and put the new policy, `pressure:` and `ask:` numbers in force; every gate, guard and `switch` is a
+fresh process that read the config as it started. Which workloads exist, how to reach them and what
+claims the card are not reloaded - that is a restart. Reading, parsing and installing a config is one
+turn of one lock, and a file counts as seen only once the rules from that reading are the ones in
+force: a dashboard is a watcher thread plus a request thread per tab, and a reload that read the file
+before a save must not be the one that installs rules last.
+If the file stops being a config — a half-typed edit, or bytes that aren't utf-8 because an editor
+saved the file as Windows-1252 and turned a comment's en dash into a byte nothing here can decode —
+the rules already in force keep running and `/api/status` carries
+`config_error` saying so: a config that doesn't read is not a reason to unload anything, and a
+dashboard that quietly kept showing the old policy would be worse. A command reading such a file
+says the same thing instead of a traceback, and neither `vhotseat watch` nor the dashboard's
+background check ends on one pass that raised: it logs the failure and carries on, because the
+watcher is the thing that releases the card for a game that asks. `api.py`'s `Seat` - a proxy's
+gate, opened once and asked before every request - reloads the same way, on each `acquire()`.
 
 ![The dashboard on an RTX 5070 Ti: Strata hands the GPU to ComfyUI at 01:04, and a render is running.](https://raw.githubusercontent.com/wandermyz/vhotseat/24999a8e62e3a6342e9af6c3bc70042e77765c60/web-dashboard/desktop.png)
 
@@ -405,7 +486,7 @@ where "refused" is a mystery. The memory that can't be freed is named: the proce
 vhotseat doesn't manage and how much each holds. `why` releases nothing, loads
 nothing and restarts nothing; it exits 0 even when the answer is `blocked`, because
 it is a report and not a gate. `--json` gives the same per workload
-(`{would, holder, free_mib, resident, priority, yields_to, notes[]}`); the dashboard
+(`{would, holder, free_mib, resident, priority, yields_to, asks_for, notes[]}`); the dashboard
 shows it as the **Next handover** card.
 
 **Claims: a game owns the card.** `vhotseat claims` prints what the rules match right

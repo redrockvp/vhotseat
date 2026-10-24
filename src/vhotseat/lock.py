@@ -14,6 +14,9 @@ for the lock can still decide what to do:
 
 On Windows the flock is a byte-range lock (msvcrt). Those are mandatory, so it
 locks one byte far past the note: the note itself stays readable by everyone.
+The same two primitives are what `config_edit` puts around a save of the owner's
+config file, where the thing being kept in turn is a read-check-write, not a
+handover.
 """
 
 import os
@@ -26,7 +29,7 @@ if os.name == "nt":
 
     LOCK_AT = 2**30   # well past any note; Windows lets a lock lie beyond the end of the file
 
-    def _try_lock(f) -> bool:
+    def try_lock(f) -> bool:
         os.lseek(f.fileno(), LOCK_AT, os.SEEK_SET)
         try:
             msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
@@ -34,20 +37,20 @@ if os.name == "nt":
             return False
         return True
 
-    def _unlock(f) -> None:
+    def unlock(f) -> None:
         os.lseek(f.fileno(), LOCK_AT, os.SEEK_SET)
         msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
 else:
     import fcntl
 
-    def _try_lock(f) -> bool:
+    def try_lock(f) -> bool:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return False
         return True
 
-    def _unlock(f) -> None:
+    def unlock(f) -> None:
         pass  # closing the file releases a flock
 
 
@@ -70,7 +73,7 @@ class Held:
     def __exit__(self, *exc):
         try:
             self.mark("")
-            _unlock(self._f)
+            unlock(self._f)
         finally:
             self._f.close()
 
@@ -112,7 +115,7 @@ class GpuLock:
         """Take the lock if it's free; otherwise return the current holder's note."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         f = open(self.path, "a+", encoding="utf-8")
-        if not _try_lock(f):
+        if not try_lock(f):
             f.seek(0)
             current = f.read().strip()
             f.close()

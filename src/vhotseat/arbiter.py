@@ -17,9 +17,12 @@ import datetime
 import os
 import signal
 import subprocess
+import threading
 import time
+from pathlib import Path
 
-from . import claims, host, policy, pressure, util
+from . import claims, config as cfgmod, host, policy, pressure, util
+from .config_edit import version_of
 from .drivers.base import Workload
 from .errors import Busy, PolicyRefused, ReleaseFailed, SwitchError
 from .events import EventLog, row_time
@@ -34,6 +37,13 @@ def _declined(why: str, by_actor: bool = False) -> dict:
     can read `released` without knowing which of four ways out was taken."""
     return {"declined": why, "by_actor": by_actor, "episode": None, "released": [],
             "waiting": [], "freed_mib": 0, "would": []}
+
+
+def _stamp(path: Path) -> tuple:
+    """What says the file is a different file: its length and its mtime to the nanosecond, so a
+    save inside the same second as the last look is still a change."""
+    st = path.stat()
+    return st.st_mtime_ns, st.st_size
 # Set in a hold's command's environment, so a nested switch to the held workload
 # is a no-op instead of waiting on the lock the hold owns.
 HOLD_ENV = "VHOTSEAT_HOLD"
@@ -44,7 +54,8 @@ class Arbiter:
                  gate_release_timeout_s: float = 20, release_timeout_s: float = 60,
                  machine_ram=host.machine_ram, telemetry=None, power: dict | None = None,
                  claim_rules: list | None = None, claim_ignore=(), claim_poll_s: float = 2.0,
-                 pressure_cfg: dict | None = None):
+                 pressure_cfg: dict | None = None, ask_cfg: dict | None = None,
+                 config_path=None):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
         self.lock = lock
@@ -72,6 +83,26 @@ class Arbiter:
         # `ignore:` - the processes the owner has said are never the reason (a VM, a benchmark, a
         # miner), whose memory is out of the measurement rather than just out of the report.
         self.pressure_cfg = pressure.cfg(pressure_cfg)
+        # What an unanswered ask is worth: the `ask:` block with the defaults in it. Nothing
+        # waits or notifies yet, so no decision reads it; the dashboard shows it, and the
+        # asking will be written against these numbers rather than its own.
+        self.ask = policy.ask_cfg(ask_cfg)
+        # Where the config this was built from lives. A gate, a guard's `--request` and
+        # `Seat.acquire` read the config in the process that asks, so a save reaches them by
+        # itself; a `web` or a `watch` has been running since before it, and reloads from this
+        # path. None for an arbiter built from a dict by a library caller or a test: nothing to
+        # watch, and nothing to save back.
+        self.config_path = Path(config_path) if config_path else None
+        self._config_stamp: tuple | None = None
+        # The version of the text whose rules are in force: "seen" means installed, not looked at, so
+        # a reading that never went in can't mark newer bytes as handled.
+        self._adopted: str | None = None
+        # One thread at a time reads, parses and installs a config. A `web` is the claim watcher plus
+        # a request thread per page tab, and `watch` re-reads too: without this, the reload that read
+        # the file before someone else's save and stopped part way through its parse can come back
+        # afterwards and put what it was reading over the rules that save installed.
+        self._policy_lock = threading.RLock()
+        self.config_error: str | None = None
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
@@ -131,17 +162,19 @@ class Arbiter:
                 if (gpu.get(f"{n}_mib") or 0) > w.idle_vram_mib]
 
     def wont_give_way(self, reason: str, gpu: dict) -> list[str]:
-        """The loaded workloads whose `yields_to:` doesn't cover `reason` - a workload's
-        name, `claims` or `pressure` (policy.py)."""
+        """The loaded workloads that won't make room for `reason` - a workload's name,
+        `claims` or `pressure` (policy.py): the ones that refuse it, and the ones that want
+        asking first, which is the same thing until the asking is built."""
         return [n for n in self.loaded(gpu)
-                if n != reason and not policy.yields(self.workloads[n].yields_to, reason)]
+                if n != reason and not policy.yields(self.workloads[n].yields_to, reason,
+                                                     self.workloads[n].asks_for)]
 
     def policy_why(self, requester: str, blockers: list[str], gpu: dict) -> str:
         """The refusal in words a person can act on: who is in the way, how much it is
         holding, and what it does give way for - which is the key to change."""
         who = self.label(requester)
-        bits = [f"{self.label(n)} holds {gpu.get(f'{n}_mib')} MiB and its yields_to "
-                f"({policy.describe(self.workloads[n].yields_to)}) doesn't cover {who}"
+        bits = [f"{self.label(n)} holds {gpu.get(f'{n}_mib')} MiB and "
+                f"{policy.why_not(self.workloads[n].yields_to, self.workloads[n].asks_for, requester, who)}"
                 for n in blockers]
         return f"nothing will make room for {who}: " + "; ".join(bits)
 
@@ -156,10 +189,10 @@ class Arbiter:
 
     def kept_why(self, reason: str, name: str, held_mib: int) -> str:
         """Why something stayed loaded, in the sentence the row and the banner show."""
-        return (f"{self.label(name)} holds {held_mib} MiB and its yields_to "
-                f"({policy.describe(self.workloads[name].yields_to)}) doesn't cover "
-                f"{policy.PHRASE.get(reason, reason)}: it keeps its model, and whatever "
-                f"asked for the card may be short of that")
+        w = self.workloads[name]
+        why = policy.why_not(w.yields_to, w.asks_for, reason, policy.PHRASE.get(reason, reason))
+        return (f"{self.label(name)} holds {held_mib} MiB and {why}: it keeps its model, and "
+                "whatever asked for the card may be short of that")
 
     def _policy_refused(self, source: str, requester: str, blockers: list[str], why: str) -> None:
         """One row for one refusal, so the dashboard can warn about it and `why` and
@@ -168,9 +201,157 @@ class Arbiter:
         self.events.record("policy-refused", source=source, requested=requester, ok=False,
                            workloads=blockers, why=why)
 
+    # --- picking up a saved policy -------------------------------------------------
+
+    def reload_policy(self, force: bool = False) -> str | None:
+        """Re-read the owner's config if the file has changed, and put the new rules in force.
+        Returns why the file isn't a config now, or None that it is.
+
+        Only the long-lived readers need this, and they all reach it the same way: `probe()` calls
+        it, so `record`, the dashboard and its sampler see the file as it is now; `watch_pass` calls
+        it before it acts on a claim or the pressure; and `Seat.acquire` (a proxy's gate, which is
+        not a new process) calls it before it switches. Every other command - a gate, the ComfyUI
+        guard's `--request`, a `switch` - is a new process that read the config as it started: for
+        them this is one `stat` on a file they parsed themselves a moment ago.
+
+        `web` and `watch` are where it matters: once the dashboard has saved a rule, the watcher on
+        the same box is the one that has to obey it, and waiting for a restart would leave the owner
+        looking at an editor that says one thing and a card that does another.
+
+        The check is cheap and the swap is safe: the whole file is parsed and validated before
+        anything is swapped, so a half-typed hand-edit changes nothing: the rules already running
+        keep running, and the caller is told (`/api/status`'s `config_error`, and one log line the
+        first time it notices, not one per poll). And the read, the parse and the swap are one turn
+        of one lock, because a dashboard is a watcher thread and a request thread per page tab: a
+        reload that read the file before a save can stop part way through its parse, and it must not
+        be the one that installs rules last. What marks the file as seen is the reading whose rules
+        actually went in, never a stamp picked up from bytes that didn't.
+
+        What is re-read is the policy, the pressure numbers and the ask numbers. Which workloads
+        there are, how to reach them, and what claims the card are what a restart is for: those
+        build the objects and the probes rather than a number on them.
+        """
+        path = self.config_path
+        if path is None:
+            return None
+        try:
+            stamp = _stamp(path)
+        except OSError as e:
+            return self._config_error(f"{path}: {e.strerror or e}")
+        if stamp == self._config_stamp and not force:
+            return self.config_error
+        # One turn of one lock for the whole read-parse-install: the watcher's pass, a dashboard's
+        # request threads and the save itself all come through here, and a reading that started before
+        # someone else's save must not be the last one to install what it read.
+        with self._policy_lock:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                # The file is there and it isn't text: an editor that saved it as Windows-1252 leaves
+                # an en dash as one byte, and that byte is not a UTF-8 sequence. It's a config error
+                # named the way `config_edit` names it when the dashboard tries to save over such a
+                # file, not a reason for the reload to die in the middle of the process that is
+                # looking after the card. Not recorded as seen either: a file caught mid-write by an
+                # editor that doesn't write atomically looks like this too, and the next poll should
+                # look again.
+                return self._config_error(f"{path}: not utf-8 text")
+            except OSError as e:
+                # Not recorded as seen: a file we couldn't read isn't a file we've handled. A moment
+                # when someone else's atomic write has the file half-present is a moment to try again
+                # on the next poll, not a state to sit in until the mtime changes again.
+                return self._config_error(f"{path}: {e.strerror or e}")
+            if not force and version_of(text) == self._adopted:
+                # The file moved - an editor that wrote it again without changing anything, a comment,
+                # a `git pull` - and says what is already in force. Nothing to install, and this is
+                # the reading that has been seen.
+                self._config_stamp = stamp
+                return self.config_error
+            note = self.adopt_policy(text)       # takes the same lock; records `_adopted`
+            if note is None:
+                # Only a reading that actually put its rules in force marks the file as seen, and with
+                # the stamp taken before its read: never bytes newer than what went in, which is how a
+                # later poll comes back to a file it was told it had already handled.
+                self._config_stamp = stamp
+            return note
+
+    def adopt_policy(self, text: str) -> str | None:
+        """Put the policy written in `text` in force, without reading anything. Returns why this text
+        can't be used - a config error or anything else that went wrong - or None that it was.
+
+        The dashboard calls this with the same text it took the version from. What the page is shown
+        is the rules and, beside them, the version of the file they came from, and it sends that
+        version back when it saves: if the rules come from this process's memory and the version
+        from a fresh read of the file, the pair stops meaning anything the moment the file is edited
+        elsewhere. The page posts rules it never saw alongside a version that matches, the save goes
+        through, and the hand-edit is written over with no 409 to say anyone else had an opinion.
+
+        One turn of `_policy_lock` over the parse and the swap, and the version recorded afterwards:
+        the rules in force belong to a named piece of text, and an install that didn't come from the
+        file as it now is leaves the stamp clear, so the next look finds a file nobody installed.
+        """
+        with self._policy_lock:
+            try:
+                cfg = cfgmod.parse(text)
+                changed = self._swap_policy(cfg)
+            except Exception as e:  # noqa: BLE001 - a file we can't use isn't a reason to stop watching
+                # Whatever it is - the validator missing something, a value the swap can't use, a bug
+                # in the swap itself - it goes to the owner as `config_error` and the rules already in
+                # force carry on. This is called from `probe()` and from the watcher's pass: letting it
+                # out takes down the process that is looking after the card, which is the one thing a
+                # bad config must never buy.
+                return self._config_error(f"{self.config_path}: {type(e).__name__}: {e}")
+            self._adopted = version_of(text)
+            self._config_stamp = None       # whoever installs rules sends the next look back out
+            if self.config_error is not None:    # the file reads again: say so once, the same way
+                util.log("policy: the config reads again" + (f" - {changed}" if changed else ""))
+            self.config_error = None
+            if changed:
+                util.log("policy: " + changed)
+            return None
+
+    def _swap_policy(self, cfg: dict) -> str:
+        """The policy keys of a parsed config onto the live workloads. Returns what changed, in
+        the words `status` uses, because an owner who saves a rule and looks at `status` a second
+        later is checking the dashboard isn't showing them a stale answer."""
+        wls = cfg.get("workloads") or {}
+        notes = []
+        for name, w in self.workloads.items():
+            raw = wls.get(name)
+            if not isinstance(raw, dict):
+                continue          # a workload removed since this started: its rules stay
+            yields_to = (tuple(raw["yields_to"]) if "yields_to" in raw
+                         else policy.DEFAULT_YIELDS_TO)
+            asks_for = (tuple(raw["asks_for"]) if "asks_for" in raw
+                        else policy.DEFAULT_ASKS_FOR)
+            priority = raw.get("priority", policy.DEFAULT_PRIORITY)
+            if (w.yields_to, w.asks_for, w.priority) != (yields_to, asks_for, priority):
+                notes.append(f"{w.label} gives way for {policy.describe(yields_to, asks_for)}"
+                             f", priority {priority}")
+            w.yields_to, w.asks_for, w.priority = yields_to, asks_for, priority
+        self.pressure_cfg = pressure.cfg(cfg.get("pressure"))
+        self.ask = policy.ask_cfg(cfg.get("ask"))
+        return "; ".join(notes)
+
+    def _config_error(self, message: str | None) -> str | None:
+        """Remember what's wrong with the config, and say it once: a watcher that polls twice a
+        second would otherwise bury every other line it writes."""
+        if message and message != self.config_error:
+            util.log(f"the config file no longer reads: {message} - the rules it had before are "
+                     "still running")
+        self.config_error = message
+        return message
+
     # --- status --------------------------------------------------------------
 
     def probe(self) -> dict:
+        """What each workload is doing, the card's readings, and who owns it.
+
+        Also where a long-running process picks up a saved policy: `record`, the dashboard and its
+        sampler all sample through here. Until the file changes it costs one `stat`, and for a
+        command that read the config itself a moment ago it costs nothing - the stamp already
+        matches.
+        """
+        self.reload_policy()
         # One card read, every process in it: the pressure reading needs the app that grew, which
         # is not necessarily among the eight biggest holders, and the report has to be built from
         # the same numbers the trigger would act on.
@@ -188,7 +369,7 @@ class Arbiter:
         hits = self._claims_in(held)
         status = {"mode": mode, **states, "gpu": gpu, "holders": held, "claims": hits,
                   "policy": {n: {"priority": w.priority, "yields_to": list(w.yields_to),
-                                  "gives_way_for": policy.describe(w.yields_to)}
+                                  "gives_way_for": policy.describe(w.yields_to, w.asks_for)}
                              for n, w in self.workloads.items()},
                   "pressure": self.pressure_status(card=(gpu, every)),
                   "ram": ram, "last_event": self.events.last()}
@@ -217,7 +398,7 @@ class Arbiter:
         # Who will make room for whom, and in what order: the two keys are the owner's, and
         # a refusal that doesn't name them is unfixable from the outside.
         lines.append(f"{pad('policy:')}" + "; ".join(
-            f"{n} {w.priority} ({policy.describe(w.yields_to)})" for n, w in self.workloads.items()))
+            f"{n} {w.priority} ({policy.describe(w.yields_to, w.asks_for)})" for n, w in self.workloads.items()))
         shares = ", ".join(f"{n} {g[f'{n}_mib']}" for n in self.workloads)
         lines.append(f"{pad('gpu:')}" + (g["error"] if "error" in g else
                      f"{g['free_mib']} of {g['total_mib']} MiB free ({shares}, other {g['other_mib']})"))
@@ -452,8 +633,8 @@ class Arbiter:
 
         The policy is part of that state: a workload that won't give way for the one being
         asked about is a blocker, and one the claim won't unload is named, because "the game
-        is short of VRAM" is otherwise a mystery. Each answer carries its own priority and
-        yields_to, so what to change is on the same line as what is wrong.
+        is short of VRAM" is otherwise a mystery. Each answer carries its own priority,
+        yields_to and asks_for, so what to change is on the same line as what is wrong.
         """
         s = self.probe()
         gpu, ram = s["gpu"], s["ram"]
@@ -469,12 +650,13 @@ class Arbiter:
                 notes.append("two workloads are on the card at once: asking for it will release the other")
             for y in self._others(name):
                 held = y.vram_mib()
-                if hits and held > y.idle_vram_mib and not policy.yields(y.yields_to, policy.CLAIMS):
+                if hits and held > y.idle_vram_mib and not policy.yields(y.yields_to, policy.CLAIMS,
+                                                                        y.asks_for):
                     # The claim will leave this one alone, so the game gets less than the
                     # card could give it. Worth saying on the workload being asked about:
                     # "the game is short of VRAM" is otherwise a mystery.
-                    notes.append(f"{y.label} keeps its model for the claim: its yields_to "
-                                 f"({policy.describe(y.yields_to)}) doesn't cover a claim on the card")
+                    notes.append(f"{y.label} keeps its model for the claim: "
+                                 f"{policy.why_not(y.yields_to, y.asks_for, policy.CLAIMS, 'a claim on the card')}")
                 if not y.service_active():
                     if held > y.idle_vram_mib:
                         would, why = "blocked", f"a {y.label} process holds {held} MiB but its service is stopped"
@@ -493,10 +675,10 @@ class Arbiter:
                         would = "waiting"
                     notes.append(f"{y.label} is busy: {busy}; a handover waits for it to finish")
                 elif held > y.idle_vram_mib:
-                    if not policy.yields(y.yields_to, name):
+                    if not policy.yields(y.yields_to, name, y.asks_for):
                         would = "blocked"
                         notes.append(f"{y.label} holds {held} MiB and won't give way for {x.label}: "
-                                     f"its yields_to ({policy.describe(y.yields_to)}) doesn't cover it")
+                                     f"{policy.why_not(y.yields_to, y.asks_for, name, 'it')}")
                     else:
                         freed += held
                         notes.append(f"{y.label} holds {held} MiB and would be asked to release it")
@@ -522,9 +704,9 @@ class Arbiter:
                 elif name in (ep.get("targets") or []):
                     notes.append(f"the pressure episode for {row.get('name')} is still owed this "
                                  "workload: it has not come off yet")
-                elif not policy.yields(x.yields_to, policy.PRESSURE):
-                    notes.append(f"it was never a pressure target: its yields_to "
-                                 f"({policy.describe(x.yields_to)}) doesn't cover pressure")
+                elif not policy.yields(x.yields_to, policy.PRESSURE, x.asks_for):
+                    notes.append(f"it was never a pressure target: "
+                                 f"{policy.why_not(x.yields_to, x.asks_for, policy.PRESSURE, 'pressure')}")
                 if not x.active(x.probe(gpu), gpu):
                     notes.append("nothing loads it back while the card is short this way: only "
                                  "loading something, or `switch`, is the order to fill it again")
@@ -564,7 +746,8 @@ class Arbiter:
                 notes.append(note)
             out[name] = {"target": name, "label": x.label, "would": would, "holder": s["mode"],
                          "free_mib": gpu.get("free_mib"), "resident": resident,
-                         "priority": x.priority, "yields_to": list(x.yields_to), "notes": notes}
+                         "priority": x.priority, "yields_to": list(x.yields_to),
+                         "asks_for": list(x.asks_for), "notes": notes}
         return out
 
     def gate(self, name: str) -> bool:
@@ -648,7 +831,7 @@ class Arbiter:
         snap = self.snapshot()
         owed = [n for n, y in self.workloads.items()
                 if (snap.get(f"{n}_mib") or 0) > y.idle_vram_mib
-                and policy.yields(y.yields_to, policy.CLAIMS)]
+                and policy.yields(y.yields_to, policy.CLAIMS, y.asks_for)]
         return sorted(owed, key=lambda n: (self.workloads[n].priority, n))
 
     def claim_release(self, claim: dict, only: list[str] | None = None) -> dict:
@@ -681,7 +864,8 @@ class Arbiter:
         # recorded when the claim started says otherwise: the list is what the card held then,
         # this is the config's answer now (an owner who protects a workload mid-game stops the
         # watcher coming back for it on the next poll).
-        cands = {n: y for n, y in cands.items() if policy.yields(y.yields_to, policy.CLAIMS)}
+        cands = {n: y for n, y in cands.items()
+                 if policy.yields(y.yields_to, policy.CLAIMS, y.asks_for)}
         pre = self.snapshot()
         if not any((pre.get(f"{n}_mib") or 0) > y.idle_vram_mib for n, y in cands.items()):
             # Nothing it is owed is on the card, so there is nothing to free and no reason to
@@ -864,7 +1048,8 @@ class Arbiter:
 
     def pressure_candidates(self, snap: dict | None = None) -> list[tuple[str, int]]:
         """The workloads that could pay for the room, lowest priority first, each with the MiB it
-        would give up: only ones whose `yields_to:` covers `pressure`, and only ones holding more
+        would give up: only ones whose `yields_to:` covers `pressure` and whose `asks_for:`
+        doesn't ask for it, and only ones holding more
         than their idle weight, because the app that grew is short of VRAM and not of the RAM a model
         with no card weights costs.
 
@@ -876,7 +1061,7 @@ class Arbiter:
         out = []
         for n, y in sorted(self.workloads.items(), key=lambda kv: (kv[1].priority, kv[0])):
             held = (snap.get(f"{n}_mib") or 0) - y.idle_vram_mib
-            if held > 0 and policy.yields(y.yields_to, policy.PRESSURE):
+            if held > 0 and policy.yields(y.yields_to, policy.PRESSURE, y.asks_for):
                 out.append((n, held))
         return out
 
@@ -988,7 +1173,7 @@ class Arbiter:
         """
         snap = self.snapshot()
         cands = {n: y for n, y in self.workloads.items()
-                 if n in targets and policy.yields(y.yields_to, policy.PRESSURE)}
+                 if n in targets and policy.yields(y.yields_to, policy.PRESSURE, y.asks_for)}
         want = {n: max(0, (snap.get(f"{n}_mib") or 0) - y.idle_vram_mib) for n, y in cands.items()}
         if not any(want.values()):
             return {"declined": None, "by_actor": False, "would": sorted(cands), "released": [],

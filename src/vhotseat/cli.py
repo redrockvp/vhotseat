@@ -96,8 +96,13 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
 
     if arbiter is None:
         try:
-            cfg = cfg or cfgmod.load(cfgmod.default_path())
-            arbiter = build(cfg)
+            # Only a config this process read itself is a file it may write back: a caller that
+            # hands in a dict (a test, the library) gets a dashboard that can show the policy and
+            # refuses to save one.
+            path = cfgmod.default_path()
+            ours = cfg is None
+            cfg = cfg or cfgmod.load(path)
+            arbiter = build(cfg, config_path=path if ours else None)
         except cfgmod.ConfigError as e:
             util.log(str(e))
             # A broken config must not let a workload load unchecked: the gate refuses.
@@ -203,7 +208,7 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
                     "blocked": "is blocked"}
             for name, w in why.items():
                 print(f"{w['label'] + ':':<12}{word[w['would']]} - priority {w['priority']}, "
-                      f"gives way for {policy.describe(w['yields_to'])}")
+                      f"gives way for {policy.describe(w['yields_to'], w.get('asks_for', ()))}")
                 for note in w["notes"]:
                     print(f"{'':<12}- {note}")
         return EXIT_OK

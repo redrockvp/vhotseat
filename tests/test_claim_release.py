@@ -219,6 +219,27 @@ def test_two_watchers_colliding_say_nothing_and_try_again(rig, monkeypatch):
     web.watch(rig.arb, polls=1)                                 # and it simply tries again
     assert not rig.strata.loaded
 
+def test_a_poll_that_raises_does_not_end_the_watcher(rig, monkeypatch, capsys):
+    """The dashboard's background check has swallowed a bad poll for a long time; `vhotseat watch`
+    - the process `autostart` keeps running, and on most boxes the only actor - had no such guard.
+    One pass tripping over a driver, an event log that moved out from under it, or a process that
+    vanished mid-scan ended the watcher, and nothing released the card for the rest of the day.
+    It says what happened and carries on."""
+    real = web.watch_pass
+    seen = []
+
+    def flaky(arbiter, hits):
+        seen.append(hits)
+        if len(seen) == 1:
+            raise OSError("the process scan fell over")
+        real(arbiter, hits)
+
+    monkeypatch.setattr(web, "watch_pass", flaky)
+    assert web.watch(rig.arb, polls=2) == 0
+    assert len(seen) == 2, "the loop stopped at the poll that raised"
+    assert "the process scan fell over" in capsys.readouterr().err
+
+
 def test_two_pollers_free_the_card_once(rig, monkeypatch):
     """`web` and `watch` both run claim_transitions, both on their own schedule. One release and
     one set of rows: the log says what is already open and already released, and the GPU lock

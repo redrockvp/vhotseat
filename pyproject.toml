@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: System :: Hardware",
 ]
-dependencies = ["pyyaml>=6"]
+dependencies = ["pyyaml>=6", "ruamel.yaml>=0.18"]
 
 [project.urls]
 Homepage = "https://github.com/wandermyz/vhotseat"

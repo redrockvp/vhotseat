@@ -34,7 +34,7 @@ def state_dir(env=os.environ) -> Path:
 GATE_KINDS = ("hook", "plugin", "proxy", "hold")
 SERVICE_KINDS = ("systemd-user", "systemd")
 COMMON = {"driver", "label", "url", "service", "vram", "idle_vram_mib", "gate", "admission",
-          "allow_restart", "restart_timeout_s", "priority", "yields_to"}
+          "allow_restart", "restart_timeout_s", "priority", "yields_to", "asks_for"}
 GATE_KEYS = {"kind", "timeout", "config", "custom_nodes", "status"}
 DRIVER_KEYS = {
     "http": {"resident", "busy", "release", "confirm", "load", "model", "headers", "body",
@@ -74,7 +74,8 @@ def _rules(rules, where: str):
 def validate(raw) -> dict:
     _check(isinstance(raw, dict), "config", "expected a mapping at the top level")
     unknown = set(raw) - {"gpu", "workloads", "events", "telemetry", "power", "claims",
-                          "claims_builtin", "claims_ignore", "claims_poll_s", "pressure", "patches"}
+                          "claims_builtin", "claims_ignore", "claims_poll_s", "pressure", "ask",
+                          "patches"}
     _check(not unknown, "config", f"unknown key(s): {', '.join(sorted(unknown))}")
     gpu = raw.get("gpu") or {}
     _check(isinstance(gpu, dict), "gpu", "expected a mapping")
@@ -136,6 +137,20 @@ def validate(raw) -> dict:
     for i, s in enumerate(pi):
         _check(isinstance(s, str) and s.strip(), f"pressure.ignore[{i}]",
                "expected a non-empty string (an exe name or a path glob)")
+    ask = raw.get("ask") or {}
+    _check(isinstance(ask, dict), "ask", "expected a mapping (see the ask: keys in the docs)")
+    unknown = set(ask) - set(policy.ASK_DEFAULTS)
+    _check(not unknown, "ask", f"unknown key(s): {', '.join(sorted(unknown))}")
+    if "timeout_s" in ask:
+        v = ask["timeout_s"]
+        _check(isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0,
+               "ask.timeout_s", "expected a number of seconds > 0 (how long to wait for an "
+                               f"answer before the fallback applies), got {v!r}")
+    if "fallback" in ask:
+        _check(ask["fallback"] in policy.FALLBACKS, "ask.fallback",
+               f"expected {' or '.join(policy.FALLBACKS)}: what happens when nobody answers "
+               "(keep it loaded, or unload it anyway)")
+
     cl = raw.get("claims") or []
     _check(isinstance(cl, list), "claims", "expected a list of {name, path, parent, note} rules")
     for i, r in enumerate(cl):
@@ -214,6 +229,22 @@ def validate(raw) -> dict:
                 _check(entry in known | set(policy.SPECIAL), f"{where}.yields_to[{i}]",
                        f"no workload named {entry!r} in this config; configured: "
                        f"{', '.join(sorted(known))} (plus claims, pressure and \"*\")")
+        if "asks_for" in w:
+            asks = w["asks_for"]
+            _check(isinstance(asks, list), f"{where}.asks_for",
+                   'expected a list of workload names, or of "claims" and "pressure"')
+            for i, entry in enumerate(asks):
+                _check(isinstance(entry, str) and entry, f"{where}.asks_for[{i}]",
+                       'expected a workload name, or "claims" or "pressure"')
+                _check(entry in known | set(policy.SPECIAL_ASK), f"{where}.asks_for[{i}]",
+                       f'no workload named {entry!r} in this config (and no "*" in asks_for: '
+                       f"an ask has to say who is asking); configured: "
+                       f"{', '.join(sorted(known))} (plus claims and pressure)")
+            if isinstance(w.get("yields_to"), list):
+                both = sorted(set(asks) & set(w["yields_to"]))
+                _check(not both, where,
+                       f"{', '.join(both)} named in both yields_to: and asks_for: - it can"
+                       "either make room for it or ask first, not both")
         _check(isinstance(w.get("allow_restart", False), bool), f"{where}.allow_restart", "expected true or false")
         _check(not w.get("allow_restart") or svc is not None, f"{where}.allow_restart",
                "needs a `service:` to restart")
@@ -308,6 +339,11 @@ def parse(text: str) -> dict:
 def load(path: Path) -> dict:
     try:
         return parse(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError:
+        # Bytes that aren't text: an editor that saved the file as Windows-1252, where an en dash in
+        # a comment is one byte that isn't a UTF-8 sequence. Named the way `config_edit` names it, so
+        # a command says which file and what's wrong with it instead of a traceback.
+        raise ConfigError(f"{path}: not utf-8 text") from None
     except OSError as e:
         raise ConfigError(f"{path}: {e.strerror}") from None
     except ConfigError as e:
@@ -334,6 +370,9 @@ def workloads(cfg: dict, ctx: Context) -> list[Workload]:
             # before there was a policy. An empty list means nobody may: keep the two
             # apart, so `or` is the wrong way to default it here.
             yields_to=tuple(w["yields_to"]) if "yields_to" in w else policy.DEFAULT_YIELDS_TO,
+            # An absent key asks for nobody: an `ask` is the owner saying "not without me",
+            # so defaulting it to anything would ask questions nobody wrote.
+            asks_for=tuple(w["asks_for"]) if "asks_for" in w else policy.DEFAULT_ASKS_FOR,
             priority=w.get("priority", policy.DEFAULT_PRIORITY),
         )
         for k in ("idle_vram_mib", "restart_timeout_s"):

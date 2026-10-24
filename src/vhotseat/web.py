@@ -10,13 +10,19 @@ The page (web.html) polls a small JSON API:
                                      warnings the page should show
   GET /api/why                       for each workload: could it take the card now, and what stands in
                                      the way (`why`'s dry run: it releases nothing)
+  GET /api/policy                    the policy as the grid: who gives way for whom, what each choice
+                                     does, the unload order, and the `ask:` and `pressure:` numbers,
+                                     with the config file's version to send back with a save
+  POST /api/policy                   save the policy to the config file - the only thing here that
+                                     writes anything, and guarded three ways over (see `guard`)
   GET /api/cost?since=&until=        kWh and money over that window, per holder (needs power.price)
   GET /api/history?since=&until=     samples between two Unix times, averaged into at most `points` buckets
   GET /api/events?since=&until=      events, newest first
   GET /api/logs?since=&until=        vhotseat's log lines from every process, newest first
 
-It only reads: nothing here switches or releases anything. While it runs it
-also records samples, like `vhotseat record`.
+It reads the live state: nothing here switches or releases anything, and the one POST
+rewrites the owner's policy in their config file rather than touching the card. While it
+runs it also records samples, like `vhotseat record`.
 """
 
 import contextlib
@@ -28,13 +34,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from urllib.parse import parse_qs, urlparse
 
-from . import policy, pressure, util
+from . import config_edit, policy, pressure, util
+from .config import ConfigError
 from .telemetry import READ_ERRORS, Sampler, cost
 
 # Probing calls every workload's API; several open tabs share one probe a second.
 STATUS_TTL_S = 1.0
 # `why` probes again (busy(), reachability): share it between tabs the same way.
 WHY_TTL_S = 3.0
+# A policy save is the one write the dashboard does, so it's the one request a hostile page
+# would like to make. A cross-site form can set neither the header nor a JSON content type, and
+# a cross-site fetch that could set both has to pass a preflight this server never answers.
+EDIT_HEADER = "X-Vhotseat-Edit"
+POLICY_BODY_LIMIT = 64 * 1024
 # The event rows that are a warning rather than a record: a load a policy refused, and a
 # workload a claim was not allowed to unload. Both say somebody may be short of VRAM.
 POLICY_WARNING_ROWS = ("policy-refused", "policy-kept")
@@ -117,6 +129,8 @@ class Dashboard:
         with self._status_lock:
             at, cached = self._status
             if cached is None or time.monotonic() - at > STATUS_TTL_S:
+                # probe() reloads the policy first: the owner may have saved it, or hand-edited the
+                # file, since this page started, and the rules the page shows are the ones acting.
                 cached = {**self.arbiter.probe(), "workloads": list(self.arbiter.workloads),
                           "labels": {n: w.label for n, w in self.arbiter.workloads.items()},
                           "idle": {n: w.idle_vram_mib for n, w in self.arbiter.workloads.items()},
@@ -160,6 +174,10 @@ class Dashboard:
                     # no "history since" line, and a fit worked out from this second's reading alone.
                     # Only one of the two is something the owner can fix, so the page says which.
                     cached["history_error"] = unreadable
+                if self.arbiter.config_error:
+                    # The rules still running are the ones from the last config that read, and
+                    # without this the page would say nothing about a file that is now broken.
+                    cached["config_error"] = self.arbiter.config_error
                 self._status = (time.monotonic(), cached)
             return cached
 
@@ -208,11 +226,90 @@ class Dashboard:
                 self._why = (time.monotonic(), cached)
             return cached
 
+    def policy(self) -> dict:
+        """The policy in the shape the editor's grid reads: the two keys per workload the arbiter
+        acts on, each cell's choice and what it does, the unload order, and the `ask:` and
+        `pressure:` numbers.
+
+        The choices and the sentences come from `policy.py`, not from anything the page works out,
+        so what a cell claims before saving is what the next handover will do. `version` is the
+        config file's: the page sends it back with a save, because the file may not still say what
+        the page is showing - a hand-edit between reading and saving is refused rather than painted
+        over. Both halves come from one reading of that file for that reason: the rules taken from
+        memory alongside a version read fresh is how a save writes a hand-edit away and calls it a
+        success, and what this process puts in force is the text it just showed.
+        """
+        path = self.arbiter.config_path
+        version, error = None, None
+        if path:
+            try:
+                text, version = config_edit.read(path)
+            except ConfigError as e:
+                # Hand-edited into something that doesn't read: the grid keeps showing the rules in
+                # force, and a save comes back with the reason. `/api/status` says the same thing.
+                error, version = str(e), None
+            else:
+                error = self.arbiter.adopt_policy(text)
+        wls = self.arbiter.workloads
+        where = {n: i for i, n in enumerate(wls)}   # the config's order, for a tie on priority
+        rows = [(w.name, w.label, w.yields_to, w.asks_for) for w in wls.values()]
+        requesters = [{"id": w.name, "label": w.label} for w in wls.values()]
+        requesters += [{"id": cid, "label": label, "sub": sub}
+                       for cid, label, sub in policy.SPECIAL_REQUESTERS]
+        grid = {"version": version, "path": str(path) if path else None,
+                "order": [{"workload": w.name, "label": w.label, "priority": w.priority}
+                          for w in sorted(wls.values(),
+                                          key=lambda w: (w.priority, where[w.name]))],
+                "requesters": requesters,
+                "matrix": policy.matrix(rows, [(r["id"], r["label"]) for r in requesters]),
+                "ask": dict(self.arbiter.ask),
+                "pressure": dict(self.arbiter.pressure_cfg)}
+        if error:
+            grid["config_error"] = error
+        return grid
+
+    def save_policy(self, body: bytes) -> tuple[int, dict]:
+        """Write a posted policy to the config file. 200 with the new version, 400 with the reason
+        it isn't a config, 409 with the version that's actually there now.
+
+        Nothing about the card is touched: the file is the owner's decision, and the processes that
+        act on it - this one, `watch`, every gate and guard - pick it up as they go.
+        """
+        path = self.arbiter.config_path
+        if not path:
+            return 400, {"error": "this dashboard isn't reading a config file it can write back"}
+        try:
+            posted = json.loads(body.decode("utf-8"))
+        except UnicodeDecodeError:
+            return 400, {"error": "the body isn't utf-8 text"}
+        except json.JSONDecodeError as e:
+            return 400, {"error": f"expected a JSON body: {e.msg}"}
+        if not isinstance(posted, dict):
+            return 400, {"error": "expected an object of "
+                                  "{version, priorities, matrix, ask, pressure}"}
+        try:
+            version = config_edit.save(path, posted.get("version") or "",
+                                       priorities=posted.get("priorities"),
+                                       matrix=posted.get("matrix"), ask=posted.get("ask"),
+                                       pressure=posted.get("pressure"))
+        except config_edit.Conflict as e:
+            return 409, {"error": str(e), "version": e.version}
+        except config_edit.Locked as e:
+            # Another save, in this process or another one. Nothing was written and the caller's
+            # reading is still good, so this is a try-again rather than a re-read.
+            return 409, {"error": str(e)}
+        except ConfigError as e:
+            return 400, {"error": str(e)}
+        self.arbiter.reload_policy(force=True)
+        return 200, {"version": version}
+
     def api(self, path: str, query: dict) -> tuple[int, object]:
         if path == "/api/status":
             return 200, self.status()
         if path == "/api/why":
             return 200, self.why()
+        if path == "/api/policy":
+            return 200, self.policy()
         if self.telemetry is None:
             return 404, {"error": "telemetry is off (telemetry.enabled: false in the config)"}
         now = time.time()
@@ -256,6 +353,9 @@ class Dashboard:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _json(self, code: int, payload: object) -> None:
+                self._send(code, json.dumps(payload).encode(), "application/json")
+
             def do_GET(self):
                 url = urlparse(self.path)
                 if url.path in ("/", "/index.html"):
@@ -268,10 +368,50 @@ class Dashboard:
                     code, body = 500, {"error": f"{type(e).__name__}: {e}"}
                 self._send(code, json.dumps(body).encode(), "application/json")
 
+            def do_POST(self):
+                url = urlparse(self.path)
+                if url.path != "/api/policy":
+                    return self._json(404, {"error": f"no such endpoint: {url.path}"})
+                reason = guard(self.headers, self.server.server_address[1])
+                if reason:
+                    return self._json(403, {"error": reason})
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    return self._json(400, {"error": "Content-Length isn't a number"})
+                if length <= 0:
+                    return self._json(400, {"error": "expected a JSON body"})
+                if length > POLICY_BODY_LIMIT:
+                    return self._json(400, {"error": f"body over {POLICY_BODY_LIMIT} bytes"})
+                code, payload = dash.save_policy(self.rfile.read(length))
+                return self._json(code, payload)
+
             def log_message(self, *args):
                 pass
 
         return Handler
+
+
+def guard(headers, port: int) -> str | None:
+    """Why this POST may not write the owner's config, or None that it may.
+
+    Three checks, because a browser will carry a request from a page the visitor was only reading,
+    and a config is not a page-refresh: the custom header, which a page on another origin can't
+    send without a preflight this server never answers; a JSON content type, which a cross-site
+    form can't pick either; and an `Origin` that is this dashboard's own port, for the requests a
+    preflight wouldn't even be needed for. An absent Origin is a non-browser client - curl, a test,
+    a script - which is the same thing that reads the config by hand. No CORS headers are ever
+    sent, so nothing here is opened up to another origin by answering it.
+    """
+    if (origin := headers.get("Origin")) and origin not in (f"http://127.0.0.1:{port}",
+                                                            f"http://localhost:{port}"):
+        return f"that Origin isn't this dashboard's: {origin}"
+    if headers.get(EDIT_HEADER) != "1":
+        return f"a policy save needs the {EDIT_HEADER}: 1 header"
+    kind = (headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if kind != "application/json":
+        return f"a policy save needs Content-Type: application/json, not {kind or 'nothing'}"
+    return None
 
 
 def claim_watcher(arbiter, stop: threading.Event) -> None:
@@ -326,6 +466,11 @@ def watch(arbiter, polls: int | None = None) -> int:
 
     `polls` stops it after that many polls: what the tests use, and what a scheduled
     claim log can use instead of a resident process.
+
+    A pass that raises is logged and the loop carries on, the way the dashboard's background check
+    has always done it. On most boxes this is the only actor, and the one that releases the card for
+    a game that asks: a poll tripping over a driver, a log file that moved, or a process that
+    vanished mid-scan shouldn't end that for the rest of the day.
     """
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -339,7 +484,10 @@ def watch(arbiter, polls: int | None = None) -> int:
     with Sampler(arbiter) if arbiter.telemetry else contextlib.nullcontext():
         while polls is None or polls > 0:
             polls = None if polls is None else polls - 1
-            watch_pass(arbiter, arbiter.claim_hits())
+            try:
+                watch_pass(arbiter, arbiter.claim_hits())
+            except Exception as e:                              # a bad poll must not stop the watcher
+                util.log(f"check failed: {type(e).__name__}: {e}")
             if polls is not None and polls <= 0:
                 break
             stop.wait(claim_every)
@@ -503,9 +651,11 @@ STUCK_TRIES = 3
 
 
 def watch_pass(arbiter, hits: list[dict]) -> None:
-    """One pass of what the watcher does: record the claims and act on them, then look at the
-    pressure the claims don't explain. One call because both halves want the same process scan, and
-    both are safe to run from more than one process on the box."""
+    """One pass of what the watcher does: pick up the owner's policy if the file changed, record
+    the claims and act on them, then look at the pressure the claims don't explain. One call
+    because both halves want the same process scan, and both are safe to run from more than one
+    process on the box."""
+    arbiter.reload_policy()
     claim_transitions(arbiter, hits)
     pressure_pass(arbiter, {h["pid"] for h in hits})
 

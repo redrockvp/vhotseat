@@ -49,6 +49,10 @@ class Workload:
     # is every handover, which is what vhotseat did before there was a policy; () means it
     # keeps its model until someone types `vhotseat switch`.
     yields_to: tuple[str, ...] = policy.DEFAULT_YIELDS_TO
+    # Which newcomers it wants asked before anything unloads it (policy.py): the same names
+    # as `yields_to`, less the "*". An absent key asks for nobody. Until the asking exists,
+    # a name here keeps the workload loaded exactly as a refusal does.
+    asks_for: tuple[str, ...] = policy.DEFAULT_ASKS_FOR
     # Among the workloads that may be unloaded for the same reason, the lowest priority
     # is asked first. It is never a way to unload something that refused.
     priority: int = policy.DEFAULT_PRIORITY
