@@ -374,9 +374,12 @@ all. No CORS header is ever sent, so nothing here is readable from another origi
 
 The file is rewritten a line at a time, only where a policy key lives: comments, key order,
 quoting style and CRLF survive a save, a key that wasn't touched isn't rewritten, and the whole
-result is checked by the same `config.parse` the CLI loads with before a byte is written. The file
-that was there is kept beside it as `config.yaml.bak-<time>` (the newest ten). `vhotseat doctor`
-and `git diff` still make sense of the file afterwards.
+result is checked by the same `config.parse` the CLI loads with before a byte is written. A key
+that goes back to its default is dropped, since an absent key says it - unless the owner left a
+note on that line, in which case the line stays, says the default, and keeps their note: the note is
+the reason for a decision that was changed, and deleting the key with it would lose something the
+owner wrote. The file that was there is kept beside it as `config.yaml.bak-<time>` (the newest ten).
+`vhotseat doctor` and `git diff` still make sense of the file afterwards.
 
 A save reaches the processes that are already running. `vhotseat web`, `vhotseat watch` and
 `vhotseat record` notice the file's mtime and size change - each samples through the same probe -

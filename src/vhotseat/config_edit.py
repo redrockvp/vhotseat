@@ -232,6 +232,17 @@ def save(path, version: str, *, priorities=None, matrix=None, ask=None, pressure
     return version_of(new_text)
 
 
+def _default_for(path: list[str]):
+    """What an absent key of this file means - the answer `DROP` stands for. The writer normally
+    leaves a default out; a line the owner annotated keeps its key, so the default has to be
+    written there rather than assumed, and the note has to say what it is now."""
+    if len(path) == 3:
+        return {"priority": policy.DEFAULT_PRIORITY,
+                "yields_to": list(policy.DEFAULT_YIELDS_TO),
+                "asks_for": list(policy.DEFAULT_ASKS_FOR)}[path[-1]]
+    return dict(pressure.DEFAULTS if path[0] == "pressure" else policy.ASK_DEFAULTS)[path[-1]]
+
+
 def _backup(path: Path) -> None:
     """Copy the file to `config.yaml.bak-YYYYMMDD-HHMMSS` beside it, keeping the newest ten."""
     target = _next_backup_name(path, datetime.now().strftime("%Y%m%d-%H%M%S"))
@@ -310,8 +321,14 @@ class _Doc:
             line, col = int(where[key][0]), int(where[key][1])
             if value is DROP:
                 # A key whose note the owner wrote stays: dropping the key would drop their
-                # comment with it, and a value already at the default decides nothing either way.
+                # comment with it. What stays is the note and the *new* answer written out, not
+                # the line as it was: an answer that went back to the default still changed the
+                # decision, and `yields_to: []   # keep my model` left in the file while the page
+                # says it makes room for everyone is a config that keeps unloading them.
                 if _eol_comment(self.lines[line]):
+                    self.patches.append((line, _extent(self.lines, line, col) + 1,
+                                         _value_lines(key, _default_for(path), col,
+                                                      self.lines[line])))
                     return
                 self.patches.append((line, _extent(self.lines, line, col) + 1, []))
                 return

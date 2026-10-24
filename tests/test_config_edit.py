@@ -174,6 +174,29 @@ def insert_after_line(text, needle, new_lines, nth=1):
     raise AssertionError(f"no {nth}th {needle!r}")
 
 
+def test_resetting_an_annotated_key_to_its_default_still_changes_the_value(cfg_file):
+    """The owner wrote why they hold their model; later the page says make room for everyone. That
+    answer needs no key - an absent `yields_to:` is the same answer - so the key goes back to what
+    being absent means, and the note stays to explain what was decided there before. Leaving the
+    old value on the line because the key can't be deleted without taking the note is the failure
+    this is about: the page says saved, `status` says the model is safe, and the next handover
+    unloads it - or the other way round, with a `[]` nobody chose any more holding the card."""
+    hand = insert_after_line(text_of(cfg_file), "allow_restart: true",
+                             ["    yields_to: []      # keep my model loaded"], 1)
+    hand = insert_after_line(hand, "patches: []",
+                             ["ask:", "  timeout_s: 300   # I walk away from the keyboard a lot"], 1)
+    cfg_file.write_bytes(hand.encode("utf-8"))
+    assert config.load(cfg_file)["workloads"]["strata"]["yields_to"] == []
+    save(cfg_file, matrix={"strata": ALL_YES, "comfy": COMFY_ASKS_PRESSURE},
+         ask={"timeout_s": 120})
+    cfg = config.load(cfg_file)
+    assert cfg["workloads"]["strata"]["yields_to"] == ["*"], "the old answer is still in the file"
+    assert cfg["ask"]["timeout_s"] == 120
+    notes = text_of(cfg_file).splitlines()
+    assert any("keep my model loaded" in ln for ln in notes)
+    assert any("walk away from the keyboard" in ln for ln in notes)
+
+
 def test_a_note_at_the_end_of_a_policy_line_survives_the_value_it_describes(cfg_file):
     """The owner wrote why they picked the number next to the number. The page changes the number;
     the note stays where it was rather than drifting a column or going away, because otherwise the
