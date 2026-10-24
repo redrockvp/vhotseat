@@ -10,7 +10,7 @@ import urllib.request
 
 import pytest
 
-from fakes import COMFY_MODEL_VRAM, STRATA_VRAM
+from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, STRATA_VRAM
 from vhotseat import claims, config, host, telemetry, util, web
 from vhotseat.telemetry import Telemetry
 
@@ -398,6 +398,33 @@ def test_the_dashboard_shows_which_two_workloads_fit_on_the_card_together(rig, s
     assert out["floor"] == 0                        # the fakes' card has nothing else on it
     assert out["fits"] == [{"a": "strata", "b": "comfy", "mib": STRATA_VRAM + COMFY_MODEL_VRAM,
                             "fits": False, "why": None}]
+
+
+def test_a_telemetry_that_cant_be_read_costs_the_page_its_history_not_its_status(rig, server,
+                                                                                 monkeypatch):
+    """Every status poll asks the history for three numbers: how far back it goes, what the card
+    usually carries that nothing here can free, and what each workload has been seen holding. A
+    database another process has locked - or one that has gone corrupt - raised through all three,
+    /api/status answered 500, and the page went blank: the card in front of the owner, the holders,
+    the open claim and the pressure episode all unreadable, because a file the page only draws
+    pictures from could not be opened. It falls back the way the pressure readings do, and says which
+    of the two - no samples yet, or a file that can't be read - the blank history means."""
+    rig.gpu.other = 1200                             # memory nothing on this box can free
+    rig.strata.loaded = True
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    for read in ("oldest", "floor_mib", "peaks"):
+        monkeypatch.setattr(rig.arb.telemetry, read, locked)
+    code, body = get(server + "/api/status")
+    st = json.loads(body)
+    assert code == 200, st
+    assert st["mode"] == "strata"                    # the live answer is still the live answer
+    assert st["oldest"] is None and st["interval_s"] == 5
+    assert st["floor"] == 1200                       # the card as it reads now, as with no samples
+    assert st["peaks"] == {"strata": STRATA_VRAM, "comfy": COMFY_CONTEXT_VRAM}
+    assert "database is locked" in st["history_error"]
 
 
 def test_an_evening_of_gaming_doesnt_make_every_pair_read_no_room(tmp_path):
