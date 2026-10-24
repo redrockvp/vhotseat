@@ -40,6 +40,22 @@ SPECIAL = (CLAIMS, PRESSURE, ANYONE)
 RESERVED = (CLAIMS, PRESSURE)
 DEFAULT_PRIORITY = 50
 PRIORITY_MIN, PRIORITY_MAX = 0, 100
+
+
+def priorities_for(order) -> dict:
+    """The unload order an owner dragged into shape, as the `priority:` numbers the config
+    holds: first gives way first.
+
+    The ends sit at 90 and 10 rather than 100 and 0 so that putting one workload above or below
+    the rest later doesn't mean renumbering the file, and so that the middle of a three-workload
+    order lands exactly on the default 50 - which the writer then leaves out of the file rather
+    than writing a default out. Ties keep the config's own order, which is what `priority:`
+    already does."""
+    n = len(order)
+    if n <= 1:
+        return {name: DEFAULT_PRIORITY for name in order}
+    return {name: round(90 - i * (80 / (n - 1))) for i, name in enumerate(order)}
+
 DEFAULT_YIELDS_TO = ("*",)
 # `asks_for:` has no `*`: "ask me before unloading me for anyone" is not a question anyone
 # can answer, and an absent key means it asks for nobody, which is the old behaviour.
@@ -71,6 +87,11 @@ def yields(spec, reason: str, asks_for=()) -> bool:
     workload's name, `claims` or `pressure`? Only a `yes` may: asking first keeps it loaded,
     which is what it will do until the asking exists and what it does today either way."""
     return choice(spec, asks_for, reason) == "yes"
+
+
+# The three answers one cell of the grid holds, in the order the editor lists them: what the
+# newcomer gets, whether the owner is asked first, and nothing.
+CHOICES = ("yes", "ask", "keep")
 
 
 def choice(yields_to, asks_for, reason: str) -> str:
