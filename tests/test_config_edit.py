@@ -335,3 +335,20 @@ def test_the_order_an_editor_chooses_becomes_priorities_with_room_left():
     assert three == {"comfy": 10, "unsloth": 50, "strata": 90}
     assert all(policy.PRIORITY_MIN <= v <= policy.PRIORITY_MAX
                for v in policy.priorities_for(list("abcdefgh")).values())
+
+
+def test_a_new_top_level_block_is_separated_from_the_block_above_it(cfg_file):
+    """`pressure:` isn't a real key of the shipped example, so a save that sets it writes one. The
+    file keeps a blank line between its top-level blocks, and a new block that lands tight against
+    the line above reads like a key of that block - which is the shape the owner has to be able to
+    read, not just the parser."""
+    before = text_of(cfg_file)
+    assert not [ln for ln in before.splitlines() if ln == "pressure:"]
+    save(cfg_file, pressure={"grow_mib": 5000}, ask={"timeout_s": 300})
+    after = text_of(cfg_file).splitlines()
+    for block, key in (("pressure:", "  grow_mib: 5000"), ("ask:", "  timeout_s: 300")):
+        at = next(i for i, ln in enumerate(after) if ln == block)
+        assert after[at - 1] == "", block
+        assert after[at + 1] == key, block
+    cfg = config.load(cfg_file)
+    assert cfg["pressure"]["grow_mib"] == 5000 and cfg["ask"]["timeout_s"] == 300

@@ -322,7 +322,13 @@ class _Doc:
                              [v for v in value.values() if v is not DROP]):
             return
         after, col = self._new_key_spot(path[:-1])
-        self.patches.append((after + 1, after + 1, _value_lines(key, value, col)))
+        lines = _value_lines(key, value, col)
+        if col == 0 and after >= 0 and self.lines[after].strip():
+            # A new top-level block gets the blank line the file puts between its blocks: one
+            # written tight against the line above reads as another key of that block, and the
+            # owner finds out when they open the file to check what the page saved.
+            lines = [""] + lines
+        self.patches.append((after + 1, after + 1, lines))
 
     def set_block(self, path: list[str], values: dict) -> None:
         """A whole block: its keys one at a time, so the ones this save isn't changing keep their
