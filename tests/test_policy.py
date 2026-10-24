@@ -285,6 +285,63 @@ def test_status_and_claims_say_what_a_claim_was_not_given(rig, monkeypatch, caps
     assert "kept for its policy: strata" in capsys.readouterr().out
 
 
+# --- asking first -------------------------------------------------------------------
+
+
+def test_asks_for_takes_the_same_names_as_yields_to_less_the_star(rig):
+    """The third answer takes the same vocabulary as the other two, so a row of the grid can
+    be written by hand as easily as it is clicked. Not the `"*"`: "ask me before unloading me
+    for anyone" is a question no owner can answer, and it would swallow the row."""
+    raw = config.parse((ROOT / "config.example.yaml").read_text())
+    for good in (["comfy"], ["claims"], ["pressure"], ["comfy", "pressure"], []):
+        raw["workloads"]["strata"]["asks_for"] = good
+        config.validate(raw)
+    for bad in (["*"], ["strat"], "comfy", [None]):
+        raw["workloads"]["strata"]["asks_for"] = bad
+        with pytest.raises(config.ConfigError, match="asks_for"):
+            config.validate(raw)
+
+
+def test_a_workload_isnt_named_in_both_lists(rig):
+    """`yields_to: [comfy]` next to `asks_for: [comfy]` says it makes room for ComfyUI and
+    that it waits for an answer first. One of the two has to be what it means, so the config
+    says so rather than picking a winner by key order."""
+    raw = config.parse((ROOT / "config.example.yaml").read_text())
+    raw["workloads"]["strata"]["yields_to"] = ["comfy", "claims"]
+    raw["workloads"]["strata"]["asks_for"] = ["claims"]
+    with pytest.raises(config.ConfigError, match="both yields_to: and asks_for:"):
+        config.validate(raw)
+    # `"*"` covers everyone, so it isn't naming the same newcomer twice; the ask is the
+    # narrower answer and the matrix reads it as the one that counts.
+    raw["workloads"]["strata"]["yields_to"] = ["*"]
+    config.validate(raw)
+
+
+def test_the_ask_block_is_a_wait_and_what_happens_with_no_answer(rig):
+    """Owner-side numbers, same style as `pressure:`: a wait and a fallback. Nothing waits
+    yet, so a typo here would be a typo in a feature the owner can't see working."""
+    raw = config.parse((ROOT / "config.example.yaml").read_text())
+    for good in ({"timeout_s": 120}, {"fallback": "release"},
+                 {"timeout_s": 5.5, "fallback": "keep"}):
+        raw["ask"] = good
+        assert config.validate(raw)["ask"] == good
+    for bad, why in (({"fallback": "ask"}, "ask.fallback"), ({"timeout_s": 0}, "ask.timeout_s"),
+                     ({"timeout_s": "2 min"}, "ask.timeout_s"), ({"ask_me": True}, "unknown key"),
+                     (["keep"], "expected a mapping")):
+        raw["ask"] = bad
+        with pytest.raises(config.ConfigError, match=why):
+            config.validate(raw)
+
+
+def test_the_ask_defaults_are_recorded_not_invented_by_the_reader(rig):
+    """One place says what an unanswered ask is worth, and the config's absence of a key means
+    that number rather than a second default somewhere else."""
+    assert policy.ask_cfg(None) == {"timeout_s": 120, "fallback": "keep"}
+    assert policy.ask_cfg({"timeout_s": 30, "fallback": "release"}) == {
+        "timeout_s": 30, "fallback": "release"}
+    assert policy.ask_cfg({"fallback": "release"})["timeout_s"] == 120
+
+
 # --- saying it back -----------------------------------------------------------------
 
 

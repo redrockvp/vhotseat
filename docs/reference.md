@@ -108,7 +108,7 @@ clients reading results have had time to.
 ## Who gives way for whom
 
 Which workloads get unloaded to make room used to be one rule for everything: whatever
-held memory on the card was a candidate for every handover. Two keys per workload make
+held memory on the card was a candidate for every handover. Three keys per workload make
 it a decision of yours instead:
 
 ```yaml
@@ -119,6 +119,9 @@ workloads:
   unsloth:
     priority: 20            # idle and cheap to reload: asked first
     yields_to: ["*"]        # the default: it gives way for anyone
+  comfy:
+    yields_to: ["*"]        # makes room for everyone...
+    asks_for: [claims]      # ...except a game, which asks first
 ```
 
 `yields_to:` lists the newcomers this workload will make room for. An entry is another
@@ -129,6 +132,21 @@ existed, so an existing config keeps behaving as it did. An empty list means it 
 way for nobody: only a command you type moves it. An entry naming a workload that isn't
 in the config is a config error, not a rule that quietly never matches; a workload can't
 be named `claims` or `pressure`, because those are words `yields_to:` already means.
+
+`asks_for:` is the third answer: *ask me before you unload me*. It takes the same entries
+as `yields_to:` without the `"*"` - an ask that means "anyone" is a question nobody can
+answer - and one entry named in both keys is a config error, because it would say two
+things at once. **The asking isn't built yet.** Until it is, a name in `asks_for:` keeps
+that workload loaded exactly as leaving it out of `yields_to:` does - a load nobody chose
+is refused, a claim leaves it holding and records `policy-kept` - and `vhotseat status`
+and `vhotseat why` say it asks first rather than pretending an answer is coming. What is
+not asked for is not unloaded, whichever way the question was meant.
+
+Top level, `ask:` is what an unanswered ask will be worth: `timeout_s` (default 120) how
+long to hold the handover for an answer, and `fallback` of `keep` (default, leave it
+loaded) or `release` (unload it anyway). Nothing waits or notifies yet; the two keys are
+read by the dashboard and recorded so the asking has something written to be built
+against.
 
 What the policy decides is **who gets unloaded, and who is refused instead**. It is
 enforced wherever vhotseat decides to unload something, and its direction matters:
@@ -150,8 +168,9 @@ enforced wherever vhotseat decides to unload something, and its direction matter
   shows; a load that hasn't put weights on the card yet isn't yet a holder.
 
 `priority:` orders the workloads that *may* be unloaded - the lowest is asked first - and
-never overrules `yields_to:`. Both are shown by `vhotseat status` and `vhotseat why`, and
-read-only on the dashboard until there's a way to edit them there.
+never overrules `yields_to:` or `asks_for:`. All three are shown by `vhotseat status` and
+`vhotseat why`, and edited through `GET`/`POST /api/policy`; the page that edits them is
+still to come.
 
 ## Talking to a server that isn't a plain server
 

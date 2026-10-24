@@ -9,6 +9,17 @@ manage), or `*` for anyone. The default when the key is absent is `["*"]`, which
 exactly the old behaviour, and an empty list means it gives way for nobody: only a
 typed `vhotseat switch` moves it.
 
+`asks_for:` is the third answer a person has in mind between "make room" and "keep
+loaded": unload me only after asking. It takes the same entries as `yields_to` except the
+`*` - an ask has to name who is asking - and an entry named in both keys is a config error
+rather than a rule with two readings. Until the asking itself exists, an `ask` is exactly a
+keep at runtime: nothing unloads for that newcomer, and `status` and `why` say so rather
+than letting the owner believe an answer is on its way.
+
+`ask:` (top level) is what an unanswered ask is worth: `timeout_s` to wait, and `fallback`
+of `keep` or `release` for what to do when nobody answers. Nothing waits yet; the numbers
+are recorded so the asking has something to be written against.
+
 `priority:` (0-100, default 50) is the order among the workloads that *may* be unloaded:
 the lowest goes first. It never overrules `yields_to` - a workload that refuses is not
 unloaded more slowly, it is not unloaded.
@@ -30,9 +41,29 @@ RESERVED = (CLAIMS, PRESSURE)
 DEFAULT_PRIORITY = 50
 PRIORITY_MIN, PRIORITY_MAX = 0, 100
 DEFAULT_YIELDS_TO = ("*",)
+# `asks_for:` has no `*`: "ask me before unloading me for anyone" is not a question anyone
+# can answer, and an absent key means it asks for nobody, which is the old behaviour.
+SPECIAL_ASK = (CLAIMS, PRESSURE)
+DEFAULT_ASKS_FOR = ()
+
+# What an unanswered ask is worth, until the asking exists (`ask:`).
+ASK_DEFAULTS = {"timeout_s": 120, "fallback": "keep"}
+FALLBACKS = ("keep", "release")
 
 # How the special words read in a sentence shown to a person.
 PHRASE = {CLAIMS: "a claim on the card", PRESSURE: "the card running short"}
+
+# The two requesters that aren't a workload, as the editor shows them: what a column is
+# called, and the line under it that says who that is.
+SPECIAL_REQUESTERS = ((CLAIMS, "A game", "or any app that claims the GPU"),
+                      (PRESSURE, "Low VRAM", "another app squeezes the card"))
+
+
+def ask_cfg(raw: dict | None) -> dict:
+    """The `ask:` block with the defaults filled in, as a plain dict the way the other
+    blocks are, so the dashboard can show it and the asking can be written against it."""
+    raw = raw or {}
+    return {k: raw.get(k, v) for k, v in ASK_DEFAULTS.items()}
 
 
 def yields(spec, reason: str) -> bool:
