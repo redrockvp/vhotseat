@@ -41,6 +41,11 @@ from .lock import try_lock, unlock
 # reaches back over a session of saving, few enough that a year of dashboards doesn't leave a
 # hundred copies of a 100-line file behind.
 BACKUP_KEEP = 10
+# Two processes saving in the same second want the same backup name. The one that loses the O_EXCL
+# race takes the next name; a handful of tries is more than the number of processes that save at
+# once on this box, and running out refuses the save rather than replacing the file without a copy
+# of it beside it.
+BACKUP_NAME_TRIES = 5
 # A save reads the file, checks the version, copies the old one and replaces it. Two of those, in
 # two threads or two processes, can both pass the check and the later one then writes over what
 # the earlier one saved, with both answers saying it worked. So a save takes a turn on a lock file
@@ -302,10 +307,45 @@ def _default_for(path: list[str]):
     return dict(pressure.DEFAULTS if path[0] == "pressure" else policy.ASK_DEFAULTS)[path[-1]]
 
 
+def _mode(path: Path) -> int | None:
+    """The permission bits the file has, or None if they can't be read. They matter because the file
+    can hold an inference server's key as plain text - `headers: {Authorization: "Bearer …"}` - and
+    those bits are the only thing between that key and everyone else on the box."""
+    try:
+        return os.stat(path).st_mode & 0o7777
+    except OSError:
+        return None
+
+
 def _backup(path: Path) -> None:
-    """Copy the file to `config.yaml.bak-YYYYMMDD-HHMMSS` beside it, keeping the newest ten."""
-    target = _next_backup_name(path, datetime.now().strftime("%Y%m%d-%H%M%S"))
-    target.write_bytes(path.read_bytes())
+    """Copy the file to `config.yaml.bak-YYYYMMDD-HHMMSS` beside it, keeping the newest ten.
+
+    The copy is created with the source's own permission bits, in the one call that creates it: a
+    backup written with the process's default mode is the same key world-readable beside the file,
+    and the rotation keeps ten of them, so it stays readable for an afternoon of saves. Creating it
+    and tightening it afterwards isn't the same thing - there is a moment in between. O_CREAT with
+    O_EXCL also means two processes saving at the same second don't both write the one name: the
+    loser takes the next name rather than writing over the winner halfway through."""
+    data = path.read_bytes()
+    mode = _mode(path)
+    for _ in range(BACKUP_NAME_TRIES):
+        target = _next_backup_name(path, datetime.now().strftime("%Y%m%d-%H%M%S"))
+        try:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                         mode if mode is not None else 0o600)
+        except FileExistsError:
+            continue                                   # someone else took that name this second
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            if mode is not None:
+                os.chmod(target, mode)                 # the umask only ever narrows what was asked
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+        break
+    else:
+        raise ConfigError(f"{path}: couldn't make a backup beside it - nothing was written")
     for old in sorted(path.parent.glob(f"{path.name}.bak-*"))[:-BACKUP_KEEP]:
         old.unlink(missing_ok=True)
 
@@ -344,6 +384,14 @@ def _write(path: Path, text: str) -> None:
             f.write(text.encode("utf-8"))
             f.flush()
             os.fsync(f.fileno())
+        mode = _mode(path)
+        if mode is not None:
+            # mkstemp makes 0600. The file being replaced is the one whose bits the owner chose, and
+            # the new file takes its place, so it takes those bits too: a save that widened a 0600
+            # config would put a key on a shared machine where the owner had kept it to themselves,
+            # and one that narrowed a 0644 config stops a service account the owner shares it with
+            # from reading it.
+            os.chmod(tmp, mode)
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):

@@ -7,6 +7,7 @@ result. Every one of them edits a copy of `config.example.yaml` in `tmp_path` - 
 ships commented is the file the writer has to survive.
 """
 
+import os
 import shutil
 import threading
 import time
@@ -426,6 +427,51 @@ def test_a_save_that_changes_nothing_writes_and_backs_up_nothing(cfg_file, tmp_p
     _, now = config_edit.read(cfg_file)
     assert version == now == config_edit.version_of(text_of(EXAMPLE))
     assert list(tmp_path.glob("config.yaml.bak-*")) == []
+
+
+def test_a_backup_is_created_with_the_source_s_mode_not_afterwards(cfg_file, monkeypatch):
+    """A config can hold the key to the owner's own server as plain text - `headers:
+    {Authorization: "Bearer …"}` - and the owner who knows that saved the file 0600. A backup made
+    with the process's default mode puts the same credentials world-readable beside it, and the
+    rotation keeps ten of them. It also has to be created with that mode rather than tightened
+    afterwards: a create-then-chmod leaves a moment when the file is there with the wrong bits, and
+    on a shared machine a moment is what a reader needs."""
+    cfg_file.chmod(0o600)
+    source_mode = cfg_file.stat().st_mode & 0o7777
+    calls = []
+    real_open = os.open
+
+    def spy(path, flags, *args, **kw):
+        if "bak-" in str(path):
+            calls.append((flags, args))
+        return real_open(path, flags, *args, **kw)
+
+    monkeypatch.setattr(os, "open", spy)
+    save(cfg_file, matrix={"strata": STRATA_KEEPS_COMFY_ASKS_CLAIMS,
+                           "comfy": COMFY_ASKS_PRESSURE})
+    assert calls, "the backup wasn't created by a single call that set its mode"
+    for flags, args in calls:
+        assert flags & os.O_CREAT and flags & os.O_EXCL, "the backup was created without O_EXCL"
+        assert args and args[0] == source_mode, f"created with {args}, the file is {oct(source_mode)}"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the mode bits a POSIX file carries; Windows has ACLs")
+@pytest.mark.parametrize("mode", [0o600, 0o644])
+def test_a_save_leaves_the_file_and_its_backup_as_private_as_the_file_was(cfg_file, mode):
+    """Neither half of the write gets to change who can read the config. The copy beside it must not
+    come out more readable than the file it was copied from; and the replacement, which is a fresh
+    temporary file moved into place, must not quietly narrow a file the owner wrote 0644 either -
+    an owner who shares their config with a container user finds out when that user can no longer
+    read it. The bits themselves mean little on Windows and this box has no ACL story to
+    check, so the assertions are POSIX-only."""
+    cfg_file.chmod(mode)
+    save(cfg_file, matrix={"strata": STRATA_KEEPS_COMFY_ASKS_CLAIMS,
+                           "comfy": COMFY_ASKS_PRESSURE})
+    assert cfg_file.stat().st_mode & 0o777 == mode & 0o777, "the save changed the file's own mode"
+    backups = list(cfg_file.parent.glob("config.yaml.bak-*"))
+    assert backups
+    for backup in backups:
+        assert backup.stat().st_mode & 0o7777 == mode, f"{backup.name} is more open than the file"
 
 
 def test_the_written_lists_are_read_back_as_the_same_policy(cfg_file):
