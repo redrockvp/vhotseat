@@ -44,7 +44,7 @@ class Arbiter:
                  gate_release_timeout_s: float = 20, release_timeout_s: float = 60,
                  machine_ram=host.machine_ram, telemetry=None, power: dict | None = None,
                  claim_rules: list | None = None, claim_ignore=(), claim_poll_s: float = 2.0,
-                 pressure_cfg: dict | None = None):
+                 pressure_cfg: dict | None = None, ask_cfg: dict | None = None):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
         self.lock = lock
@@ -72,6 +72,10 @@ class Arbiter:
         # `ignore:` - the processes the owner has said are never the reason (a VM, a benchmark, a
         # miner), whose memory is out of the measurement rather than just out of the report.
         self.pressure_cfg = pressure.cfg(pressure_cfg)
+        # What an unanswered ask is worth: the `ask:` block with the defaults in it. Nothing
+        # waits or notifies yet, so no decision reads it; the dashboard shows it, and the
+        # asking will be written against these numbers rather than its own.
+        self.ask = policy.ask_cfg(ask_cfg)
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
@@ -131,17 +135,19 @@ class Arbiter:
                 if (gpu.get(f"{n}_mib") or 0) > w.idle_vram_mib]
 
     def wont_give_way(self, reason: str, gpu: dict) -> list[str]:
-        """The loaded workloads whose `yields_to:` doesn't cover `reason` - a workload's
-        name, `claims` or `pressure` (policy.py)."""
+        """The loaded workloads that won't make room for `reason` - a workload's name,
+        `claims` or `pressure` (policy.py): the ones that refuse it, and the ones that want
+        asking first, which is the same thing until the asking is built."""
         return [n for n in self.loaded(gpu)
-                if n != reason and not policy.yields(self.workloads[n].yields_to, reason)]
+                if n != reason and not policy.yields(self.workloads[n].yields_to, reason,
+                                                     self.workloads[n].asks_for)]
 
     def policy_why(self, requester: str, blockers: list[str], gpu: dict) -> str:
         """The refusal in words a person can act on: who is in the way, how much it is
         holding, and what it does give way for - which is the key to change."""
         who = self.label(requester)
-        bits = [f"{self.label(n)} holds {gpu.get(f'{n}_mib')} MiB and its yields_to "
-                f"({policy.describe(self.workloads[n].yields_to)}) doesn't cover {who}"
+        bits = [f"{self.label(n)} holds {gpu.get(f'{n}_mib')} MiB and "
+                f"{policy.why_not(self.workloads[n].yields_to, self.workloads[n].asks_for, requester, who)}"
                 for n in blockers]
         return f"nothing will make room for {who}: " + "; ".join(bits)
 
@@ -156,9 +162,9 @@ class Arbiter:
 
     def kept_why(self, reason: str, name: str, held_mib: int) -> str:
         """Why something stayed loaded, in the sentence the row and the banner show."""
-        return (f"{self.label(name)} holds {held_mib} MiB and its yields_to "
-                f"({policy.describe(self.workloads[name].yields_to)}) doesn't cover "
-                f"{policy.PHRASE.get(reason, reason)}: it keeps its model, and whatever "
+        return (f"{self.label(name)} holds {held_mib} MiB and "
+                f"{policy.why_not(self.workloads[name].yields_to, self.workloads[name].asks_for, reason, policy.PHRASE.get(reason, reason))}"
+                f": it keeps its model, and whatever "
                 f"asked for the card may be short of that")
 
     def _policy_refused(self, source: str, requester: str, blockers: list[str], why: str) -> None:
@@ -188,7 +194,7 @@ class Arbiter:
         hits = self._claims_in(held)
         status = {"mode": mode, **states, "gpu": gpu, "holders": held, "claims": hits,
                   "policy": {n: {"priority": w.priority, "yields_to": list(w.yields_to),
-                                  "gives_way_for": policy.describe(w.yields_to)}
+                                  "gives_way_for": policy.describe(w.yields_to, w.asks_for)}
                              for n, w in self.workloads.items()},
                   "pressure": self.pressure_status(card=(gpu, every)),
                   "ram": ram, "last_event": self.events.last()}
@@ -217,7 +223,7 @@ class Arbiter:
         # Who will make room for whom, and in what order: the two keys are the owner's, and
         # a refusal that doesn't name them is unfixable from the outside.
         lines.append(f"{pad('policy:')}" + "; ".join(
-            f"{n} {w.priority} ({policy.describe(w.yields_to)})" for n, w in self.workloads.items()))
+            f"{n} {w.priority} ({policy.describe(w.yields_to, w.asks_for)})" for n, w in self.workloads.items()))
         shares = ", ".join(f"{n} {g[f'{n}_mib']}" for n in self.workloads)
         lines.append(f"{pad('gpu:')}" + (g["error"] if "error" in g else
                      f"{g['free_mib']} of {g['total_mib']} MiB free ({shares}, other {g['other_mib']})"))
@@ -452,8 +458,8 @@ class Arbiter:
 
         The policy is part of that state: a workload that won't give way for the one being
         asked about is a blocker, and one the claim won't unload is named, because "the game
-        is short of VRAM" is otherwise a mystery. Each answer carries its own priority and
-        yields_to, so what to change is on the same line as what is wrong.
+        is short of VRAM" is otherwise a mystery. Each answer carries its own priority,
+        yields_to and asks_for, so what to change is on the same line as what is wrong.
         """
         s = self.probe()
         gpu, ram = s["gpu"], s["ram"]
@@ -469,12 +475,13 @@ class Arbiter:
                 notes.append("two workloads are on the card at once: asking for it will release the other")
             for y in self._others(name):
                 held = y.vram_mib()
-                if hits and held > y.idle_vram_mib and not policy.yields(y.yields_to, policy.CLAIMS):
+                if hits and held > y.idle_vram_mib and not policy.yields(y.yields_to, policy.CLAIMS,
+                                                                        y.asks_for):
                     # The claim will leave this one alone, so the game gets less than the
                     # card could give it. Worth saying on the workload being asked about:
                     # "the game is short of VRAM" is otherwise a mystery.
-                    notes.append(f"{y.label} keeps its model for the claim: its yields_to "
-                                 f"({policy.describe(y.yields_to)}) doesn't cover a claim on the card")
+                    notes.append(f"{y.label} keeps its model for the claim: "
+                                 f"{policy.why_not(y.yields_to, y.asks_for, policy.CLAIMS, 'a claim on the card')}")
                 if not y.service_active():
                     if held > y.idle_vram_mib:
                         would, why = "blocked", f"a {y.label} process holds {held} MiB but its service is stopped"
@@ -493,10 +500,10 @@ class Arbiter:
                         would = "waiting"
                     notes.append(f"{y.label} is busy: {busy}; a handover waits for it to finish")
                 elif held > y.idle_vram_mib:
-                    if not policy.yields(y.yields_to, name):
+                    if not policy.yields(y.yields_to, name, y.asks_for):
                         would = "blocked"
                         notes.append(f"{y.label} holds {held} MiB and won't give way for {x.label}: "
-                                     f"its yields_to ({policy.describe(y.yields_to)}) doesn't cover it")
+                                     f"{policy.why_not(y.yields_to, y.asks_for, name, 'it')}")
                     else:
                         freed += held
                         notes.append(f"{y.label} holds {held} MiB and would be asked to release it")
@@ -522,9 +529,9 @@ class Arbiter:
                 elif name in (ep.get("targets") or []):
                     notes.append(f"the pressure episode for {row.get('name')} is still owed this "
                                  "workload: it has not come off yet")
-                elif not policy.yields(x.yields_to, policy.PRESSURE):
-                    notes.append(f"it was never a pressure target: its yields_to "
-                                 f"({policy.describe(x.yields_to)}) doesn't cover pressure")
+                elif not policy.yields(x.yields_to, policy.PRESSURE, x.asks_for):
+                    notes.append(f"it was never a pressure target: "
+                                 f"{policy.why_not(x.yields_to, x.asks_for, policy.PRESSURE, 'pressure')}")
                 if not x.active(x.probe(gpu), gpu):
                     notes.append("nothing loads it back while the card is short this way: only "
                                  "loading something, or `switch`, is the order to fill it again")
@@ -564,7 +571,8 @@ class Arbiter:
                 notes.append(note)
             out[name] = {"target": name, "label": x.label, "would": would, "holder": s["mode"],
                          "free_mib": gpu.get("free_mib"), "resident": resident,
-                         "priority": x.priority, "yields_to": list(x.yields_to), "notes": notes}
+                         "priority": x.priority, "yields_to": list(x.yields_to),
+                         "asks_for": list(x.asks_for), "notes": notes}
         return out
 
     def gate(self, name: str) -> bool:
@@ -648,7 +656,7 @@ class Arbiter:
         snap = self.snapshot()
         owed = [n for n, y in self.workloads.items()
                 if (snap.get(f"{n}_mib") or 0) > y.idle_vram_mib
-                and policy.yields(y.yields_to, policy.CLAIMS)]
+                and policy.yields(y.yields_to, policy.CLAIMS, y.asks_for)]
         return sorted(owed, key=lambda n: (self.workloads[n].priority, n))
 
     def claim_release(self, claim: dict, only: list[str] | None = None) -> dict:
@@ -681,7 +689,8 @@ class Arbiter:
         # recorded when the claim started says otherwise: the list is what the card held then,
         # this is the config's answer now (an owner who protects a workload mid-game stops the
         # watcher coming back for it on the next poll).
-        cands = {n: y for n, y in cands.items() if policy.yields(y.yields_to, policy.CLAIMS)}
+        cands = {n: y for n, y in cands.items()
+                 if policy.yields(y.yields_to, policy.CLAIMS, y.asks_for)}
         pre = self.snapshot()
         if not any((pre.get(f"{n}_mib") or 0) > y.idle_vram_mib for n, y in cands.items()):
             # Nothing it is owed is on the card, so there is nothing to free and no reason to
@@ -864,7 +873,8 @@ class Arbiter:
 
     def pressure_candidates(self, snap: dict | None = None) -> list[tuple[str, int]]:
         """The workloads that could pay for the room, lowest priority first, each with the MiB it
-        would give up: only ones whose `yields_to:` covers `pressure`, and only ones holding more
+        would give up: only ones whose `yields_to:` covers `pressure` and whose `asks_for:`
+        doesn't ask for it, and only ones holding more
         than their idle weight, because the app that grew is short of VRAM and not of the RAM a model
         with no card weights costs.
 
@@ -876,7 +886,7 @@ class Arbiter:
         out = []
         for n, y in sorted(self.workloads.items(), key=lambda kv: (kv[1].priority, kv[0])):
             held = (snap.get(f"{n}_mib") or 0) - y.idle_vram_mib
-            if held > 0 and policy.yields(y.yields_to, policy.PRESSURE):
+            if held > 0 and policy.yields(y.yields_to, policy.PRESSURE, y.asks_for):
                 out.append((n, held))
         return out
 
@@ -988,7 +998,7 @@ class Arbiter:
         """
         snap = self.snapshot()
         cands = {n: y for n, y in self.workloads.items()
-                 if n in targets and policy.yields(y.yields_to, policy.PRESSURE)}
+                 if n in targets and policy.yields(y.yields_to, policy.PRESSURE, y.asks_for)}
         want = {n: max(0, (snap.get(f"{n}_mib") or 0) - y.idle_vram_mib) for n, y in cands.items()}
         if not any(want.values()):
             return {"declined": None, "by_actor": False, "would": sorted(cands), "released": [],

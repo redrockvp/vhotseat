@@ -50,6 +50,7 @@ def build(cfg: dict, *, env=os.environ, gpu=None, machine_ram=None, **arbiter_ar
         claim_ignore=cfg.get("claims_ignore") or [],
         claim_poll_s=cfg.get("claims_poll_s", 2.0),
         pressure_cfg=cfg.get("pressure"),
+        ask_cfg=cfg.get("ask"),
         **arbiter_args,
     )
     return arbiter

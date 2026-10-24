@@ -424,7 +424,7 @@ where "refused" is a mystery. The memory that can't be freed is named: the proce
 vhotseat doesn't manage and how much each holds. `why` releases nothing, loads
 nothing and restarts nothing; it exits 0 even when the answer is `blocked`, because
 it is a report and not a gate. `--json` gives the same per workload
-(`{would, holder, free_mib, resident, priority, yields_to, notes[]}`); the dashboard
+(`{would, holder, free_mib, resident, priority, yields_to, asks_for, notes[]}`); the dashboard
 shows it as the **Next handover** card.
 
 **Claims: a game owns the card.** `vhotseat claims` prints what the rules match right
