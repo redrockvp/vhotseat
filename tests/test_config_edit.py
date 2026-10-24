@@ -576,6 +576,120 @@ def test_a_key_of_a_workload_written_on_one_line_keeps_the_rest_of_it(cfg_file):
                                   "asks_for:") == []
 
 
+def write_inline_strata(cfg_file, inline: str) -> None:
+    """The example with strata's whole block replaced by the one line `inline`: a workload written
+    in flow style, carrying the keys the validator insists on (driver, url, vram, resident, release,
+    gate). The commented lines that were part of the block go with it, which is the point: they were
+    never what had to survive."""
+    example = text_of(EXAMPLE)
+    nl = "\r\n" if "\r\n" in example else "\n"
+    lines = example.splitlines(keepends=True)
+    start = next(i for i, ln in enumerate(lines) if ln.rstrip("\r\n") == "  strata:")
+    stop = next(i for i, ln in enumerate(lines) if ln.rstrip("\r\n") == "  comfy:")
+    cfg_file.write_bytes("".join(lines[:start] + [inline + nl] + lines[stop:]).encode("utf-8"))
+
+
+STRATA_BASE = ("{driver: http, url: http://127.0.0.1:2335, vram: {process: strata.exe}, "
+               "resident: {get: /health, path: loaded}, release: {post: /unload, always: true, ")
+
+
+def test_a_quoted_word_yaml_thinks_is_a_boolean_stays_quoted(cfg_file):
+    """`body: {mode: "off"}` - a server that takes a mode named off, and the quotes are what make it
+    the word rather than a flag. Re-rendering the line through a round-trip dump wrote it without
+    them, and `off` is what YAML 1.1 - the one the runtime parses the config with - reads as false.
+    So a save of the *policy* silently changed what vhotseat sends that workload: the owner clicked
+    a grid cell and their release request grew a boolean."""
+    write_inline_strata(cfg_file, "  strata: " + STRATA_BASE
+                        + 'body: {model_path: "{model}", mode: "off"}}, '
+                          "priority: 40, yields_to: [comfy], gate: {kind: hook, "
+                          "config: ~/Strata/strata.json, timeout: 90}}")
+    cfg = config.load(cfg_file)
+    assert cfg["workloads"]["strata"]["release"]["body"]["mode"] == "off"
+
+    before = text_of(cfg_file)
+    save(cfg_file, matrix={"strata": STRATA_KEEPS_COMFY_ASKS_CLAIMS,
+                           "comfy": COMFY_ASKS_PRESSURE})
+    after = text_of(cfg_file)
+    written = code(after, "  strata:")
+    assert len(written) == 1, after
+    assert 'mode: "off"' in written[0], written[0]
+    body = config.load(cfg_file)["workloads"]["strata"]["release"]["body"]
+    assert body == {"model_path": "{model}", "mode": "off"}, body
+    assert unchanged_apart_from(before, after, "strata:", "priority:", "yields_to:",
+                                "asks_for:") == []
+
+
+def test_an_edit_that_changed_something_else_as_well_is_refused(cfg_file, monkeypatch, capsys):
+    """The line surgery is a text edit of a parsed file, and text edits of a parsed file get things
+    wrong eventually: a quote dropped, a re-render that resolves differently, a span one line too
+    long. So the save answers one question before it writes - is everything the edit was not about
+    still the same config? - and refuses if it isn't. What the owner gets is `doctor`'s line about
+    their file and a config that didn't change, which is the same answer a config that doesn't
+    parse gets."""
+    real_render = config_edit._Doc._render_flows
+
+    def wrecked(doc):
+        """The flow re-render writing a sibling of the key the save was about: `pressure.ignore`
+        quietly losing its entry, which nobody asked for."""
+        for owner_path in list(doc.flows.values()):
+            block = doc.node(owner_path)
+            if "min_free_mib" in block:
+                block["min_free_mib"] = 999999
+        real_render(doc)
+
+    monkeypatch.setattr(config_edit._Doc, "_render_flows", wrecked)
+    hand = insert_after_line(text_of(EXAMPLE), "patches: []",
+                             ["pressure: {enabled: true, min_free_mib: 512}"], 1)
+    cfg_file.write_bytes(hand.encode("utf-8"))
+    was = text_of(cfg_file)
+    version = config_edit.read(cfg_file)[1]
+    with pytest.raises(config.ConfigError, match="changed something the edit didn't cover"):
+        config_edit.save(cfg_file, version, pressure={"sustain_s": 90})
+    assert text_of(cfg_file) == was, "something was written"
+    assert list(cfg_file.parent.glob("config.yaml.bak-*")) == []
+
+
+def test_a_heading_with_nothing_under_it_takes_the_block_it_was_asked_for(cfg_file):
+    """`pressure:` on its own, with no keys under it, is a valid thing to have written: it says "the
+    defaults, and I meant to fill this in later". The save tried to edit keys inside it and got
+    "expected a mapping" back, which reaches the page as a 400 and reaches the owner as a config
+    they can see is fine and cannot save. The heading is where the block belongs: its keys go under
+    it, at its indent, and a note left on the heading line stays there."""
+    hand = insert_after_line(text_of(EXAMPLE), "patches: []",
+                             ["pressure:", "ask: {timeout_s: 20, fallback: keep}   # mine"], 1)
+    cfg_file.write_bytes(hand.encode("utf-8"))
+    assert config.load(cfg_file)["pressure"] is None
+    before = text_of(cfg_file)
+
+    save(cfg_file, pressure={"sustain_s": 90, "ignore": ["thing.exe"]})
+    after = text_of(cfg_file)
+    assert config.parse(after)["pressure"] == {"sustain_s": 90, "ignore": ["thing.exe"]}
+    assert len(after.splitlines()) == len(before.splitlines()) + 2
+    assert code(after, "pressure:") == ["pressure:"]
+    assert code(after, "  sustain_s:") == ["  sustain_s: 90"]
+    assert code(after, "  ignore:") == ["  ignore: [thing.exe]"]
+    assert unchanged_apart_from(before, after, "pressure:", "sustain_s:", "ignore:",
+                                "- thing.exe") == []
+
+    before = text_of(cfg_file)
+    save(cfg_file, ask={"timeout_s": 45})
+    after = text_of(cfg_file)
+    assert config.parse(after)["ask"] == {"timeout_s": 45, "fallback": "keep"}
+    assert len(changed(before, after)) == 1, changed(before, after)
+
+    hand = insert_after_line(text_of(EXAMPLE), "patches: []",
+                             ["pressure:   # filled in later"], 1)
+    cfg_file.write_bytes(hand.encode("utf-8"))
+    before = text_of(cfg_file)
+    save(cfg_file, pressure={"grow_mib": 5000})
+    after = text_of(cfg_file)
+    assert config.parse(after)["pressure"] == {"grow_mib": 5000}
+    heading = code(after, "pressure:")[0]
+    assert heading == "pressure:   # filled in later", heading
+    assert code(after, "  grow_mib:") == ["  grow_mib: 5000"]
+    assert unchanged_apart_from(before, after, "pressure:", "grow_mib:") == []
+
+
 def test_the_written_lists_are_read_back_as_the_same_policy(cfg_file):
     """What the page wrote and what the arbiter acts on have to be one thing: the file is the
     source, and a value that comes back other than how it went in is a policy the owner didn't

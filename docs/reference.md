@@ -381,7 +381,14 @@ the reason for a decision that was changed, and deleting the key with it would l
 owner wrote. A policy key inside a mapping written on one line - `pressure: {enabled: true,
 sustain_s: 60}`, or a workload written `{driver: http, ...}` - is rewritten as that same line: the
 mapping comes back with the change in it, and its heading, its siblings and the note at the end of
-the line stay on it. The file that was there is kept beside it as `config.yaml.bak-<time>` (the
+the line stay on it. A heading the file has with nothing under it - `pressure:` on its own, which is
+a valid way to write 'the defaults, fill this in later' - is where the keys the page sent go, at the
+heading's indent, note kept. Then the file as it was and the file as it would be are read with the
+same parser the arbiter uses, and unless everything that differs sits inside a key this save was
+asked to write, nothing is written and `web` answers with the line `doctor` prints for that file: a
+quote that would change a value's type, a re-rendered value that resolves the other way, a span one
+line too long - all of them arrive as a refusal rather than as a save nobody asked for. The file that
+was there is kept beside it as `config.yaml.bak-<time>` (the
 newest ten) with the permissions the config itself has - that backup holds the same `headers:` key
 if the config does - and the replacement file takes those bits too, so a save neither opens up a
 private config nor quietly shuts one. The

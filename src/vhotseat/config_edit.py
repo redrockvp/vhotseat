@@ -200,7 +200,8 @@ def apply(text: str, edits: dict) -> str:
 
     The result is parsed and validated as a whole config before it's returned, so what's checked
     is the file as it would be rather than the keys in isolation, and the error is the line
-    `doctor` prints.
+    `doctor` prints. And the two readings are compared with each other: everything outside the keys
+    this edit was allowed to write has to mean the same thing it meant before.
     """
     doc = _Doc(text)
     for path, value in edits["edits"]:
@@ -220,10 +221,60 @@ def apply(text: str, edits: dict) -> str:
             doc.set(path, value)
     out = doc.text()
     try:
-        parse(out)
+        after = parse(out)
     except ConfigError as e:
         raise ConfigError(str(e)) from None
+    # The same question pointed the other way at the same file: is everything this edit was not about
+    # still the config it was? The writing is line surgery on a parsed document, and line surgery
+    # gets things wrong eventually - a quote dropped, so `body: {mode: "off"}` came back as the word
+    # off and the runtime read it as false; a re-rendered value that resolves the other way; a span
+    # one line too long. Reading the two files with the parser the arbiter actually uses turns any of
+    # those into a refusal the owner can read, instead of a save that succeeds and quietly changes
+    # what vhotseat sends one of their servers.
+    untouched_outside_edits(parse(text), after, list(edits["edits"]))
     return out
+
+
+def untouched_outside_edits(before: dict, after: dict, edits: list) -> None:
+    """Refuse unless everything that differs between the config as it was and as it would be sits
+    inside a key this edit was allowed to write: a workload's `priority` / `yields_to` / `asks_for`,
+    or one of the keys of an `ask:` / `pressure:` block the page sent.
+
+    A whole-block edit doesn't make the block's insides fair game: the page edits numbers, and
+    `pressure.min_free_mib` moving because a save came to write `sustain_s` is exactly the kind of
+    thing this is here to catch. The block as a whole is allowed to appear or disappear, which is
+    what the keys going back to their default means.
+
+    Comparing parsed values rather than lines is the point. It says nothing about how tidy the file
+    looks and everything about whether the config still means the same thing - which is the promise
+    the text editing can't make on its own."""
+    whole = {tuple(p) for p, value in edits if len(p) == 1 and isinstance(value, dict)}
+    keyed: set[tuple] = set()
+    for path, value in edits:
+        if len(path) == 1 and isinstance(value, dict):
+            keyed |= {(path[0], k) for k in value}
+        else:
+            keyed.add(tuple(path))
+    for path in _diff_paths(before, after):
+        _check(path in whole or any(path[:len(k)] == k for k in keyed),
+               ".".join(path) or "config",
+               "changed something the edit didn't cover - this save writes "
+               + ", ".join(sorted(".".join(k) for k in keyed)) + ")")
+
+
+def _diff_paths(a, b, prefix: tuple = ()) -> list[tuple]:
+    """The paths where two parsed configs differ, as key lists. A list that differs at all counts as
+    its own path rather than as each of its elements: adding or removing an entry shifts every index
+    after it, and reporting the shifted ones would name things nobody touched."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        out = []
+        for key in set(a) | set(b):
+            if key not in a or key not in b:
+                out.append(prefix + (str(key),))
+            else:
+                out += _diff_paths(a[key], b[key], prefix + (str(key),))
+        return out
+    return [] if a == b else [prefix]
 
 
 @contextlib.contextmanager
@@ -412,6 +463,10 @@ class _Doc:
         # A mapping written with braces is one physical line, so an edit inside it is recorded here
         # and the whole mapping is written back once, after every edit of the save has been made.
         self.flows: dict[int, list[str]] = {}
+        # Likewise a heading the file has with nothing under it - `pressure:` on its own, which is a
+        # valid way to write "the defaults, fill this in later": asked for keys of it, the block goes
+        # on that heading, written once the keys have been decided.
+        self.nulls: set[tuple] = set()
 
     def node(self, path: list[str]):
         out = self.data
@@ -472,7 +527,23 @@ class _Doc:
             if any(v is not DROP for v in values.values()):
                 self.set(path, {k: v for k, v in values.items() if v is not DROP})
             return
-        where = _where(self.node(path))
+        block = self.node(path)
+        if block is None:
+            # The heading is there and nothing is under it. That's the config the owner wrote, not a
+            # broken one - a null `pressure:` says "the defaults" - and it's where the keys they just
+            # asked for belong. The children are decided in memory and `_render_nulls` writes the
+            # heading and the block under it in one go, because the heading line owns the block and
+            # editing a child is not a reason to write that line twice.
+            if all(v is DROP for v in values.values()):
+                return
+            holder = self.node(path[:-1]) if len(path) > 1 else self.data
+            block = CommentedMap()
+            holder[path[-1]] = block
+            self.nulls.add(tuple(path))
+            for k, v in values.items():
+                self._memorize(block, k, v)
+            return
+        where = _where(block)
         annotated = [k for k, pos in where.items() if _eol_comment(self.lines[int(pos[0])])]
         if all(v is DROP for v in values.values()) and set(where) <= set(values) and not annotated:
             self.set(path, DROP)
@@ -485,12 +556,17 @@ class _Doc:
         line to `_render_flows`, rather than writing anything here. One save can change three keys
         of the same `{...}`, and all three own the same line, so writing the line once - after every
         edit has landed - is what keeps it from holding that mapping three times over."""
+        self._memorize(parent, key, value)
+        self.flows[id(self.node(owner_path))] = owner_path
+
+    def _memorize(self, parent, key, value) -> None:
+        """Change the parsed mapping without writing anything: the line that owns this mapping is
+        written whole once the save's edits have all been decided."""
         if value is DROP:
             if key in parent:
                 del parent[key]
         else:
             parent[key] = _flow_value(value)
-        self.flows[id(self.node(owner_path))] = owner_path
 
     def _flow_owner(self, path: list[str]) -> list[str] | None:
         """The outermost flow-style mapping the key at `path` sits inside, as the path to it, or None
@@ -538,6 +614,21 @@ class _Doc:
                 lines[-1] = _with_note(lines[-1], original)
             self.patches.append((start, end + 1, lines))
 
+    def _render_nulls(self) -> None:
+        """Every heading the file had with nothing under it, written back with the block the edit put
+        in it: the heading line at its own column, the keys under it at two more, and a note the
+        owner left on the heading line still on that line."""
+        for path in self.nulls:
+            node = self.node(path)
+            holder = self.node(path[:-1]) if len(path) > 1 else self.data
+            pos = _where(holder).get(path[-1])
+            if pos is None:
+                continue
+            line, col = int(pos[0]), int(pos[1])
+            end = self.value_end(node, line, col)
+            self.patches.append((line, end + 1,
+                                 _value_lines(path[-1], dict(node), col, self.lines[line])))
+
     def value_end(self, node, line: int, col: int) -> int:
         """The last line of the value whose key starts on `line` - whichever of the two ways of
         measuring it reaches further down: the indentation rule, and what the parsed value says its
@@ -562,6 +653,7 @@ class _Doc:
         return _extent(self.lines, int(own[0]), int(own[1])), int(own[1]) + 2
 
     def text(self) -> str:
+        self._render_nulls()
         self._render_flows()
         out = list(self.lines)
         # Two keys new to the same block land at the same spot: they go in the order they were
@@ -588,6 +680,12 @@ def _yaml() -> YAML:
     # The file's comments run long; the default 80-column dump would fold them and still call
     # that preserving the comment.
     y.width = 4092
+    # A quote the owner wrote is part of what they wrote, not decoration the writer may drop:
+    # `body: {mode: "off"}` is a request field whose value is the word off, and written back without
+    # the quotes the runtime's YAML 1.1 parser reads it as false. `on: "yes"` is worse - the *key*
+    # comes back as the boolean True. Same for a `yields_to: ["*"]` that lost its quotes on the way
+    # out: quotes here are load-bearing.
+    y.preserve_quotes = True
     return y
 
 
@@ -718,7 +816,7 @@ def _value_lines(key: str, value, col: int, original: str = "") -> list[str]:
         return []
     indent = " " * col
     if isinstance(value, dict):
-        out = [f"{indent}{key}:"]
+        out = [_with_note(f"{indent}{key}:", original)]   # the heading's own note stays with it
         for k, v in value.items():
             out += _value_lines(k, v, col + 2)
         return out
