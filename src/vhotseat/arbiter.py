@@ -17,10 +17,12 @@ import datetime
 import os
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 from . import claims, config as cfgmod, host, policy, pressure, util
+from .config_edit import version_of
 from .drivers.base import Workload
 from .errors import Busy, PolicyRefused, ReleaseFailed, SwitchError
 from .events import EventLog, row_time
@@ -92,6 +94,14 @@ class Arbiter:
         # watch, and nothing to save back.
         self.config_path = Path(config_path) if config_path else None
         self._config_stamp: tuple | None = None
+        # The version of the text whose rules are in force: "seen" means installed, not looked at, so
+        # a reading that never went in can't mark newer bytes as handled.
+        self._adopted: str | None = None
+        # One thread at a time reads, parses and installs a config. A `web` is the claim watcher plus
+        # a request thread per page tab, and `watch` re-reads too: without this, the reload that read
+        # the file before someone else's save and stopped part way through its parse can come back
+        # afterwards and put what it was reading over the rules that save installed.
+        self._policy_lock = threading.RLock()
         self.config_error: str | None = None
 
     def snapshot(self) -> dict:
@@ -211,7 +221,11 @@ class Arbiter:
         The check is cheap and the swap is safe: the whole file is parsed and validated before
         anything is swapped, so a half-typed hand-edit changes nothing: the rules already running
         keep running, and the caller is told (`/api/status`'s `config_error`, and one log line the
-        first time it notices, not one per poll).
+        first time it notices, not one per poll). And the read, the parse and the swap are one turn
+        of one lock, because a dashboard is a watcher thread and a request thread per page tab: a
+        reload that read the file before a save can stop part way through its parse, and it must not
+        be the one that installs rules last. What marks the file as seen is the reading whose rules
+        actually went in, never a stamp picked up from bytes that didn't.
 
         What is re-read is the policy, the pressure numbers and the ask numbers. Which workloads
         there are, how to reach them, and what claims the card are what a restart is for: those
@@ -226,23 +240,39 @@ class Arbiter:
             return self._config_error(f"{path}: {e.strerror or e}")
         if stamp == self._config_stamp and not force:
             return self.config_error
-        try:
-            text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            # The file is there and it isn't text: an editor that saved it as Windows-1252 leaves an
-            # en dash as one byte, and that byte is not a UTF-8 sequence. It's a config error named
-            # the way `config_edit` names it when the dashboard tries to save over such a file, not a
-            # reason for the reload to die in the middle of the process that is looking after the
-            # card. Not recorded as seen either: a file caught mid-write by an editor that doesn't
-            # write atomically looks like this too, and the next poll should look again.
-            return self._config_error(f"{path}: not utf-8 text")
-        except OSError as e:
-            # Not recorded as seen: a file we couldn't read isn't a file we've handled. A moment
-            # when someone else's atomic write has the file half-present is a moment to try again
-            # on the next poll, not a state to sit in until the mtime changes again.
-            return self._config_error(f"{path}: {e.strerror or e}")
-        self._config_stamp = stamp
-        return self.adopt_policy(text)
+        # One turn of one lock for the whole read-parse-install: the watcher's pass, a dashboard's
+        # request threads and the save itself all come through here, and a reading that started before
+        # someone else's save must not be the last one to install what it read.
+        with self._policy_lock:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                # The file is there and it isn't text: an editor that saved it as Windows-1252 leaves
+                # an en dash as one byte, and that byte is not a UTF-8 sequence. It's a config error
+                # named the way `config_edit` names it when the dashboard tries to save over such a
+                # file, not a reason for the reload to die in the middle of the process that is
+                # looking after the card. Not recorded as seen either: a file caught mid-write by an
+                # editor that doesn't write atomically looks like this too, and the next poll should
+                # look again.
+                return self._config_error(f"{path}: not utf-8 text")
+            except OSError as e:
+                # Not recorded as seen: a file we couldn't read isn't a file we've handled. A moment
+                # when someone else's atomic write has the file half-present is a moment to try again
+                # on the next poll, not a state to sit in until the mtime changes again.
+                return self._config_error(f"{path}: {e.strerror or e}")
+            if not force and version_of(text) == self._adopted:
+                # The file moved - an editor that wrote it again without changing anything, a comment,
+                # a `git pull` - and says what is already in force. Nothing to install, and this is
+                # the reading that has been seen.
+                self._config_stamp = stamp
+                return self.config_error
+            note = self.adopt_policy(text)       # takes the same lock; records `_adopted`
+            if note is None:
+                # Only a reading that actually put its rules in force marks the file as seen, and with
+                # the stamp taken before its read: never bytes newer than what went in, which is how a
+                # later poll comes back to a file it was told it had already handled.
+                self._config_stamp = stamp
+            return note
 
     def adopt_policy(self, text: str) -> str | None:
         """Put the policy written in `text` in force, without reading anything. Returns why this text
@@ -254,23 +284,30 @@ class Arbiter:
         from a fresh read of the file, the pair stops meaning anything the moment the file is edited
         elsewhere. The page posts rules it never saw alongside a version that matches, the save goes
         through, and the hand-edit is written over with no 409 to say anyone else had an opinion.
+
+        One turn of `_policy_lock` over the parse and the swap, and the version recorded afterwards:
+        the rules in force belong to a named piece of text, and an install that didn't come from the
+        file as it now is leaves the stamp clear, so the next look finds a file nobody installed.
         """
-        try:
-            cfg = cfgmod.parse(text)
-            changed = self._swap_policy(cfg)
-        except Exception as e:  # noqa: BLE001 - a file we can't use isn't a reason to stop watching
-            # Whatever it is - the validator missing something, a value the swap can't use, a bug in
-            # the swap itself - it goes to the owner as `config_error` and the rules already in force
-            # carry on. This is called from `probe()` and from the watcher's pass: letting it out
-            # takes down the process that is looking after the card, which is the one thing a bad
-            # config must never buy.
-            return self._config_error(f"{self.config_path}: {type(e).__name__}: {e}")
-        if self.config_error is not None:        # the file reads again: say so once, the same way
-            util.log("policy: the config reads again" + (f" - {changed}" if changed else ""))
-        self.config_error = None
-        if changed:
-            util.log("policy: " + changed)
-        return None
+        with self._policy_lock:
+            try:
+                cfg = cfgmod.parse(text)
+                changed = self._swap_policy(cfg)
+            except Exception as e:  # noqa: BLE001 - a file we can't use isn't a reason to stop watching
+                # Whatever it is - the validator missing something, a value the swap can't use, a bug
+                # in the swap itself - it goes to the owner as `config_error` and the rules already in
+                # force carry on. This is called from `probe()` and from the watcher's pass: letting it
+                # out takes down the process that is looking after the card, which is the one thing a
+                # bad config must never buy.
+                return self._config_error(f"{self.config_path}: {type(e).__name__}: {e}")
+            self._adopted = version_of(text)
+            self._config_stamp = None       # whoever installs rules sends the next look back out
+            if self.config_error is not None:    # the file reads again: say so once, the same way
+                util.log("policy: the config reads again" + (f" - {changed}" if changed else ""))
+            self.config_error = None
+            if changed:
+                util.log("policy: " + changed)
+            return None
 
     def _swap_policy(self, cfg: dict) -> str:
         """The policy keys of a parsed config onto the live workloads. Returns what changed, in

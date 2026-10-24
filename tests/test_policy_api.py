@@ -370,6 +370,47 @@ def test_a_file_that_stopped_reading_is_told_about_not_thrown(served, rig):
     assert rig.arb.config_error
 
 
+def test_a_reload_that_paused_mid_parse_cannot_put_the_old_rules_back(rig, tmp_path, monkeypatch):
+    """One dashboard is several threads: the claim watcher and a request thread per page tab, and
+    both install rules. A reload that read the file before a save and stopped part way through its
+    parse can come back after the save's reload and install what it was reading - yesterday's
+    answer - and if it also recorded the stamp the save's reload left, no later poll looks again.
+    Then the workload the owner just protected is still the one that gets unloaded, and the page
+    says it isn't. So the read, the parse and the install belong to one turn of one lock, and what
+    marks a file as seen is the text whose rules actually went in."""
+    path = tmp_path / "config.yaml"
+    path.write_text(rig_config_text(rig), encoding="utf-8")
+    rig.arb.config_path = path
+    real_parse = config.parse
+    reading, resume = threading.Event(), threading.Event()
+    parsed = []
+
+    def slow_parse(text):
+        parsed.append(text)
+        if len(parsed) == 1:                     # the reload that got there first: the old file
+            reading.set()
+            assert resume.wait(10), "the paused reload was never let finish"
+        return real_parse(text)
+
+    monkeypatch.setattr(config, "parse", slow_parse)
+    old = threading.Thread(target=rig.arb.reload_policy, name="reload-of-the-old-file")
+    old.start()
+    assert reading.wait(5), "the first reload never reached its parse"
+
+    write(rig, after="    driver: comfyui", lines=["    yields_to: [strata]"])
+    assert rig.arb.reload_policy(force=True) is None       # what a save does in this process
+    assert rig.arb.workloads["comfy"].yields_to == ("strata",)
+
+    resume.set()
+    old.join(10)
+    assert not old.is_alive()
+    assert rig.arb.workloads["comfy"].yields_to == ("strata",), \
+        "the paused reload put the rules it had been reading back over the saved ones"
+    web.watch(rig.arb, polls=1)                            # and the next poll agrees, rather than
+    assert rig.arb.workloads["comfy"].yields_to == ("strata",), \
+        "a poll trusted a stamp for bytes it had never adopted"
+
+
 def test_a_file_that_isnt_utf8_is_an_error_about_the_file(served, rig):
     """An editor that saved the config as Windows-1252 leaves a file that is there, is YAML, and is
     not text we can read: an en dash in a comment is one byte there, and that byte is not a UTF-8

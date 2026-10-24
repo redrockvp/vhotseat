@@ -401,7 +401,10 @@ A save reaches the processes that are already running. `vhotseat web`, `vhotseat
 `vhotseat record` notice the file's mtime and size change - each samples through the same probe -
 and put the new policy, `pressure:` and `ask:` numbers in force; every gate, guard and `switch` is a
 fresh process that read the config as it started. Which workloads exist, how to reach them and what
-claims the card are not reloaded - that is a restart.
+claims the card are not reloaded - that is a restart. Reading, parsing and installing a config is one
+turn of one lock, and a file counts as seen only once the rules from that reading are the ones in
+force: a dashboard is a watcher thread plus a request thread per tab, and a reload that read the file
+before a save must not be the one that installs rules last.
 If the file stops being a config — a half-typed edit, or bytes that aren't utf-8 because an editor
 saved the file as Windows-1252 and turned a comment's en dash into a byte nothing here can decode —
 the rules already in force keep running and `/api/status` carries
