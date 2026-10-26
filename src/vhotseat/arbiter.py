@@ -437,6 +437,17 @@ class Arbiter:
         were read.
         """
         existing = self.events.open_ask(workload, requester)
+        moot = self.ask_moot(existing, requester=requester, pid=pid)
+        if moot:
+            # Joined to a question that is not this claim's to answer. Retire it and open this
+            # claim's own, so the card the owner sees is the one this release will act on.
+            code, _ = self.close_ask(existing["id"], closed_by=moot,
+                                     reason=self.moot_says(existing, pid))
+            if code != 200:
+                util.log(f"ask: couldn't retire the question asked about process "
+                         f"{existing.get('pid')}: code {code}; asking again next poll")
+                return self.events.open_ask(workload, requester) or existing
+            existing = self.events.open_ask(workload, requester)
         if existing:
             return existing
         if not held:
@@ -453,6 +464,88 @@ class Arbiter:
         row = self._open_ask(workload, requester, held_mib=held_mib, source=source, name=name,
                              note=note, free_mib=free_mib, pid=pid)
         return self._raise_question(row) if row else self.events.open_ask(workload, requester)
+
+    def ask_moot(self, ask: dict | None, *, requester: str,
+                 pid: int | None) -> str | None:
+        """Why this open ask is not the current claim's question (`claim-restarted`), or None when
+        it is the one to join.
+
+        A claim is a process, not a rule, and the release path already knows it: `asks_for` refuses
+        an answer whose pid isn't this process's, because "unload Strata" is consent for the game
+        that was playing when it was said. The look that *joins* an open question was never told the
+        same thing, and the mismatch is visible from the owner's side: game A exits without
+        answering, game B starts inside the timeout and joins A's question, so the card shows A's
+        countdown and Unload now answers 200 - and the next poll ignores it, because that consent
+        belongs to a process that no longer exists, then opens a second question a moment later. The
+        pid is what tells the two games apart inside one second, which a row's timestamp (whole
+        seconds) cannot.
+
+        A question asked without a pid, or by a claim that has none either way, is left as it was:
+        the pair is the only scope there is, and it is the scope the asking used.
+        """
+        if ask is None or requester != policy.CLAIMS:
+            return None
+        if pid and ask.get("pid") and ask["pid"] != pid:
+            return "claim-restarted"
+        return None
+
+    def moot_says(self, ask: dict, pid: int | None) -> str:
+        """The sentence on a question retired because the claim it was asked about became a
+        different process: what changed, and why that makes the question moot."""
+        return (f"{ask.get('name') or 'the game'} is now process {pid}; this question was asked "
+                f"about process {ask.get('pid')}, so answering it would unload for a game that "
+                "is gone")
+
+    def ended_says(self, claim: dict) -> str:
+        """The sentence on a question retired because the claim itself ended."""
+        return (f"{claim.get('name') or 'the game'} (process {claim.get('pid')}) exited: the "
+                "question was asked about that game, and there is nothing left to free for it")
+
+    def close_ask(self, ask_id: str, *, closed_by: str, reason: str) -> tuple[int, dict]:
+        """Retire an open ask that has nothing left to be answered: 200 when it was open, 409 when
+        it has an answer or was retired already, 404 when the log holds no such ask, 503 when the
+        log wouldn't let go.
+
+        Whether it was still open is decided in the log, in the same turn as the closing row, for
+        the same reason an answer is decided there: the owner clicking Unload now and a watcher
+        noticing the game has gone are one write apart, and only one of them should land. Nothing is
+        unloaded either way: a close takes away a question, it never releases anything.
+        """
+        state, row = self.events.end_ask(ask_id, closed_by=closed_by, reason=reason)
+        if state == "missing":
+            return 404, {"error": f"no ask {ask_id} in the event log"}
+        if state == "answered":
+            return 409, {"error": f"ask {ask_id} was answered {row.get('answer')} already",
+                         "ask": self.ask_view(row)}
+        if state == "closed":
+            return 409, {"error": f"ask {ask_id} was closed ({row.get('closed_by')}) already",
+                         "ask": self.ask_view(row)}
+        if state == "locked":
+            return 503, {"error": f"the event log is busy: nothing was written for ask {ask_id}"}
+        util.log(f"ask: closed an unanswered question: {reason}")
+        return 200, {"ask": self.ask_view(row)}
+
+    def end_claim_asks(self, claim: dict) -> int:
+        """Retire the questions a claim was asking, once the claim itself is over. Returns how many.
+
+        Otherwise a question outlives its questioner: the game closes mid-countdown and the card
+        goes on showing "Strata unloads for Elden Ring - answer within 1:40" with a button no
+        release will ever act on. Nothing waits on it either, so the only thing that would close it
+        is the fallback - which would record a decision about an unload nobody wants any more.
+        """
+        n = 0
+        for ask in self.events.open_asks():
+            if ask.get("requester") != policy.CLAIMS:
+                continue
+            if (ask.get("name"), ask.get("note")) != (claim.get("name"), claim.get("note")):
+                continue
+            if claim.get("pid") and ask.get("pid") and ask["pid"] != claim["pid"]:
+                continue            # another process's question: this claim ending says nothing about it
+            code, _ = self.close_ask(ask["id"], closed_by="claim-ended",
+                                     reason=self.ended_says(claim))
+            if code == 200:
+                n += 1
+        return n
 
     def _open_ask(self, workload: str, requester: str, *, held_mib: int, source: str,
                   name: str | None, note: str | None, free_mib: int | None,
@@ -526,6 +619,10 @@ class Arbiter:
             return 409, {"error": (f"ask {ask_id} was answered {row.get('answer')} "
                                    f"({row.get('by') or 'owner'}) already"),
                          "ask": self.ask_view(row)}
+        if state == "closed":
+            return 409, {"error": f"ask {ask_id} was closed without an answer: "
+                                  f"{row.get('closed_reason') or row.get('closed_by')}",
+                         "ask": self.ask_view(row)}
         if state == "locked":
             return 503, {"error": f"the event log is busy: nothing was written for ask {ask_id} - "
                                   "the question is still open, answer it again"}
@@ -595,6 +692,12 @@ class Arbiter:
                 cur = self.events.ask_by_id(ask_id)
                 if cur is None:
                     pending.discard(ask_id)     # aged out of the retained log: nothing to wait on
+                    continue
+                if cur.get("closed_by") and not cur.get("answer"):
+                    # Retired without an answer - the claim it was asked about has gone. No answer
+                    # is coming, and waiting for one would hang the request on a moot question; an
+                    # ask that was answered *then* retired still has its answer, and that is read.
+                    pending.discard(ask_id)
                     continue
                 if not cur.get("answer"):
                     if self.ask_view(cur)["left_s"] > 0:

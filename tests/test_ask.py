@@ -509,6 +509,79 @@ def test_the_hook_and_the_wait_share_one_deadline(rig, monkeypatch, waiters):
     assert rig.arb.events.ask_by_id(asked["id"])["answer"] == policy.RELEASE
 
 
+def test_a_question_for_a_game_that_has_gone_is_closed_not_carried(rig, monkeypatch):
+    """A question is asked about a game process, and it stops meaning anything when that process
+    does. Game A asks, the owner says nothing, and A exits mid-countdown: the card used to go on
+    showing A's countdown - a button whose consent no release would ever act on - and worse, the
+    next game B that matches the same rule was joined to that stale question rather than given its
+    own. So the owner clicked "Unload now" on a card that answered 200 and did nothing, because the
+    consent it recorded belonged to a process that no longer existed, and only on the next poll did
+    B's real question appear. Now the claim ending retires its open asks with a closing row that
+    says why, and the new game is asked its own question, with its own notification.
+
+    Retiring is not an answer: the row says the question closed because the thing it was about
+    stopped existing, so a log read later cannot mistake it for a `keep` nobody gave, and a question
+    that has gone is answered exactly like any other closed one - refused."""
+    procs = claim_rule(rig, monkeypatch)
+    ask_first(rig, strata=["claims"])
+    rig.strata.loaded = True
+    web.watch(rig.arb, polls=1)
+    asked = rig.arb.events.open_ask("strata", policy.CLAIMS)
+    assert asked["pid"] == 4242 and len(rig.arb.notify.asks) == 1
+
+    del procs[4242]                                   # the game closes, unanswered
+    web.watch(rig.arb, polls=1)
+    assert not rig.arb.events.open_ask("strata", policy.CLAIMS), \
+        "the card still asks the owner to decide for a game that is gone"
+    ended = rows(rig, "ask-end")
+    assert [(r["id"], r["closed_by"]) for r in ended] == [(asked["id"], "claim-ended")]
+    assert "exited" in ended[0]["reason"] and ended[0]["workload"] == "strata"
+    assert not rows(rig, "ask-answer"), "a question that was never answered recorded an answer"
+    assert rig.strata.loaded, "retiring a question unloaded something on its own"
+    assert rig.arb.answer_ask(asked["id"], policy.RELEASE)[0] == 409, \
+        "a retired question can still be answered"
+
+    procs[9999] = {"pid": 9999, "ppid": 4, "name": NAME, "exe": r"D:\Libraries\elden\EldenRing.exe"}
+    web.watch(rig.arb, polls=1)                       # a new game, inside the old timeout
+    again = rig.arb.events.open_ask("strata", policy.CLAIMS)
+    assert again and again["id"] != asked["id"], "the new game inherited the old game's question"
+    assert again["pid"] == 9999
+    assert [a["id"] for a in rig.arb.notify.asks] == [asked["id"], again["id"]], \
+        "the new game's question was never put in front of the owner"
+    assert rig.arb.answer_ask(again["id"], policy.RELEASE)[0] == 200
+    web.watch(rig.arb, polls=1)
+    assert not rig.strata.loaded and "POST /unload" in rig.strata.calls, \
+        "the answer to the new game's own question did not free the card for it"
+
+
+def test_a_claim_does_not_join_a_question_asked_about_another_process(rig):
+    """The join itself is checked, at the seam that does it: `ask_now` is handed the claim's pid,
+    and an open question whose pid is somebody else's is not this claim's question - so it is
+    retired the same way, and a fresh one is raised for the process that is asking now.
+
+    This is the safety net behind the claim ending retiring its own asks. A question that somehow
+    outlives its claim - the log busy when the end was noticed, a watch that started up over a log
+    written by another one - must not be what the next game is joined to: `asks_for` already refuses
+    that answer by pid, so the card would say Unload now and the release would walk past it."""
+    first = rig.arb.ask_now("strata", policy.CLAIMS, held_mib=STRATA_VRAM, source="watch",
+                            name=NAME, note=NOTE, pid=4242, held=True)
+    again = rig.arb.ask_now("strata", policy.CLAIMS, held_mib=STRATA_VRAM, source="watch",
+                            name=NAME, note=NOTE, pid=9999, held=True)
+    assert again["id"] != first["id"], "the new process joined the old process's question"
+    assert again["pid"] == 9999 and rig.arb.events.ask_by_id(first["id"])["closed_by"] == \
+        "claim-restarted"
+    assert "4242" in rig.arb.events.ask_by_id(first["id"])["closed_reason"]
+    assert [a["id"] for a in rig.arb.notify.asks] == [first["id"], again["id"]], \
+        "the second question came with no notification of its own"
+    assert rig.arb.answer_ask(first["id"], policy.RELEASE)[0] == 409
+    assert [a["id"] for a in rig.arb.events.open_asks()] == [again["id"]]
+    # and a claim that is the same process keeps the question it already has
+    same = rig.arb.ask_now("strata", policy.CLAIMS, held_mib=STRATA_VRAM, source="watch",
+                           name=NAME, note=NOTE, pid=9999, held=True)
+    assert same["id"] == again["id"], "the same game got asked twice"
+    assert len(rig.arb.notify.asks) == 2
+
+
 def test_a_fallback_the_log_wont_take_leaves_the_waiter_waiting(rig, monkeypatch, waiters):
     """When an ask's timeout runs out, the waiter applies its fallback - and the fallback is a row
     in the log, which means writing it can fail the way any write here fails: another writer holds

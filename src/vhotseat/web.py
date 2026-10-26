@@ -625,6 +625,13 @@ def claim_transitions(arbiter, hits: list[dict]) -> None:
         events.record("claim-end", source="watch", pid=row.get("pid"), name=key[0], note=key[1],
                       processes=n)
         util.log(f"{key[0]}" + (f" x{n}" if n > 1 else "") + " is gone: the card is open to loads again")
+        # And the questions it was still asking go with it. A claim's ask is asked *about that
+        # process*: once it has exited there is nothing for an answer to free, so an open question
+        # left behind is a countdown the owner is invited to act on for a game that is gone - and
+        # the next game that matches the rule must not be joined to it. `ask_before_release` only
+        # asks again when nothing is open for the pair, so an unanswered question also stops the new
+        # game's own question, and its toast, from ever being raised.
+        arbiter.end_claim_asks(row)
     state = events.claims_open()             # ours are in the record now
     for key, group in now.items():
         if (group[0].get("on_start") or "release") != "release":

@@ -95,7 +95,9 @@ workloads:
     #                              # holds and when it was last working. A load nobody chose
     #                              # waits for your answer; a game or an app that grew keeps
     #                              # running meanwhile and gets the release as soon as the answer
-    #                              # arrives. No answer within ask.timeout_s does ask.fallback.
+    #                              # arrives. No answer within ask.timeout_s does ask.fallback,
+    #                              # and a question asked about a game ends with that game: the
+    #                              # next one to match the rule is asked its own.
 
   comfy:
     driver: comfyui    # built-in: /queue, /free, restart when /free isn't enough

@@ -17,10 +17,29 @@ CLAIM_ROWS = ("claim", "claim-end", "claim-release", "claim-release-targets",
 # The rows that make an ask: `ask` opens the question (one per workload and requester at a
 # time) and `ask-answer` closes it, answered by the owner or by nobody answering in time.
 ASK_ROWS = ("ask", "ask-answer")
+# A question can also be retired without ever being answered, because whoever would answer it is
+# gone: `claim-ended` when the claim it was asked about has ended, `claim-restarted` when the claim
+# now belongs to a different process than the one the question was asked about. `ask-end` closes the
+# ask for the same reason an answer does - so nothing waits on it or shows it - and `closed_by` says
+# which of the two it was, so a retired question is never read as a decision nobody made.
+ASK_CLOSE_ROW = "ask-end"
+# Everything that takes part in what an ask currently is: opened by one, ended by an answer or by a
+# close. Reading the log for asks means reading all three; reading it for answers alone is how a
+# closed question would go on looking open.
+ASK_ALL_ROWS = (*ASK_ROWS, ASK_CLOSE_ROW)
 # How long a row waits for another writer to let go before the write is refused: appending is
 # milliseconds of file work, so this waits out a writer that is wedged, not one that is busy.
 LOCK_WAIT_S = 5.0
 LOCK_POLL_S = 0.05
+
+
+def ask_open(a: dict) -> bool:
+    """Whether this ask can still be answered: no answer yet, and not retired without one.
+
+    Both endings matter. An answered ask is settled. An ask closed by `ask-end` has no answer - the
+    game it was asked about is gone - and treating it as still open is how a dashboard ends up
+    showing, and a waiter waiting on, a question nobody can act on any more."""
+    return not a.get("answer") and not a.get("closed_by")
 
 
 def row_time(e: dict) -> datetime.datetime | None:
@@ -69,6 +88,11 @@ class EventLog:
         if self._turn_by == mine:
             yield
             return
+        # The directory before the turn, not only inside the write: the turn's lock file lives
+        # beside the log, so a log that has never been written - a box's first question, before
+        # anything has had a reason to record a row - has no directory for the lock to sit in, and
+        # `record()`'s own mkdir comes too late for it.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         with lock.write_turn(self.path, what=what, wait_s=LOCK_WAIT_S, poll_s=LOCK_POLL_S):
             self._turn_by = mine
             try:
@@ -230,7 +254,7 @@ class EventLog:
         order: list[str] = []
         for e in self.tail(limit):
             kind = e.get("event")
-            if kind not in ASK_ROWS:
+            if kind not in ASK_ALL_ROWS:
                 continue
             ask_id = e.get("id")
             if not ask_id:
@@ -239,7 +263,14 @@ class EventLog:
                 if ask_id not in out:
                     out[ask_id] = dict(e)
                     order.append(ask_id)
-            elif ask_id in out and not out[ask_id].get("answer"):
+            elif kind == ASK_CLOSE_ROW:
+                if ask_id in out and ask_open(out[ask_id]):
+                    out[ask_id].update(closed_by=e.get("closed_by") or "closed",
+                                       closed_reason=e.get("reason"), closed_at=e.get("time"))
+            elif ask_id in out and ask_open(out[ask_id]):
+                # The first ending wins, answer or close: the owner clicking Keep a moment before a
+                # watcher gives up on the fallback is the same shape as clicking it a moment before
+                # the claim ends, and `answer_ask` and `end_ask` each refuse to write over the other.
                 out[ask_id].update(answer=e.get("answer"), by=e.get("by") or "owner",
                                    answered_at=e.get("time"))
         return [out[i] for i in order]
@@ -248,9 +279,11 @@ class EventLog:
         """Write the answer to an open ask, inside the same turn as the check that it is still open.
 
         Returns (state, the ask as it reads now), where state is `"ok"` when this answer is the one
-        in the log, `"answered"` when a different answer got there first, `"missing"` when the log
-        holds no such ask, and `"locked"` when another writer wouldn't let go - which says nothing
-        was written, instead of two answers both being believed.
+        in the log, `"answered"` when a different answer got there first, `"closed"` when the ask was
+        retired without an answer - the game it was asked about is gone, so there is nothing left for
+        an answer to authorise - `"missing"` when the log holds no such ask, and `"locked"` when
+        another writer wouldn't let go - which says nothing was written, instead of two answers both
+        being believed.
 
         The check and the write share the turn because an answer is a decision with a winner. Read
         the log here and write there, and an owner clicking Keep while a watcher gives up and
@@ -268,6 +301,8 @@ class EventLog:
                     return "missing", None
                 if ask.get("answer"):
                     return "answered", ask
+                if ask.get("closed_by"):
+                    return "closed", ask
                 self._append({"time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
                               "event": "ask-answer", "id": ask_id, "answer": answer, "by": by,
                               "workload": ask.get("workload"), "requester": ask.get("requester")})
@@ -275,10 +310,46 @@ class EventLog:
         except Locked:
             return "locked", None
 
+    def end_ask(self, ask_id: str, *, closed_by: str, reason: str) -> tuple[str, dict | None]:
+        """Retire an open ask that has nothing left to be answered, inside the same turn as the check
+        that it is still open. Same states, and the same reason for the turn, as `answer_ask`.
+
+        A question is asked *about* something: this workload unloading for that game process. When
+        the game is gone - or is a different process than the one being asked about - the question is
+        not merely unanswered, it is moot, and leaving it open has three costs. The dashboard and
+        `status` show the owner a question they cannot act on; a waiter keeps waiting on an answer
+        that would authorise an unload nobody wants any more; and when the same rule matches a new
+        game process, joining it to the old question means its Unload-now is consent the release path
+        refuses by pid, so the click returns 200 and does nothing.
+
+        It is a separate row, and a separate ending, from an answer for a reason: `keep` as the
+        fallback of a question nobody answered is already in the log as an answer nobody gave, and
+        writing one for a game that walked away would read tomorrow as a decision about that unload.
+        An `ask-end` row says the question closed because the thing it was about stopped existing."""
+        try:
+            with self.turn(what="retiring an ask"):
+                ask = self.ask_by_id(ask_id)
+                if ask is None:
+                    return "missing", None
+                if ask.get("answer"):
+                    return "answered", ask
+                if ask.get("closed_by"):
+                    return "closed", ask
+                self._append({"time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+                              "event": ASK_CLOSE_ROW, "id": ask_id, "closed_by": closed_by,
+                              "reason": reason, "workload": ask.get("workload"),
+                              "requester": ask.get("requester"), "name": ask.get("name"),
+                              "note": ask.get("note"), "pid": ask.get("pid")})
+                return "ok", self.ask_by_id(ask_id) or {**ask, "closed_by": closed_by,
+                                                        "closed_reason": reason}
+        except Locked:
+            return "locked", None
+
     def open_asks(self, limit: int = 500) -> list[dict]:
-        """The asks the log shows as unanswered. What `/api/status` shows as the open question, and
-        what an actor joins instead of asking the same question twice."""
-        return [a for a in self.asks(limit) if not a.get("answer")]
+        """The asks the log shows as still open: no answer, and not retired without one. What
+        `/api/status` shows as the open question, and what an actor joins instead of asking the same
+        question twice."""
+        return [a for a in self.asks(limit) if ask_open(a)]
 
     def open_ask(self, workload: str, requester: str, limit: int = 500) -> dict | None:
         """The unanswered ask for this workload and this requester, if the log holds one. The one
