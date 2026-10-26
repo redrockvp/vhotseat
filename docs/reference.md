@@ -58,7 +58,11 @@ a way that leaves the rest of the file, comments included, exactly as it was
 **State** is in `~/.local/state/vhotseat/` (`$XDG_STATE_HOME`): the lock
 (`switch.lock`, one per GPU) and the event log (`events.jsonl`, the last 500
 decisions: every switch, hold and gate, with its reason), and the telemetry
-(`telemetry.db`, below).
+(`telemetry.db`, below). Files more than one process writes - the event log, its
+`last-used.json`, and the owner's `config.yaml` - each have a `<name>.lock` sibling: the
+operating system's lock around a read-check-write, so one process's row or stamp is never
+written over by another's. They stay on disk between writes: removing a lock file is the race
+it closes.
 
 ## Gates: how a workload asks for the GPU
 
@@ -395,6 +399,8 @@ running process.
 |---|---|
 | `GET /api/policy` | what the grid needs: the workloads in the order a handover unloads them, the columns a pair can be asked for (each other workload, `claims`, `pressure`), each cell's choice (`yes` / `ask` / `keep`) with the sentence saying what it does and why, the `ask:` and `pressure:` numbers, and a `version` (sha256 of the config file) to send back with a save. Grid and version are read from the file in one go, and those rules are what this process then acts on: rules remembered from an older file beside a version read fresh is how a save would write someone's hand-edit away and report success. A file that stopped being a config keeps the rules that were in force and carries `config_error` in the answer |
 | `POST /api/policy` | `{"version": "..."}` when the file now says what was posted. Body: `version` (required) and any of `priorities` (the unload order), `matrix` (`{workload: {requester: "yes"\|"ask"\|"keep"}}`), `ask`, `pressure` - a key left out is left alone. `409` with the version that's on disk when the file changed since it was read (or without one, when another save is midway through the file and this one should simply try again); `400` with what `doctor` would say, when the result wouldn't load |
+| `POST /api/asks/<id>` | the ask as it now reads: `{ask: {...}}`. Body: `{answer: "release"\|"keep"}`. The id is the row's own, so an answer belongs to the question that was opened - its numbers, its timeout, its fallback - and not to whatever the pair looks like now. `409` for an ask answered or closed already (the first answer wins, whoever wrote it: a notification's button, the page's button and a watcher applying the fallback all go through this call, and the check that the ask is still open plus the row answering it are written in one turn of the log, so which answer won is decided in the file rather than in a reading of it); `404` for an id the log doesn't hold; `400` for a body that isn't one of the two answers; `503` when the log is held by a writer that wouldn't let go, which says plainly that nothing was written and the question is still open. Nothing is unloaded by this call: it writes the answer, and whoever owes the release - the request that waited, a watcher's next poll, the episode - acts on it through the normal path, which is what keeps a request in flight from being cut off |
+| `POST /api/make-room` | what the switch did: `{ok, done}`. Body: `{for: "workload"}`. The warning's "make room for X": one workload gets the card now whatever the rules say about who would have been refused, recorded as `policy-override` exactly as a `switch` typed at a terminal is, and asking nothing - not even a claim, since a person clicked it. It changes no rule and writes no config: wanting room this once and wanting the rule moved are different answers, and the second one belongs in the grid. `400` for a workload that isn't configured |
 
 The POSTs are guarded three ways, because a config and an unload are not page-refreshes: the
 `X-Vhotseat-Edit: 1` header, `Content-Type: application/json` - a page on another origin
