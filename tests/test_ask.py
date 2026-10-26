@@ -690,6 +690,23 @@ def test_a_fallback_the_log_wont_take_leaves_the_waiter_waiting(rig, monkeypatch
     assert not rig.strata.loaded and "POST /unload" in rig.strata.calls,         "nobody answered, and the fallback said release"
 
 
+def test_a_question_the_log_wont_take_is_a_refusal_not_a_crash(rig, monkeypatch):
+    """Opening a question is a write too. When another writer holds the log past its bounded wait,
+    a gate, a `--request` or a `Seat.acquire` must come back with the refusal an unasked question
+    gets - not an uncaught `Locked` out of the hook - and nothing may be unloaded for it."""
+    monkeypatch.setattr(events, "LOCK_WAIT_S", 0.05)
+    ask_first(rig, strata=["comfy"])
+    rig.strata.loaded = True
+    with rig.arb.events.turn(what="a writer that never lets go"):
+        th, box = in_thread(lambda: rig.cli("switch", "comfy", "--request"))
+        code = join(th, box, within=12.0)
+    assert "error" not in box, f"the request died on a log it could not write: {box['error']!r}"
+    assert code == 1, "a question that was never asked let the load through"
+    assert not rows(rig, "ask"), "a question was written to a log that wouldn't take it"
+    assert rig.strata.loaded and "POST /unload" not in rig.strata.calls, \
+        "nobody was asked, and a model was unloaded anyway"
+
+
 def test_a_log_that_never_lets_go_stops_the_wait_rather_than_hanging_it(rig, monkeypatch,
                                                                         waiters):
     """The retry has a limit, because a log held by a writer that never lets go is not a question

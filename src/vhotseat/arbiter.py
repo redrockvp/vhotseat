@@ -527,7 +527,22 @@ class Arbiter:
         one to answer. The GPU lock usually keeps them apart, but a `web`, a `watch` and a gate in a
         fresh process reach here from three different places, and the log turn is what makes "is it
         already asked?" mean the same thing as the row that follows it.
+
+        A log another writer won't let go of is the same answer as one that already holds the
+        question: no row, None. A request then decides as it would without the asking (refused,
+        since an ask doesn't give way), and a claim or an episode asks again on its next poll -
+        a gate that died on a busy log would be a load nobody refused and nobody let through.
         """
+        try:
+            return self._write_ask(workload, requester, held_mib=held_mib, source=source,
+                                   name=name, note=note, free_mib=free_mib, pid=pid, scope=scope)
+        except Locked as e:
+            util.log(f"couldn't ask about {workload} for {requester}: {e}")
+            return None
+
+    def _write_ask(self, workload: str, requester: str, *, held_mib: int, source: str,
+                   name: str | None, note: str | None, free_mib: int | None,
+                   pid: int | None, scope: str) -> dict | None:
         with self.events.turn(what="opening an ask"):
             if self.events.open_ask(workload, requester, scope) is not None:
                 return None              # written between the look above and this turn
