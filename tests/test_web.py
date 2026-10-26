@@ -3,15 +3,19 @@ CLI, read back by the dashboard's API, and pruned after their retention."""
 
 import datetime
 import json
+import re
+import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import urllib.request
+from pathlib import Path
 
 import pytest
-
 from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, STRATA_VRAM
-from vhotseat import claims, config, host, telemetry, util, web
+
+from vhotseat import claims, config, host, pressure, telemetry, util, web
 from vhotseat.telemetry import Telemetry
 
 
@@ -557,3 +561,354 @@ def test_the_spill_into_system_ram_is_recorded_as_evidence(rig):
     assert sample["vram_shared"] == 13000
     rig.gpu.shared_of = {}                    # a backend with no such counter, not an empty card
     assert rig.arb.probe()["gpu"]["shared_mib"] is None
+
+
+# --- the rules editor: the sentences it is handed, and the questions it asks -----------
+
+
+def post(url, body, edit="1"):
+    """POST the way the page does, with the header and content type the guard asks for. `edit=None`
+    is the way a page on somebody else's origin does it."""
+    headers = {"Content-Type": "application/json"}
+    if edit is not None:
+        headers[web.EDIT_HEADER] = edit
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers=headers)
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def policy_api(server) -> dict:
+    return json.loads(get(server + "/api/policy")[1])
+
+
+def preview(server, row, col, choice, **extra):
+    """Ask the editor's question: what would the (row, col) cell do if the grid said this? The
+    draft matrix is the one the page would post - the saved grid with the one cell changed - so
+    the answer is about an answer the owner has not committed to yet."""
+    cells = {name: {c: v["choice"] for c, v in cols.items()}
+             for name, cols in policy_api(server)["matrix"].items()}
+    cells[row][col] = choice
+    return post(f"{server}/api/policy/preview", {"requester": col, "workload": row,
+                                                 "matrix": cells, **extra})
+
+
+def test_the_policy_api_hands_the_page_the_row_sentence_and_all_three_cell_lines(rig, server):
+    """The grid's words are the server's. Each cell comes with the sentence each of its three
+    choices carries - so picking Ask me changes the line under it before anything is saved, and
+    the page never holds a consequence of its own to fall out of step with the arbiter - and each
+    row comes with the sentence it adds up to, which is what says what a whole row does without
+    reading five cells."""
+    body = policy_api(server)
+    assert body["summaries"]["strata"] == ("Strata makes room for anything, including workloads "
+                                           "you add later.")
+    assert body["says_for"]["strata"]["comfy"] == {
+        "yes": "Strata unloads once idle",
+        "ask": "ComfyUI waits for your answer",
+        "keep": "ComfyUI is refused"}
+    assert body["says_for"]["strata"]["pressure"]["keep"] == "nothing is freed"
+    assert "strata" not in body["says_for"]["strata"]      # nothing unloads itself
+    # The words each column reads in the middle of a sentence: the page's own labels have to use
+    # them, or its headings, its aria-labels and its summaries name one thing three ways.
+    assert [r["phrase"] for r in body["requesters"]] == ["Strata", "ComfyUI", "a game", "low VRAM"]
+    rig.arb.workloads["strata"].asks_for = ("claims",)
+    assert policy_api(server)["summaries"]["strata"] == (
+        "Strata makes room for ComfyUI and low VRAM and asks you first for a game.")
+
+
+def test_the_preview_says_what_an_unsaved_cell_would_do_on_this_card(rig, server):
+    """Before the owner saves a rule they are told what it does, and the sentence is about the
+    card they are looking at: which answer the cell holds, and whether the workload on it is
+    answering something now, was used a moment ago so something may be mid-task, or is idle. A
+    demo whose state the page could set would be a demo of a situation the owner is not in."""
+    rig.strata.loaded = True
+    rig.arb.note_used("strata", time.time() - 3600)          # an hour since anything asked
+    code, out = preview(server, "strata", "comfy", "keep")
+    assert code == 200 and out["tone"] == "warn"
+    assert out["title"] == "Strata stays loaded, and you get a warning"
+    assert out["detail"] == ("ComfyUI is refused. The warning has a Make room now button, and the "
+                             "refusal is logged.")
+    code, out = preview(server, "strata", "comfy", "yes")
+    assert code == 200 and out["title"] == "Strata unloads right away"
+    assert "Strata has been idle for 60 min." in out["detail"]
+    assert "Frees 13.7 GiB in about 2 s" in out["detail"]
+    code, out = preview(server, "strata", "comfy", "ask")
+    assert out["title"] == "You get a notification asking first"
+    assert "ComfyUI waits for your answer." in out["detail"]
+    assert "No answer in 2 min: Strata stays loaded." in out["detail"]
+    # The draft's own ask numbers, not the saved ones: the question the preview describes is the
+    # one the owner's unsaved ask block would ask.
+    _, out = preview(server, "strata", "comfy", "ask", ask={"timeout_s": 60, "fallback": "release"})
+    assert "No answer in 60 s: Strata unloads." in out["detail"]
+    # A game and an app that grew cannot be refused, so keeping loaded costs memory rather than a
+    # refusal, and the preview says which of the two it is.
+    assert preview(server, "strata", "claims", "keep")[1]["detail"] == (
+        "A game can't be refused, so it starts with what is free.")
+    assert preview(server, "strata", "pressure", "keep",
+                   pressure={"enabled": False})[1]["title"] == "Nothing is unloaded"
+
+
+def test_the_preview_reads_the_workload_s_real_state(rig, server):
+    """The same cell answers differently depending on what the loaded workload is doing, and the
+    states that matter are the states the release itself obeys: it is working, so its current
+    request finishes first; or it is not working but was used a moment ago, so unloading it may
+    cut across a task mid-step. Not knowing when it last worked is a third state and is said as
+    that, never as idle."""
+    rig.strata.loaded = True
+    rig.arb.note_used("strata")                             # seconds ago: may well be mid-task
+    _, out = preview(server, "strata", "comfy", "yes")
+    assert out["tone"] == "warn"
+    assert out["title"] == "Strata unloads at the next pause, even mid-task"
+    assert "Strata was used 0 s ago, so something may be mid-task." in out["detail"]
+    assert "Choose Ask me if you'd rather decide." in out["detail"]
+    # A box where nothing has ever stamped this workload has no evidence that it is idle, and
+    # calling it idle here is how an agent loses its model between two steps.
+    rig.arb.used_path.unlink()
+    _, out = preview(server, "strata", "comfy", "yes")
+    assert "Nothing has recorded Strata working since this started" in out["detail"]
+    # And a workload answering something keeps answering it: the preview says the request in front
+    # of it is never the one that gets cut off.
+    rig.arb.workloads["strata"].busy = lambda: "Strata is busy"
+    _, out = preview(server, "strata", "comfy", "yes")
+    assert out["title"] == "Strata finishes its current request, then unloads"
+    assert "frees 13.7 GiB for ComfyUI" in out["detail"]
+
+
+def test_a_preview_changes_no_rule_no_card_and_no_log(rig, server):
+    """The preview is a question about the rules, not an edit of them: nothing is written, no cell
+    moves, and no row is recorded. It is guarded like the writes all the same, because what it
+    hands back is the owner's rules read out loud next to their live card, and a page on another
+    origin has no business asking - least of all with a draft grid this page never showed."""
+    rig.strata.loaded = True
+    before = policy_api(server)
+    assert preview(server, "strata", "comfy", "keep")[0] == 200
+    after = policy_api(server)
+    assert after["matrix"] == before["matrix"] and after["version"] == before["version"]
+    assert rig.events() == []
+    # Nothing was asked of the card: reading it costs a GET to each API, and the preview that sent
+    # one of those is the one that must never send a POST.
+    assert not [c for c in rig.strata.calls if c.startswith("POST")]
+    assert post(f"{server}/api/policy/preview", {"requester": "comfy"}, edit=None)[0] == 403
+    for body in ({"requester": "nosuch"}, {"requester": "comfy", "workload": "nosuch"},
+                 {"requester": "strata", "workload": "strata"},
+                 {"requester": "comfy", "workload": "strata",
+                  "matrix": {"strata": {"comfy": "maybe"}}},
+                 {"requester": "comfy", "ask": {"timeout_s": 0}}, "not an object"):
+        code, out = post(f"{server}/api/policy/preview", body)
+        assert code == 400 and out["error"], body
+    assert rig.arb.open_asks() == [] and rig.strata.loaded   # still holding, as it was
+
+
+def test_nothing_on_the_card_is_answered_as_nothing(rig, server):
+    """The card is free, so the rule has nothing to do, and the preview says that instead of
+    describing a release that would not happen. Asked with no workload named, which is what the
+    page does when its own reading of the card says nobody holds it."""
+    assert rig.arb.probe()["mode"] == "none"
+    code, out = post(f"{server}/api/policy/preview", {"requester": "comfy"})
+    assert code == 200 and out["tone"] == "info"
+    assert out["title"] == "Nothing is loaded"
+    assert out["detail"] == "Nothing is on the card right now, so this would not unload anything."
+# --- the page's own script, run without a browser --------------------------------------
+
+WEB_HTML = Path(__file__).resolve().parents[1] / "src" / "vhotseat" / "web.html"
+
+
+def page_script() -> str:
+    """The dashboard's script: the one at the end of the page, not the two-line theme snippet in
+    its head."""
+    text = WEB_HTML.read_text(encoding="utf-8")
+    start = text.index('<script>\n"use strict"')
+    return text[text.index("\n", start) + 1:text.rindex("</script>")]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this box")
+def test_the_page_script_is_still_a_script(tmp_path):
+    """The page is one script of plain JS with no build step and no JS test runner of its own, so
+    the free check on it is the parser's: a stray brace here is a dashboard that draws nothing at
+    all while every test in this file still passes."""
+    js = tmp_path / "page.js"
+    js.write_text(page_script(), encoding="utf-8")
+    done = subprocess.run([shutil.which("node"), "--check", str(js)], capture_output=True,
+                          text=True)
+    assert done.returncode == 0, done.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this box")
+def test_the_order_the_page_posts_is_the_reverse_of_the_order_it_draws(tmp_path):
+    """The list is drawn with the workload kept longest at the top, and the order a save posts is
+    an unload order whose first name gives way first - the order `GET /api/policy` reports - so
+    the save has to post the drawn list backwards. That one reversal is where the editor can get
+    the direction backwards, and backwards means every pair in the config swaps on every save:
+    the workload the owner just put last is the next one unloaded. So the helper is taken out of
+    the page and run."""
+    script = page_script()
+    helper = re.search(r"function orderToPost\(order\) \{[^{}]*\}", script)
+    assert helper, "the page has no orderToPost to check"
+    assert "orderToPost(rules.draft.order)" in script, "the save does not post through the helper"
+    done = subprocess.run([shutil.which("node"), "-e", helper.group(0) +
+                           "\nconsole.log(JSON.stringify(orderToPost([" +
+                           "'strata', 'comfy', 'unsloth'])))"], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == ["unsloth", "comfy", "strata"]
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this box")
+def test_the_low_vram_inputs_are_the_config_keys_in_the_units_the_page_shows(tmp_path):
+    """The Low VRAM block edits `pressure:` through five number inputs set in a sentence, four of
+    which show the config's own unit and one of which shows minutes where the file keeps seconds.
+    A key misspelled there is a number that looks saved and was never written; a scale wrong by 60
+    is a cooldown of ten hours typed as ten minutes. So the page's field list is run and compared
+    with the keys the trigger itself reads."""
+    block = re.search(r"const PRESSURE_FIELDS = \[.*?\n\];", page_script(), re.S)
+    assert block, "the page has no PRESSURE_FIELDS to check"
+    done = subprocess.run([shutil.which("node"), "-e", block.group(0)
+                           + "\nconsole.log(JSON.stringify(PRESSURE_FIELDS))"],
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    shown = {f[1]: (f[3], f[4]) for f in json.loads(done.stdout)}
+    assert shown == {"grow_mib": ("MiB", 1), "min_free_mib": ("MiB", 1), "sustain_s": ("s", 1),
+                     "headroom_mib": ("MiB", 1), "cooldown_s": ("min", 60)}
+    # end_margin_mib is deliberately not on the page: it decides when a release episode *stops*,
+    # which an owner watching one can read in the Pressure card but has no reason to tune.
+    assert set(shown) | {"end_margin_mib"} == set(pressure.KEYS) - {"enabled", "ignore"}
+
+
+def js_function(script: str, name: str) -> str:
+    """One named function out of the page's script, braces matched rather than regexed: the
+    functions worth running are the ones that build a POST body, and those have nested objects."""
+    start = script.index(f"function {name}(")
+    depth = 0
+    for i in range(script.index("{", start), len(script)):
+        depth += script[i] == "{"
+        depth -= script[i] == "}"
+        if depth == 0:
+            return script[start:i + 1]
+    raise AssertionError(f"unbalanced {name} in the page script")
+
+
+def js_let(script: str, decl: str) -> str:
+    """A one-line `const NAME = ...;` from the page script."""
+    line = next((ln for ln in script.splitlines() if ln.startswith(decl)), None)
+    assert line, f"the page has no {decl}"
+    return line
+
+
+SAVE_STUBS = """
+const rules = { base: {version: "v1", order: [{workload: "strata"}, {workload: "comfy"},
+            {workload: "unsloth"}]},
+  draft: {order: ORDER, cells: {strata: {comfy: "yes"}}, ask: {timeout_s: 120, fallback: "keep"},
+    pressure: {enabled: true, ignore: [], grow_mib: 2000, min_free_mib: 512, sustain_s: 30,
+      headroom_mib: 1000, cooldown_s: 600}} };
+function pressureToPost() { return { enabled: rules.draft.pressure.enabled }; }
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this box")
+def test_a_save_posts_the_order_only_when_the_owner_moved_it(tmp_path):
+    """The order is the one part of the body that can write something the save bar never mentioned.
+    A config where every workload sits at the same priority has no order in it: post the list
+    anyway and the save gives each workload a priority number - 10 for one, 90 for another - while
+    the bar still reads "1 unsaved change", the grid cell the owner did touch. So the page leaves
+    priorities out unless the drawn order differs from the one it read, and this runs the page's
+    own body builder over both cases."""
+    script = page_script()
+    page_js = chr(10).join([
+        js_let(script, "const baseOrder = "), js_let(script, "const tiedOrder = "),
+        js_let(script, "const orderMoved = "), js_function(script, "orderToPost"),
+        js_function(script, "saveBody")])
+
+    def post(order: str) -> dict:
+        done = subprocess.run([shutil.which("node"), "-e",
+                               SAVE_STUBS.replace("ORDER", order) + chr(10) + page_js
+                               + chr(10) + "console.log(JSON.stringify(saveBody()))"],
+                              capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+        return json.loads(done.stdout)
+
+    same = post('["unsloth", "comfy", "strata"]')      # the drawn order, as it was read
+    assert "priorities" not in same, same
+    assert same["version"] == "v1" and same["matrix"] == {"strata": {"comfy": "yes"}}
+    moved = post('["strata", "comfy", "unsloth"]')     # the owner moved Strata to the top
+    assert moved["priorities"] == ["unsloth", "comfy", "strata"], moved
+
+
+def test_the_rules_are_read_before_the_slowest_thing_on_the_page():
+    """A cold dashboard's first status read is its slowest: it walks every workload's API, and a
+    workload that isn't answering is only known to be so after its request has been given up on.
+    The editor used to wait behind that - and an owner who opened the page during it saw an empty
+    Rules card, with no order, no grid and no explanation. So the policy read starts first and the
+    card is drawn when it lands, and this checks the order they start in, because putting the
+    policy read back into the batch behind status reproduces the blank card."""
+    script = page_script()
+    policy_read = script.index("const policy = loadPolicy()")
+    status_read = script.index('state.status = await getJSON("/api/status")')
+    assert policy_read < status_read, "the rules are queued behind the status read again"
+    assert "if (rules.base) renderRules()" in script[policy_read:policy_read + 200], \
+        "the card is not drawn when the rules arrive"
+    # The card's own renderers take a status if one has arrived, and not otherwise: they are the
+    # part of the page that can be drawn before any workload has been asked.
+    for name in ("renderRules", "renderFits", "tryHolder", "trySituation", "rulesNow", "tryState"):
+        body = js_function(script, name)
+        assert body.count("state.status") == body.count("state.status || {}"), \
+            f"{name} reads state.status without saying it may not have arrived yet"
+def test_a_preview_with_a_claim_open_records_nothing_and_unloads_nothing(rig, server, monkeypatch):
+    """The preview answers a question about a rule the owner has not saved, so reading the card to
+    answer it must not carry the rule out. It used to read the dashboard's cached status, and filling
+    that cache runs a watcher pass: record the claim, then unload whatever the *saved* policy says to
+    unload for it. So a preview asked while a game is claiming the card - on a dashboard that has
+    never answered a status request, where that pass would have run - answers without recording a row, without unloading a model, and without asking Strata for anything."""
+    rig.arb.claim_rules = claims.rules([{"name": "game.exe", "note": "a Steam game"}], builtin=False)
+    monkeypatch.setattr(host, "processes",
+                        lambda: {5: {"pid": 5, "ppid": 4, "name": "game.exe", "exe": None}})
+    rig.strata.loaded = True
+    assert rig.arb.probe()["claims"], "the fake game isn't claiming the card here"
+    code, out = preview(server, "strata", "claims", "keep")
+    assert code == 200, out
+    assert rig.strata.loaded, "the preview unloaded the model"
+    assert rig.events() == [], [e["event"] for e in rig.events()]
+    assert not [c for c in rig.strata.calls if c.startswith("POST")], rig.strata.calls
+    assert rig.arb.open_asks() == []
+    # And the card is still there to be asked about: the page asks with no workload named, and the
+    # answer is about Strata rather than about nobody.
+    code, out = post(f"{server}/api/policy/preview", {"requester": "comfy"})
+    assert code == 200 and out["title"].startswith("Strata"), out
+    assert rig.events() == [], [e["event"] for e in rig.events()]
+
+
+def test_a_conflict_on_the_card_is_answered_about_the_workload_holding_most(rig, server):
+    """Two workloads holding memory at once is mode "conflict" - Strata with its model up and ComfyUI
+    with a workflow's caches - and "nothing is loaded" is the wrong answer to "what would this do?".
+    The one holding most is the one a rule would be asked about, which is what the saved policy would
+    act on, so the preview answers about it instead of about a free card."""
+    rig.strata.loaded = True                             # 13.7 GiB
+    rig.comfy.vram = COMFY_MODEL_VRAM + COMFY_CONTEXT_VRAM
+    assert rig.arb.probe()["mode"] == "conflict"
+    code, out = post(f"{server}/api/policy/preview", {"requester": "claims"})
+    assert code == 200, out
+    assert out["title"].startswith("Strata"), out
+    assert out["title"] != "Nothing is loaded", out          # what a conflict used to answer
+
+
+def test_the_page_picks_the_same_holder_in_a_conflict(tmp_path):
+    """The page names the workload it is asking about, so it makes the same choice for the same
+    reason: a conflict is not an empty card, and the try-it box would otherwise say nothing is on it
+    while two models sit on the GPU. This runs the page's own holder function over the four modes -
+    conflict, one holder, conflict with nothing measurable, and a free card - in one node process,
+    because four node starts for a five-line function is a lot of process churn for whoever runs
+    the suite."""
+    fn = js_function(page_script(), "tryHolder")
+    both = ('{"mode": "conflict", "workloads": ["strata", "comfy"], '
+            '"gpu": {"strata_mib": 21504, "comfy_mib": 9216}}')
+    cases = [(both, "strata"),
+             ('{"mode": "strata", "workloads": ["strata", "comfy"], "gpu": {}}', "strata"),
+             ('{"mode": "conflict", "workloads": ["strata", "comfy"], "gpu": {}}', None),
+             ('{"mode": "none", "workloads": ["strata", "comfy"], "gpu": {}}', None)]
+    program = ("let state;\n" + fn + "\nconst cases = ["
+               + ",".join(f"[{status}, {json.dumps(want)}]" for status, want in cases)
+               + "];\nfor (const [status, want] of cases) { state = { status }; "
+                 "console.log(String(tryHolder()) === String(want)); }\n")
+    done = subprocess.run([shutil.which("node"), "-e", program], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["true"] * len(cases), (done.stdout, cases)

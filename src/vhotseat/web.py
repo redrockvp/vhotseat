@@ -11,10 +11,14 @@ The page (web.html) polls a small JSON API:
   GET /api/why                       for each workload: could it take the card now, and what stands in
                                      the way (`why`'s dry run: it releases nothing)
   GET /api/policy                    the policy as the grid: who gives way for whom, what each choice
-                                     does, the unload order, and the `ask:` and `pressure:` numbers,
+                                     does (all three sentences per cell, so a pick that isn't saved
+                                     yet already says what it would do), the sentence each row adds
+                                     up to, the unload order, and the `ask:` and `pressure:` numbers,
                                      with the config file's version to send back with a save
   POST /api/policy                   save the policy to the config file - the only thing here that
                                      writes the owner's config, and guarded three ways over (see `guard`)
+  POST /api/policy/preview           what one cell of a grid that hasn't been saved would do, in words:
+                                     read-only, writes nothing, guarded like the writes
   POST /api/asks/<ID>                answer an open ask: {answer: "release"|"keep"}. Same guard.
   POST /api/make-room                {for: WORKLOAD}: unload what is in that workload's way once,
                                      changing no rule. Same guard.
@@ -61,6 +65,23 @@ POLICY_WARNING_ROWS = ("policy-refused", "policy-kept")
 # this afternoon. It's the row's own timestamp that decides, so every process serving a page
 # sees the same set.
 WARNING_AGE_S = 300.0
+
+
+def preview_holder(card: dict, workloads: dict) -> str | None:
+    """Who is on the card, for the question "what would this cell do?". `mode` is the arbiter's own
+    answer, and when two workloads are holding memory at once it says "conflict" - which is not a
+    card with nothing on it: the one holding most is the one a rule would be asked about, and
+    answering as though the card were free would promise an owner nothing happens when something
+    obviously would. The page picks the same holder for the same reason; neither offers a picker,
+    because this is about the card as it is."""
+    mode = card.get("mode")
+    if mode in workloads:
+        return mode
+    if mode != "conflict":
+        return None
+    gpu = card.get("gpu") or {}
+    best = max(workloads, key=lambda n: gpu.get(f"{n}_mib") or 0, default=None)
+    return best if best and (gpu.get(f"{best}_mib") or 0) > 0 else None
 
 
 def fits_on_card(peaks: dict, floor: int, idle: dict, total_mib: int | None) -> list[dict]:
@@ -232,6 +253,17 @@ class Dashboard:
                 self._why = (time.monotonic(), cached)
             return cached
 
+    def requesters(self) -> list:
+        """The grid's columns: every workload, then the two requesters that aren't workloads. The
+        labels, the line under each heading, and the words each one reads in the middle of a
+        sentence all come from here, so a heading, an aria-label and a summary on the page cannot
+        drift into three different names for the same column."""
+        out = [{"id": w.name, "label": w.label, "phrase": w.label}
+               for w in self.arbiter.workloads.values()]
+        out += [{"id": cid, "label": label, "sub": sub, "phrase": policy.SUMMARY_PHRASE[cid]}
+                for cid, label, sub in policy.SPECIAL_REQUESTERS]
+        return out
+
     def policy(self) -> dict:
         """The policy in the shape the editor's grid reads: the two keys per workload the arbiter
         acts on, each cell's choice and what it does, the unload order, and the `ask:` and
@@ -259,15 +291,15 @@ class Dashboard:
         wls = self.arbiter.workloads
         where = {n: i for i, n in enumerate(wls)}   # the config's order, for a tie on priority
         rows = [(w.name, w.label, w.yields_to, w.asks_for) for w in wls.values()]
-        requesters = [{"id": w.name, "label": w.label} for w in wls.values()]
-        requesters += [{"id": cid, "label": label, "sub": sub}
-                       for cid, label, sub in policy.SPECIAL_REQUESTERS]
+        columns = [(r["id"], r["label"]) for r in self.requesters()]
         grid = {"version": version, "path": str(path) if path else None,
                 "order": [{"workload": w.name, "label": w.label, "priority": w.priority}
                           for w in sorted(wls.values(),
                                           key=lambda w: (w.priority, where[w.name]))],
-                "requesters": requesters,
-                "matrix": policy.matrix(rows, [(r["id"], r["label"]) for r in requesters]),
+                "requesters": self.requesters(),
+                "matrix": policy.matrix(rows, columns),
+                "says_for": policy.says_all(rows, columns),
+                "summaries": policy.row_says(rows, columns),
                 "ask": dict(self.arbiter.ask),
                 "pressure": dict(self.arbiter.pressure_cfg)}
         if error:
@@ -308,6 +340,72 @@ class Dashboard:
             return 400, {"error": str(e)}
         self.arbiter.reload_policy(force=True)
         return 200, {"version": version}
+
+    def preview(self, body: bytes) -> tuple[int, dict]:
+        """What one cell of a grid the page is holding would do: {title, detail, tone}. Reads the
+        card and writes nothing - not the config, not the card, not one row of the log.
+
+        The draft grid comes in with the request because the owner is deciding what to save, and
+        they are entitled to know what a cell does before they save it. The card's half of the
+        sentence does not: who is loaded, whether it is working, when it was last seen working and
+        what it holds are read from the card here, so the answer is about this machine now rather
+        than about a situation the page made up. Guarded like the writes: what a page on another
+        origin would be reading here is the owner's rules and their live workload activity, and the
+        draft it posted is one this dashboard never showed.
+        """
+        posted = _json_body(body)
+        if isinstance(posted, str):
+            return 400, {"error": posted}
+        columns = {r["id"]: r for r in self.requesters()}
+        rid = posted.get("requester")
+        if rid not in columns:
+            return 400, {"error": f"no requester named {rid!r}; the grid has: "
+                                  + ", ".join(columns)}
+        ask = {**self.arbiter.ask, **(posted.get("ask") or {})}
+        if not isinstance(ask.get("timeout_s"), (int, float)) or ask["timeout_s"] <= 0:
+            return 400, {"error": "ask.timeout_s: expected a number of seconds > 0"}
+        pressure_on = bool((posted.get("pressure") or {}).get(
+            "enabled", self.arbiter.pressure_cfg.get("enabled", True)))
+        requester, label = rid, columns[rid]["label"]
+        # The card is probed here rather than read out of the dashboard's cached status, and that is
+        # not a detail: filling that cache runs a watcher pass, which records an open claim and then
+        # unloads what the *saved* policy says to unload for it. A question about a rule must not
+        # carry out a rule - least of all one the owner is still deciding whether to keep.
+        card = self.arbiter.probe()
+        wls = self.arbiter.workloads
+        name = posted.get("workload")
+        if name is None:
+            name = preview_holder(card, wls)
+        elif name not in wls:
+            return 400, {"error": f"no workload named {name!r}; configured: "
+                                  + ", ".join(wls)}
+        elif name == rid:
+            return 400, {"error": f"a workload doesn't unload itself: there is no {name} "
+                                  "column in the grid"}
+        if name is None:
+            return 200, policy.outcome(holder=None, requester=label, requester_id=requester,
+                                       cell="yes", working=False, ago_s=None, held_mib=None,
+                                       ask=ask, pressure_on=pressure_on)
+        w = wls[name]
+        cell = ((posted.get("matrix") or {}).get(name) or {}).get(rid)
+        if cell is None:
+            cell = policy.choice(w.yields_to, w.asks_for, rid)
+        if cell not in policy.CHOICES:
+            return 400, {"error": f"matrix.{name}.{rid}: expected one of "
+                                  f"{', '.join(policy.CHOICES)}, got {cell!r}"}
+        held = (card.get("gpu") or {}).get(f"{name}_mib")
+        # Loaded as the arbiter means it when it decides who to ask: on the card, or its own API
+        # says it is. A workload that holds nothing has nothing for this rule to unload, and the
+        # honest answer to "what would this do?" is that it wouldn't do anything.
+        loaded = card["mode"] == name or (held or 0) > w.idle_vram_mib
+        try:
+            working = bool(w.busy())
+        except Exception:                                     # noqa: BLE001 - a probe, not a decision
+            working = True      # unknown counts as busy, which is how every release reads it
+        return 200, policy.outcome(holder=w.label if loaded else None, requester=label,
+                                   requester_id=requester, cell=cell, working=working,
+                                   ago_s=self.arbiter.used_ago(name), held_mib=held, ask=ask,
+                                   pressure_on=pressure_on, loaded=loaded)
 
     def answer_ask(self, ask_id: str, body: bytes) -> tuple[int, dict]:
         """Answer the open ask `ask_id`: 200 with the ask as it now reads, 400 with the reason the
@@ -419,19 +517,21 @@ class Dashboard:
 
             def do_POST(self):
                 url = urlparse(self.path)
-                ask_id = (url.path[len("/api/asks/"):] if url.path.startswith("/api/asks/")
-                          else None)
-                if ask_id is not None:
+                if url.path.startswith("/api/asks/"):
+                    ask_id = url.path[len("/api/asks/"):]
                     todo = lambda body: dash.answer_ask(ask_id, body)                # noqa: E731
                 elif url.path == "/api/make-room":
                     todo = dash.make_room
+                elif url.path == "/api/policy/preview":
+                    todo = dash.preview
                 elif url.path == "/api/policy":
                     todo = dash.save_policy
                 else:
                     return self._json(404, {"error": f"no such endpoint: {url.path}"})
-                # The same three guards for all three: an ask's answer unloads a model, "make room
-                # now" unloads one, and a policy save rewrites the rules - none of them is
-                # something a page the visitor was only reading gets to do.
+                # The same three guards for all four: an ask's answer unloads a model, "make room
+                # now" unloads one, a policy save rewrites the rules, and the preview reads the
+                # owner's rules and their live card back out loud - none of them is something a
+                # page the visitor was only reading gets to do.
                 reason = guard(self.headers, self.server.server_address[1])
                 if reason:
                     return self._json(403, {"error": reason})
