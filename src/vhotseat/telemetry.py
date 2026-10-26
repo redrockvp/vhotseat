@@ -43,7 +43,7 @@ TABLES = ("samples", "events", "logs")
 READ_ERRORS = (sqlite3.Error, OSError)
 # The status keys that aren't a workload's.
 NOT_WORKLOADS = {"mode", "gpu", "ram", "holders", "claims", "claims_state", "last_event",
-                 "policy", "pressure"}
+                 "policy", "pressure", "last_used", "asks", "notifications"}
 
 
 def compact(status: dict, health: dict | None = None) -> dict:
