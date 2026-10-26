@@ -1722,6 +1722,13 @@ class Arbiter:
         """
         if card is not None:
             now, gpu = set(card[0]), card[1]
+        elif not [n for n, w in self.workloads.items()
+                  if (w.gate or {}).get("kind") == "hold"] and not self.events.arrivals_open():
+            # Nothing on this box can load past a gate that never asks, and nothing is recorded as
+            # having done so - which is most boxes: every workload there asks for the GPU itself, and
+            # its gate makes the room. So the card is not read for arrivals at all, rather than read
+            # every poll to conclude what the config already says.
+            return set(), [], {}
         else:
             gpu = self.snapshot()
             now = {n for n, w in self.workloads.items() if w.active(w.probe(gpu), gpu)}

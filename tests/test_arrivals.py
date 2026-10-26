@@ -328,6 +328,21 @@ def test_the_conflict_is_over_when_the_newcomer_unloads(arig):
     assert len(arig.events("arrival-release")) == 1
 
 
+def test_a_box_where_every_workload_asks_for_itself_reads_nothing_for_arrivals(arig, monkeypatch):
+    """No `kind: hold` workload - every workload on the box asks for the GPU through a gate that makes
+    its own room - and nothing recorded as having skipped one: the arrival check costs no card read
+    and no probe, rather than one of each per poll. That is what config.example.yaml describes, and
+    what most boxes are."""
+    seen = []
+    for name, w in arig.arb.workloads.items():
+        real = w.probe
+        monkeypatch.setattr(w, "probe",
+                            lambda gpu, real=real, name=name: (seen.append(name), real(gpu))[1])
+    arig.arb.workloads["studio"].gate = {"kind": "hook"}
+    _, arrivals, _gpu = arig.arb.arrival_scan()
+    assert arrivals == [] and seen == []
+
+
 def test_status_names_the_load_that_asked_for_nothing(arig):
     """An owner reading `vhotseat status` in a terminal gets the same account the log has: which of
     the two on the card asked for nothing, and what is still holding because of its own policy. A
