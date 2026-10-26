@@ -367,6 +367,10 @@ class FakeGpu:
         self.error = None
         self.total = 16303
         self.extra: list[dict] = []        # [{pid, name, mib}]: processes nothing manages
+        # A third workload's fake server, by name: what it holds counts as that workload's, the way
+        # strata's and comfy's do. Tests that need more than the two in config.example.yaml - a
+        # `gate: {kind: hold}` workload loading past its gate - put one here.
+        self.more: dict[str, object] = {}
         self.shared_of: dict[int, int] = {}  # pid -> shared GPU memory: system RAM, not the card
 
     def add_process(self, name: str, mib: int, pid: int | None = None) -> int:
@@ -385,12 +389,13 @@ class FakeGpu:
             return {"total_mib": None, "free_mib": None, **{f"{n}_mib": 0 for n in selectors}, "other_mib": 0,
                     "error": self.error}
         extra = sum(e["mib"] for e in self.extra)
+        mine = {**{f"{n}_mib": f.vram for n, f in self.more.items()}}
         if getattr(self, "strata_as_other", False):   # a workload the backend can't attribute
-            used = {"strata_mib": 0, "comfy_mib": self.comfy.vram,
-                    "other_mib": self.other + self.strata.vram + extra}
+            used = {"strata_mib": 0, "comfy_mib": self.comfy.vram, "other_mib": self.other + self.strata.vram + extra,
+                    **mine}
         else:
             used = {"strata_mib": self.strata.vram, "comfy_mib": self.comfy.vram,
-                    "other_mib": self.other + extra}
+                    "other_mib": self.other + extra, **mine}
         return {"total_mib": self.total, "free_mib": self.total - sum(used.values()), **used}
 
     def read_all(self, selectors: dict, limit: int = 8) -> tuple[dict, list]:
@@ -408,6 +413,8 @@ class FakeGpu:
             rows.append({"pid": 2222, "mib": self.comfy.vram, "name": "python.exe", "workload": "comfy"})
         if self.other:
             rows.append({"pid": 3333, "mib": self.other, "name": "Xorg", "workload": None})
+        rows.extend({"pid": 4444 + i, "mib": f.vram, "name": f"{n}.exe", "workload": n}
+                    for i, (n, f) in enumerate(self.more.items()) if f.vram)
         rows.extend({"pid": e["pid"], "mib": e["mib"], "name": e["name"], "workload": None}
                     for e in self.extra)
         rows.sort(key=lambda r: -r["mib"])

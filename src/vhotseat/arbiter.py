@@ -127,6 +127,10 @@ class Arbiter:
         # afterwards and put what it was reading over the rules that save installed.
         self._policy_lock = threading.RLock()
         self.config_error: str | None = None
+        # Which workloads were on the card at the previous watcher pass, for noticing an arrival
+        # (see `arrival_scan`). Process memory on purpose: the watcher thread and the page's status
+        # read share one arbiter, so they compare against the same "last time".
+        self._was_active: set[str] | None = None
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
@@ -397,7 +401,8 @@ class Arbiter:
 
     def ask_now(self, workload: str, requester: str, *, held_mib: int, source: str,
                 name: str | None = None, note: str | None = None, free_mib: int | None = None,
-                pid: int | None = None, held: bool = False, scope: str = "") -> dict | None:
+                pid: int | None = None, held: bool = False, scope: str = "",
+                arrived: bool = False) -> dict | None:
         """Open the one open ask for this (workload, requester, scope), or return the one that is
         already open. Returns the row, or None when this process couldn't open one.
 
@@ -417,7 +422,9 @@ class Arbiter:
 
         The row carries the numbers the wait and the sentence are built from - the timeout and
         fallback as of asking, what the workload holds, when it was last seen working - because a
-        question has to keep meaning the same thing to whoever reads it later.
+        question has to keep meaning the same thing to whoever reads it later. `arrived` says the
+        newcomer is already loaded, so the question promises nothing to anybody waiting: it is asked
+        about a load that happened past a gate that never asks.
 
         The row is written under the lock; the notification is raised after it is given back, when
         this process took the lock itself. Showing a toast is a call into a GUI stack that nobody
@@ -439,11 +446,12 @@ class Arbiter:
                 return self.events.open_ask(workload, requester, scope)
             with got:
                 row = self._open_ask(workload, requester, held_mib=held_mib, source=source,
-                                     name=name, note=note, free_mib=free_mib, pid=pid, scope=scope)
+                                     name=name, note=note, free_mib=free_mib, pid=pid, scope=scope,
+                                     arrived=arrived)
             return (self._raise_question(row) if row
                     else self.events.open_ask(workload, requester, scope))
         row = self._open_ask(workload, requester, held_mib=held_mib, source=source, name=name,
-                             note=note, free_mib=free_mib, pid=pid, scope=scope)
+                             note=note, free_mib=free_mib, pid=pid, scope=scope, arrived=arrived)
         return self._raise_question(row) if row else self.events.open_ask(workload, requester, scope)
 
     @staticmethod
@@ -516,7 +524,7 @@ class Arbiter:
 
     def _open_ask(self, workload: str, requester: str, *, held_mib: int, source: str,
                   name: str | None, note: str | None, free_mib: int | None,
-                  pid: int | None, scope: str = "") -> dict | None:
+                  pid: int | None, scope: str = "", arrived: bool = False) -> dict | None:
         """Write the `ask` row and return it, or None when the question is already in the log -
         the same recheck after taking a lock that a pressure episode does, and the reason a pair gets
         one question and one notification rather than two. Called with the GPU lock held.
@@ -535,14 +543,15 @@ class Arbiter:
         """
         try:
             return self._write_ask(workload, requester, held_mib=held_mib, source=source,
-                                   name=name, note=note, free_mib=free_mib, pid=pid, scope=scope)
+                                   name=name, note=note, free_mib=free_mib, pid=pid, scope=scope,
+                                   arrived=arrived)
         except Locked as e:
             util.log(f"couldn't ask about {workload} for {requester}: {e}")
             return None
 
     def _write_ask(self, workload: str, requester: str, *, held_mib: int, source: str,
                    name: str | None, note: str | None, free_mib: int | None,
-                   pid: int | None, scope: str) -> dict | None:
+                   pid: int | None, scope: str, arrived: bool = False) -> dict | None:
         with self.events.turn(what="opening an ask"):
             if self.events.open_ask(workload, requester, scope) is not None:
                 return None              # written between the look above and this turn
@@ -551,6 +560,11 @@ class Arbiter:
                    "timeout_s": self.ask["timeout_s"], "fallback": self.ask["fallback"],
                    "last_used": self.last_used().get(workload), "name": name, "note": note,
                    "scope": scope}
+            if arrived:
+                # Only on the questions that need it: "nothing is waiting for your answer" is true of
+                # an arrival and wrong of every other ask, and a row that says it twice teaches an
+                # owner to stop reading it.
+                row["arrived"] = True
             if pid:
                 row["pid"] = pid
             # The row's own time, chosen here rather than left to the log: the wait, the countdown
@@ -791,9 +805,14 @@ class Arbiter:
         for n in asked:
             ask = known.get(n)
             if ask is None:
+                # A release is asked about one of three things: a claim, an episode, or a workload
+                # that is already on the card because its gate never asks (`arrived`). Only the last
+                # one has nothing waiting, and the question has to say so rather than promise an
+                # answer someone is holding a load up for.
                 self.ask_now(n, reason, held_mib=want.get(n) or 0, source=source, name=name,
                              note=note, free_mib=(snap or {}).get("free_mib"), pid=pid, held=True,
-                             scope=scope)
+                             scope=scope,
+                             arrived=reason not in (policy.CLAIMS, policy.PRESSURE))
                 continue
             answer = ask.get("answer")
             if answer == policy.RELEASE:
@@ -990,6 +1009,12 @@ class Arbiter:
             # is still holding. Read back from the event log, so it costs nothing when nothing
             # claims the card and survives whichever process did the releasing.
             status["claims_state"] = self.events.claims_open()
+        if mode == "conflict":
+            # Two workloads on the card at once is the only state an arrival is open in, so the log is
+            # read for it only then. What has already been freed for a load that asked for nothing, and
+            # what is still holding, come back from the rows for the same reason a claim's do: the one
+            # that released it may not be the one now reporting it.
+            status["arrival_state"] = self.events.arrivals_open()
         if self.telemetry is not None:
             self.telemetry.sample(status, self.gpu_health)
         return status
@@ -1037,6 +1062,24 @@ class Arbiter:
                     bits.append("kept for its policy: " + ", ".join(kept))
                 if bits:
                     lines.append(f"{pad('freed for:')}{key[0]} ({key[1]}) - " + "; ".join(bits))
+        if arrivals := s.get("arrival_state"):
+            # A load nobody asked for, and what it cost. The same shape as a claim's line above,
+            # because it is the same decision: who gave way, and who didn't. The `note` is the row's
+            # own sentence about what the owner has to do next - the memory that came free is only
+            # worth having if the model that sized itself smaller is loaded again.
+            for n, rec in sorted(arrivals.items()):
+                bits = []
+                if rec["released"]:
+                    bits.append("unloaded " + ", ".join(rec["released"])
+                                + (f" ({rec['freed_mib']} MiB)" if rec.get("freed_mib") else ""))
+                for w in rec["waiting"]:
+                    bits.append(f"{w['workload']} keeps its model: {w['why']}")
+                if kept := rec.get("kept"):
+                    bits.append("kept for its policy: " + ", ".join(kept))
+                if rec.get("note"):
+                    bits.append(rec["note"])
+                if bits:
+                    lines.append(f"{pad('arrival:')}{n} - " + "; ".join(bits))
         pr = s.get("pressure") or {}
         if open := pr.get("open"):            # The card is short right now for something vhotseat doesn't manage, and this says so in
             # the same words the release wrote: what took the memory, how far past its usual it is,
@@ -1515,7 +1558,10 @@ class Arbiter:
                      or policy.may_ask(y.yields_to, y.asks_for, policy.CLAIMS))]
         return sorted(owed, key=lambda n: (self.workloads[n].priority, n))
 
-    def claim_release(self, claim: dict, only: list[str] | None = None) -> dict:
+    def claim_release(self, claim: dict, only: list[str] | None = None, *,
+                      reason: str = policy.CLAIMS, tag: str = "claim release",
+                      scope: str | None = None, ask_since: str | None = None,
+                      source: str = "claim") -> dict:
         """A claim appeared (`on_start: release`): ask the workloads it was owed to let go of
         the card, through the normal release path - API unload, then the card confirms the MiB
         went - and leave anything that is working alone.
@@ -1523,6 +1569,14 @@ class Arbiter:
         `only` is that set, read back from the log by whoever is acting; workloads outside it
         are not touched for this claim whatever they come to hold later. With no set passed,
         every workload holding card memory is a candidate.
+
+        The same path serves an arrival - a workload that loaded past a gate that never asks - and
+        that is what the four extra keywords are for rather than a second release function that
+        could drift from this one: `reason` is who the room is being made for (`claims`, or the
+        newcomer's name, which is the pair the Rules grid holds), `tag` is the lock's label, so a
+        sister watcher is still spotted, `scope` is which questions are this episode's instead of
+        which game process, `ask_since` is the row that scopes them, and `source` is who the log
+        says asked. The claim's own call passes none of them and behaves exactly as it did.
 
         It takes the GPU lock exactly as a switch would: a `hold` or a switch in progress owns
         the card, and releasing underneath it would pull the ground out from under that work, so
@@ -1546,22 +1600,22 @@ class Arbiter:
         # this is the config's answer now (an owner who protects a workload mid-game stops the
         # watcher coming back for it on the next poll).
         cands = {n: y for n, y in cands.items()
-                 if policy.yields(y.yields_to, policy.CLAIMS, y.asks_for)
-                 or policy.may_ask(y.yields_to, y.asks_for, policy.CLAIMS)}
+                 if policy.yields(y.yields_to, reason, y.asks_for)
+                 or policy.may_ask(y.yields_to, y.asks_for, reason)}
         pre = self.snapshot()
         if not any((pre.get(f"{n}_mib") or 0) > y.idle_vram_mib for n, y in cands.items()):
             # Nothing it is owed is on the card, so there is nothing to free and no reason to
             # take the lock every poll for as long as the game runs. `would` says as much.
             return {"declined": None, "by_actor": False, "would": [], "released": [],
                     "waiting": [], "freed_mib": 0}
-        got = self.lock.try_take(f"claim release {claim.get('name') or ''}".strip())
+        got = self.lock.try_take(f"{tag} {claim.get('name') or ''}".strip())
         if not isinstance(got, Held):
             want = {n: max(0, (pre.get(f"{n}_mib") or 0) - y.idle_vram_mib)
                     for n, y in cands.items()}
             # Another watcher (watch and the dashboard both act) is mid-release for this same
             # claim. That isn't a workload holding on: saying so once per workload would both
             # spam the log and shadow the reason that matters, if one turns up later.
-            sister = bool(got and got.startswith("claim release"))
+            sister = bool(got and got.startswith(tag))
             return {"declined": f"{got or 'a switch'} in progress", "by_actor": sister,
                     "would": sorted(n for n, mib in want.items() if mib),
                     "released": [], "waiting": [], "freed_mib": 0}
@@ -1576,10 +1630,11 @@ class Arbiter:
             if not any(want.values()):
                 return {"declined": None, "by_actor": False, "would": [], "released": [],
                         "waiting": [], "freed_mib": 0}
-            cands = self.ask_before_release(policy.CLAIMS, cands, want, source="claim",
+            cands = self.ask_before_release(reason, cands, want, source=source,
                                             name=claim.get("name"), note=claim.get("note"),
-                                            pid=claim.get("pid"), snap=snap,
-                                            scope=self.claim_scope(claim.get("pid")))
+                                            pid=claim.get("pid"), snap=snap, since=ask_since,
+                                            scope=self.claim_scope(claim.get("pid")) if scope is None
+                                            else scope)
             if not any(want.get(n) for n in cands):
                 # Everything it is still owed wants being asked first, and the answers haven't
                 # come. Nothing was released and nothing is `waiting`: the game is running with
@@ -1634,6 +1689,74 @@ class Arbiter:
                 continue
             released.append({"workload": n, "freed_mib": want[n]})
         return released, waiting
+
+    # --- an arrival: a workload that loaded past a gate that never asks ---------------
+
+    ARRIVAL_LOCK = "arrival release"    # the lock's label, and how a sister actor is spotted
+
+    def arrival_scan(self, card: tuple | None = None) -> tuple[set, list[str], dict]:
+        """(which workloads are on the card now, which of them are arrivals, the card they were read
+        on).
+
+        An arrival is a workload that is on the card now, wasn't on it at the previous pass, and got
+        there while at least one other workload was on it too: the load already happened and sized
+        itself to whatever was free, which is the situation the owner chose to have handled after the
+        fact. The room it would have asked for is what gets made - see `arrival_targets`.
+
+        Only a `gate: {kind: hold}` workload is detected. A hook, plugin or proxy gate holds the GPU
+        lock and makes room before its load, so one of those arriving beside another workload is a
+        handover already in progress, and racing it is worse than not noticing it. `hold` is the kind
+        that means "nothing inside this program ever asks vhotseat first".
+
+        Whose previous pass? The set lives on the arbiter, because one process runs this from two
+        places - the watcher thread and a page's status read - and `watch` runs beside them, so each
+        comparing against its own "last time" would call the same load an arrival twice. It is
+        process memory, so the first pass after a start records the card and acts on nothing: an
+        existing pair of residents is not news, and one reading cannot say which of the two loaded
+        second. Nothing is persisted to close that gap: the pair a restart walks in on is left as it
+        is, and the next load that happens while something else is resident is noticed normally.
+
+        `card` is a reading the caller already has - the dashboard has just probed, and noticing an
+        arrival on a card that isn't the one the page is showing is a disagreement nobody can
+        explain. Without it this takes one card read and a probe of each workload.
+        """
+        if card is not None:
+            now, gpu = set(card[0]), card[1]
+        else:
+            gpu = self.snapshot()
+            now = {n for n, w in self.workloads.items() if w.active(w.probe(gpu), gpu)}
+        was, self._was_active = self._was_active, now
+        if was is None or len(now) < 2:
+            # Nothing on the card, or one workload owning it outright: nobody's room was skipped.
+            return now, [], gpu
+        return now, sorted(n for n in now - was
+                           if (self.workloads[n].gate or {}).get("kind") == "hold"), gpu
+
+    def arrival_targets(self, arriving: str) -> list[str]:
+        """The workloads an arrival is owed: what is on the card, gives way for the newcomer - or
+        wants being asked for it - and is not the newcomer itself, lowest priority first.
+
+        The same list `claim_targets` builds, read against the newcomer's name instead of the word
+        `claims`. That is what makes the Rules grid the thing that decides here: the cell for this
+        workload's row and the newcomer's column is the same cell a load that *did* ask would have
+        been answered by. The newcomer is never a candidate for its own room - unloading it would
+        undo a load nobody asked vhotseat to make, and the fix the owner asked for is more memory
+        for the model that is already loaded, not less.
+        """
+        snap = self.snapshot()
+        owed = [n for n in self.loaded(snap) if n != arriving
+                and (policy.yields(self.workloads[n].yields_to, arriving, self.workloads[n].asks_for)
+                     or policy.may_ask(self.workloads[n].yields_to, self.workloads[n].asks_for,
+                                       arriving))]
+        return sorted(owed, key=lambda n: (self.workloads[n].priority, n))
+
+    @staticmethod
+    def arrival_scope(arrival: dict) -> str:
+        """Which questions are this arrival's: the id of the row that opened it, the way an episode's
+        questions are that episode's. The same workload loading again next week is a different
+        question, and "unload ComfyUI" answered for this load is not consent for that one.
+        """
+        return f"ar{arrival['id']}" if arrival.get("id") else ""
 
     # --- pressure: an app vhotseat doesn't manage takes the card ---------------------
 

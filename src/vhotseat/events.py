@@ -14,6 +14,14 @@ from .lock import Locked
 # The rows that say a claim is open, and what has been done about it.
 CLAIM_ROWS = ("claim", "claim-end", "claim-release", "claim-release-targets",
               "claim-release-waiting")
+# The rows for a workload that loaded past a gate that never asks (`kind: hold`): the load is the
+# `arrival`, and the rest is what the watcher has done about it. Same shape as the claim rows on
+# purpose - one episode, its targets decided once when it started, and what has come free read back
+# from the rows - so the dashboard's event table and `status` need no new rendering for it. Keyed by
+# `arriving`, which leaves `workload` meaning the same thing it does in a claim row: the workload
+# being asked to give its model back.
+ARRIVAL_ROWS = ("arrival", "arrival-end", "arrival-release", "arrival-release-targets",
+                "arrival-release-waiting")
 # The rows that make an ask: `ask` opens the question (one per workload and requester at a
 # time) and `ask-answer` closes it, answered by the owner or by nobody answering in time.
 ASK_ROWS = ("ask", "ask-answer")
@@ -229,6 +237,73 @@ class EventLog:
                 for w in rec["waiting"]:
                     if w["workload"] == e["workload"]:
                         # The newest reason, and however many tries the log has seen.
+                        w["why"], w["stuck"] = e.get("why") or w["why"], bool(e.get("stuck")) or w["stuck"]
+                        w["attempts"] = max(w.get("attempts") or 0, e.get("attempts") or 1)
+                        w["held_mib"] = e.get("held_mib") or w.get("held_mib") or 0
+                        break
+                else:
+                    rec["waiting"].append({"workload": e["workload"], "why": e.get("why") or "",
+                                           "attempts": e.get("attempts") or 1,
+                                           "stuck": bool(e.get("stuck")),
+                                           "held_mib": e.get("held_mib") or 0})
+        return out
+
+    def arrivals_open(self, limit: int = 500) -> dict:
+        """What the log shows as an arrival still on the card: {workload: {arrival, targets, kept,
+        released, waiting, freed_mib}}, rebuilt from its tail.
+
+        The same answer `claims_open` gives, for the same reason: `watch` and the dashboard both
+        notice a load that went past its gate and both act, so which workloads that load was owed,
+        which have already unloaded for it and which have already been reported holding come from the
+        rows rather than from the memory of whoever wrote them. The one that arrives second finds an
+        episode in progress instead of a card to free a second time.
+
+        Keyed by the workload that arrived. Every row carries it as `arriving`, so `workload` on a
+        `-waiting` or `policy-kept` row stays what it is on a claim row: the workload being asked to
+        let go of its model.
+
+        The trade is the same one as a claim's: an arrival older than the retained log is forgotten,
+        and the next conflict is treated as news.
+        """
+        out: dict[str, dict] = {}
+
+        def record(key):
+            return out.setdefault(key, {"arrival": {"arriving": key}, "targets": None, "kept": [],
+                                        "released": [], "waiting": [], "freed_mib": 0})
+
+        for e in self.tail(limit):
+            kind = e.get("event")
+            if kind not in ARRIVAL_ROWS:
+                continue
+            key = e.get("arriving")
+            if not key:
+                continue
+            if kind == "arrival-end":
+                out.pop(key, None)
+            elif kind == "arrival":
+                record(key)["arrival"] = e
+            elif kind == "arrival-release-targets":
+                # Decided once, when the arrival's release first ran, from what the card held under
+                # the load. An empty list is a real answer, and `kept` names what was on the card and
+                # is not owed because of its `yields_to:`.
+                record(key)["targets"] = list(e.get("targets") or [])
+                record(key)["kept"] = list(e.get("kept") or [])
+            elif kind == "arrival-release":
+                rec = record(key)
+                got = set(e.get("workloads") or [])
+                rec["released"] = sorted(set(rec["released"]) | got)
+                rec["freed"] = (rec.get("freed") or []) + (e.get("freed") or [])
+                rec["freed_mib"] += e.get("freed_mib") or 0
+                # A retry that worked: the row saying it was still holding is history now.
+                rec["waiting"] = [w for w in rec["waiting"] if w["workload"] not in got]
+                if e.get("note"):
+                    # The newest one: what the owner has to do with the memory that came free. Rows
+                    # age out of the log; this is the sentence that matters while they don't.
+                    rec["note"] = e["note"]
+            elif e.get("workload"):
+                rec = record(key)
+                for w in rec["waiting"]:
+                    if w["workload"] == e["workload"]:
                         w["why"], w["stuck"] = e.get("why") or w["why"], bool(e.get("stuck")) or w["stuck"]
                         w["attempts"] = max(w.get("attempts") or 0, e.get("attempts") or 1)
                         w["held_mib"] = e.get("held_mib") or w.get("held_mib") or 0
