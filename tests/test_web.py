@@ -853,3 +853,62 @@ def test_the_rules_are_read_before_the_slowest_thing_on_the_page():
         body = js_function(script, name)
         assert body.count("state.status") == body.count("state.status || {}"), \
             f"{name} reads state.status without saying it may not have arrived yet"
+def test_a_preview_with_a_claim_open_records_nothing_and_unloads_nothing(rig, server, monkeypatch):
+    """The preview answers a question about a rule the owner has not saved, so reading the card to
+    answer it must not carry the rule out. It used to read the dashboard's cached status, and filling
+    that cache runs a watcher pass: record the claim, then unload whatever the *saved* policy says to
+    unload for it. So a preview asked while a game is claiming the card - on a dashboard that has
+    never answered a status request, where that pass would have run - answers without recording a row, without unloading a model, and without asking Strata for anything."""
+    rig.arb.claim_rules = claims.rules([{"name": "game.exe", "note": "a Steam game"}], builtin=False)
+    monkeypatch.setattr(host, "processes",
+                        lambda: {5: {"pid": 5, "ppid": 4, "name": "game.exe", "exe": None}})
+    rig.strata.loaded = True
+    assert rig.arb.probe()["claims"], "the fake game isn't claiming the card here"
+    code, out = preview(server, "strata", "claims", "keep")
+    assert code == 200, out
+    assert rig.strata.loaded, "the preview unloaded the model"
+    assert rig.events() == [], [e["event"] for e in rig.events()]
+    assert not [c for c in rig.strata.calls if c.startswith("POST")], rig.strata.calls
+    assert rig.arb.open_asks() == []
+    # And the card is still there to be asked about: the page asks with no workload named, and the
+    # answer is about Strata rather than about nobody.
+    code, out = post(f"{server}/api/policy/preview", {"requester": "comfy"})
+    assert code == 200 and out["title"].startswith("Strata"), out
+    assert rig.events() == [], [e["event"] for e in rig.events()]
+
+
+def test_a_conflict_on_the_card_is_answered_about_the_workload_holding_most(rig, server):
+    """Two workloads holding memory at once is mode "conflict" - Strata with its model up and ComfyUI
+    with a workflow's caches - and "nothing is loaded" is the wrong answer to "what would this do?".
+    The one holding most is the one a rule would be asked about, which is what the saved policy would
+    act on, so the preview answers about it instead of about a free card."""
+    rig.strata.loaded = True                             # 13.7 GiB
+    rig.comfy.vram = COMFY_MODEL_VRAM + COMFY_CONTEXT_VRAM
+    assert rig.arb.probe()["mode"] == "conflict"
+    code, out = post(f"{server}/api/policy/preview", {"requester": "claims"})
+    assert code == 200, out
+    assert out["title"].startswith("Strata"), out
+    assert out["title"] != "Nothing is loaded", out          # what a conflict used to answer
+
+
+def test_the_page_picks_the_same_holder_in_a_conflict(tmp_path):
+    """The page names the workload it is asking about, so it makes the same choice for the same
+    reason: a conflict is not an empty card, and the try-it box would otherwise say nothing is on it
+    while two models sit on the GPU. This runs the page's own holder function over the four modes -
+    conflict, one holder, conflict with nothing measurable, and a free card - in one node process,
+    because four node starts for a five-line function is a lot of process churn for whoever runs
+    the suite."""
+    fn = js_function(page_script(), "tryHolder")
+    both = ('{"mode": "conflict", "workloads": ["strata", "comfy"], '
+            '"gpu": {"strata_mib": 21504, "comfy_mib": 9216}}')
+    cases = [(both, "strata"),
+             ('{"mode": "strata", "workloads": ["strata", "comfy"], "gpu": {}}', "strata"),
+             ('{"mode": "conflict", "workloads": ["strata", "comfy"], "gpu": {}}', None),
+             ('{"mode": "none", "workloads": ["strata", "comfy"], "gpu": {}}', None)]
+    program = ("let state;\n" + fn + "\nconst cases = ["
+               + ",".join(f"[{status}, {json.dumps(want)}]" for status, want in cases)
+               + "];\nfor (const [status, want] of cases) { state = { status }; "
+                 "console.log(String(tryHolder()) === String(want)); }\n")
+    done = subprocess.run([shutil.which("node"), "-e", program], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["true"] * len(cases), (done.stdout, cases)

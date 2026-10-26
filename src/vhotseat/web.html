@@ -1250,7 +1250,7 @@ const ICONS = {
   x: '<path d="M6 6l12 12M18 6L6 18"></path>',
 };
 const rules = { base: null, draft: null, readError: null, tryReq: "claims", tryOut: null,
-  trySeq: 0, trySit: null, conflict: null, error: null, justSaved: false };
+  trySeq: 0, trySit: null, conflict: null, error: null, justSaved: false, saving: false };
 
 function iconSvg(name, size, width = 2) {
   const s = el("svg", { viewBox: "0 0 24 24", width: size, height: size, "aria-hidden": "true",
@@ -1337,7 +1337,7 @@ function changeList() {
 // One edit to the draft, then the page and the "try it" answer follow it. The callback runs before
 // anything is redrawn, so a control can hand over the value it was clicked to.
 function editDraft(fn) {
-  if (!rules.draft) return;          // nothing to edit until the policy has been read
+  if (!rules.draft || rules.saving) return;   // nothing to edit until it's read; nothing to accept mid-save
   fn(rules.draft);
   rules.error = null;
   rules.justSaved = false;
@@ -1392,7 +1392,7 @@ function moveOrder(i, dir) {
 function moveBtn(id, i, dir) {
   const b = el("button", { type: "button", class: "move", "data-k": `move:${id}:${dir}`,
     "aria-label": `Move ${labelOf(id)} ${dir < 0 ? "up" : "down"}` });
-  b.disabled = i + dir < 0 || i + dir >= rules.draft.order.length;
+  b.disabled = rules.saving || i + dir < 0 || i + dir >= rules.draft.order.length;
   b.append(iconSvg(dir < 0 ? "up" : "down", 18));
   b.onclick = () => moveOrder(i, dir);
   return b;
@@ -1451,6 +1451,7 @@ function cellControl(row, col) {
     "aria-label": `While ${labelOf(row)} is loaded and ${col.phrase} wants the GPU` });
   for (const c of CHOICE_ORDER) sel.append(el("option", { value: c }, CHOICE_LABEL[c]));
   sel.value = saved;
+  sel.disabled = rules.saving;
   sel.onchange = () => editDraft((d) => { d.cells[row][col.id] = sel.value; });
   pick.append(sel);
   return el("label", { class: `cell c-${saved}` }, pick,
@@ -1493,9 +1494,20 @@ function renderGrid() {
 // The workload on the card, as the arbiter means it, and the "try it" answer from the server for
 // the draft grid this page is holding: the state the outcome is about is the card's, not a state
 // the page could set to demo a rule.
+// Who is on the card, for the preview and for the "…while" line. Two workloads holding memory at
+// once is mode "conflict", and that is not a card with nothing on it: the one holding most is the
+// one a rule would be asked about, which is what the endpoint answers too. Neither offers a picker:
+// the try-it is about the card as it is, not a card the owner got to choose.
 function tryHolder() {
   const s = state.status || {};
-  return s.workloads && s.workloads.includes(s.mode) ? s.mode : null;
+  if (s.workloads && s.workloads.includes(s.mode)) return s.mode;
+  if (s.mode !== "conflict") return null;
+  const gpu = s.gpu || {};
+  let best = null;
+  for (const n of s.workloads || []) {
+    if ((gpu[`${n}_mib`] || 0) > (best ? gpu[`${best}_mib`] || 0 : 0)) best = n;
+  }
+  return best;
 }
 const tryLabel = (r) => r.id === "claims" ? "A game"
   : r.id === "pressure" ? "Another app needs room" : r.label;
@@ -1569,11 +1581,17 @@ function renderPressureEdit() {
   const p = rules.draft.pressure;
   $("pressureOn").setAttribute("aria-pressed", String(!!p.enabled));
   $("pressureOff").setAttribute("aria-pressed", String(!p.enabled));
+  $("pressureOn").disabled = $("pressureOff").disabled = rules.saving;
   $("pressureForm").hidden = !p.enabled;
   $("pressureOffNote").hidden = !!p.enabled;
-  for (const [id, key, , , scale] of PRESSURE_FIELDS) setVal($(id), p[key] / scale);
+  for (const [id, key, , , scale] of PRESSURE_FIELDS) {
+    setVal($(id), p[key] / scale);
+    $(id).disabled = rules.saving;
+  }
+  $("ignoreNew").disabled = $("ignoreAdd").disabled = rules.saving;
   $("ignoreChips").replaceChildren(...p.ignore.map((name, i) => {
     const b = el("button", { type: "button", "data-k": `ig:${i}`, "aria-label": `Stop ignoring ${name}` });
+    b.disabled = rules.saving;
     b.append(iconSvg("x", 12, 2.4));
     b.onclick = () => editDraft((d) => { d.pressure.ignore.splice(i, 1); });
     return el("span", { class: "igchip" }, el("code", {}, name), b);
@@ -1597,22 +1615,33 @@ function saveBody() {
   return body;
 }
 
+// While a save is on the wire, the card stops taking edits. The answer replaces the draft with what
+// the file now says, so a change made in that window would vanish with nothing on screen to say it
+// ever existed. The controls the card rebuilds read the flag as they are drawn; these four are
+// static markup, so they are marked here.
+function setSaving(on) {
+  rules.saving = on;
+  for (const id of ["askTimeout", "askFallback", "ignoreNew", "ignoreAdd"]) $(id).disabled = on;
+}
+
 async function saveRules() {
-  for (const b of $("savebar").querySelectorAll("button")) b.disabled = true;
+  setSaving(true);
+  renderRules();
   try {
     await postJSON("/api/policy", saveBody());
     rules.conflict = null; rules.error = null; rules.justSaved = true;
     rules.base = null; rules.draft = null;
     await loadPolicy(true);
     askTry();
-    renderRules();
-    setTimeout(() => { rules.justSaved = false; renderRules(); }, 10000);
   } catch (e) {
     // A 409 is the file having changed since this page read it. Nothing was written; the page says
     // so and offers to re-read it. It never merges its draft into what it finds there, because
     // that would be an edit nobody made.
     if (e.status === 409) rules.conflict = e.message; else rules.error = e.message;
+  } finally {
+    setSaving(false);
     renderRules();
+    if (rules.justSaved) setTimeout(() => { rules.justSaved = false; renderRules(); }, 10000);
   }
 }
 
@@ -1641,12 +1670,14 @@ function renderSavebar() {
   } else if (rules.error) left.append(el("div", { class: "bad" }, rules.error));
   const box = el("div", { class: "box" }, left);
   const reload = el("button", { type: "button" }, rules.conflict ? "Reload" : "Discard");
+  reload.disabled = rules.saving;
   reload.onclick = () => {
     rules.conflict = null; rules.error = null;
     loadPolicy(true).then(() => { renderRules(); askTry(); });
   };
   box.append(reload);
   const save = el("button", { type: "button", class: "primary" }, "Save rules");
+  save.disabled = rules.saving;
   save.onclick = saveRules;
   box.append(save);
   bar.append(box);

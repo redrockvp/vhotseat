@@ -67,6 +67,23 @@ POLICY_WARNING_ROWS = ("policy-refused", "policy-kept")
 WARNING_AGE_S = 300.0
 
 
+def preview_holder(card: dict, workloads: dict) -> str | None:
+    """Who is on the card, for the question "what would this cell do?". `mode` is the arbiter's own
+    answer, and when two workloads are holding memory at once it says "conflict" - which is not a
+    card with nothing on it: the one holding most is the one a rule would be asked about, and
+    answering as though the card were free would promise an owner nothing happens when something
+    obviously would. The page picks the same holder for the same reason; neither offers a picker,
+    because this is about the card as it is."""
+    mode = card.get("mode")
+    if mode in workloads:
+        return mode
+    if mode != "conflict":
+        return None
+    gpu = card.get("gpu") or {}
+    best = max(workloads, key=lambda n: gpu.get(f"{n}_mib") or 0, default=None)
+    return best if best and (gpu.get(f"{best}_mib") or 0) > 0 else None
+
+
 def fits_on_card(peaks: dict, floor: int, idle: dict, total_mib: int | None) -> list[dict]:
     """For each pair of workloads: would they fit on the card at the same time?
 
@@ -325,16 +342,16 @@ class Dashboard:
         return 200, {"version": version}
 
     def preview(self, body: bytes) -> tuple[int, dict]:
-        """What one cell of the grid the page is holding would do: {title, detail, tone}. Reads
-        the card and writes nothing - not the config, not the card, not one row of the log.
+        """What one cell of a grid the page is holding would do: {title, detail, tone}. Reads the
+        card and writes nothing - not the config, not the card, not one row of the log.
 
         The draft grid comes in with the request because the owner is deciding what to save, and
         they are entitled to know what a cell does before they save it. The card's half of the
         sentence does not: who is loaded, whether it is working, when it was last seen working and
-        what it holds come from the same status the page is drawn from, so the answer is about
-        this machine now rather than about a situation the page made up. Guarded like the writes:
-        what a page on another origin would be reading here is the owner's rules and their live
-        workload activity, and the draft it posted is one this dashboard never showed.
+        what it holds are read from the card here, so the answer is about this machine now rather
+        than about a situation the page made up. Guarded like the writes: what a page on another
+        origin would be reading here is the owner's rules and their live workload activity, and the
+        draft it posted is one this dashboard never showed.
         """
         posted = _json_body(body)
         if isinstance(posted, str):
@@ -350,11 +367,15 @@ class Dashboard:
         pressure_on = bool((posted.get("pressure") or {}).get(
             "enabled", self.arbiter.pressure_cfg.get("enabled", True)))
         requester, label = rid, columns[rid]["label"]
-        status = self.status()
+        # The card is probed here rather than read out of the dashboard's cached status, and that is
+        # not a detail: filling that cache runs a watcher pass, which records an open claim and then
+        # unloads what the *saved* policy says to unload for it. A question about a rule must not
+        # carry out a rule - least of all one the owner is still deciding whether to keep.
+        card = self.arbiter.probe()
         wls = self.arbiter.workloads
         name = posted.get("workload")
         if name is None:
-            name = status["mode"] if status["mode"] in wls else None
+            name = preview_holder(card, wls)
         elif name not in wls:
             return 400, {"error": f"no workload named {name!r}; configured: "
                                   + ", ".join(wls)}
@@ -372,11 +393,11 @@ class Dashboard:
         if cell not in policy.CHOICES:
             return 400, {"error": f"matrix.{name}.{rid}: expected one of "
                                   f"{', '.join(policy.CHOICES)}, got {cell!r}"}
-        held = (status.get("gpu") or {}).get(f"{name}_mib")
+        held = (card.get("gpu") or {}).get(f"{name}_mib")
         # Loaded as the arbiter means it when it decides who to ask: on the card, or its own API
         # says it is. A workload that holds nothing has nothing for this rule to unload, and the
         # honest answer to "what would this do?" is that it wouldn't do anything.
-        loaded = status["mode"] == name or (held or 0) > w.idle_vram_mib
+        loaded = card["mode"] == name or (held or 0) > w.idle_vram_mib
         try:
             working = bool(w.busy())
         except Exception:                                     # noqa: BLE001 - a probe, not a decision
