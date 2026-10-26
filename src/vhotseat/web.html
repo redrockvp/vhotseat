@@ -214,9 +214,12 @@ ol.order .name .now { display: block; color: var(--muted); font-size: 12px; }
 .grid-scroll tr.sum td { background: var(--surface); color: var(--ink-2); padding: 6px 12px 12px; border-bottom: 1px solid var(--axis); }
 .cell { min-height: 44px; min-width: 128px; border-radius: 8px; padding: 5px 9px; display: flex;
   flex-direction: column; gap: 1px; cursor: pointer; }
-.cell.yes { background: var(--surface); color: var(--ink); box-shadow: 0 0 0 1px var(--axis); }
-.cell.ask { background: var(--ask); color: var(--ask-ink); box-shadow: 0 0 0 1px var(--ask-line); }
-.cell.keep { background: var(--keep); color: var(--keep-ink); box-shadow: 0 0 0 1px var(--keep-line); }
+/* The three answers carry a c- prefix of their own: bare .ask is the open-ask banner and bare .warn
+   is the warning banner, and a class name shared with either puts a 4px coloured border on a grid
+   cell that was only trying to say which answer it holds. */
+.cell.c-yes { background: var(--surface); color: var(--ink); box-shadow: 0 0 0 1px var(--axis); }
+.cell.c-ask { background: var(--ask); color: var(--ask-ink); box-shadow: 0 0 0 1px var(--ask-line); }
+.cell.c-keep { background: var(--keep); color: var(--keep-ink); box-shadow: 0 0 0 1px var(--keep-line); }
 .cell .pick { display: flex; align-items: center; gap: 6px; }
 .cell select { font: inherit; font-weight: 600; font-size: 13px; color: inherit; background: transparent;
   border: 0; padding: 2px 0; flex: 1 1 auto; min-width: 0; cursor: pointer; }
@@ -225,10 +228,10 @@ ol.order .name .now { display: block; color: var(--muted); font-size: 12px; }
 .explain { border-radius: 10px; padding: 12px 14px; background: var(--surface); box-shadow: 0 0 0 1px var(--axis); }
 .explain b { display: flex; align-items: center; gap: 6px; font-weight: 650; margin-bottom: 6px; }
 .explain ol { margin: 0; padding-left: 18px; font-size: 12px; color: var(--ink-2); }
-.explain.ask { background: var(--ask); box-shadow: 0 0 0 1px var(--ask-line); color: var(--ask-ink); }
-.explain.ask ol { color: inherit; }
-.explain.keep { background: var(--keep); box-shadow: 0 0 0 1px var(--keep-line); color: var(--keep-ink); }
-.explain.keep ol { color: inherit; }
+.explain.c-ask { background: var(--ask); box-shadow: 0 0 0 1px var(--ask-line); color: var(--ask-ink); }
+.explain.c-ask ol { color: inherit; }
+.explain.c-keep { background: var(--keep); box-shadow: 0 0 0 1px var(--keep-line); color: var(--keep-ink); }
+.explain.c-keep ol { color: inherit; }
 .askline { display: flex; align-items: center; gap: 6px 8px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; }
 .inlabel { display: inline-flex; align-items: center; gap: 4px; }
 .inlabel input, .askline input, .askline select, .pline input, .pline select {
@@ -248,9 +251,9 @@ ol.order .name .now { display: block; color: var(--muted); font-size: 12px; }
 .outcome { border-radius: 10px; padding: 12px 14px; font-size: 13px; background: var(--surface);
   box-shadow: 0 0 0 1px var(--ring); }
 .outcome b { display: block; font-size: 15px; font-weight: 650; margin-bottom: 2px; }
-.outcome.good { box-shadow: inset 4px 0 0 var(--good), 0 0 0 1px var(--ring); }
-.outcome.warn { box-shadow: inset 4px 0 0 var(--warning), 0 0 0 1px var(--ring); }
-.outcome.info { box-shadow: inset 4px 0 0 var(--s1), 0 0 0 1px var(--ring); }
+.outcome.t-good { box-shadow: inset 4px 0 0 var(--good), 0 0 0 1px var(--ring); }
+.outcome.t-warn { box-shadow: inset 4px 0 0 var(--warning), 0 0 0 1px var(--ring); }
+.outcome.t-info { box-shadow: inset 4px 0 0 var(--s1), 0 0 0 1px var(--ring); }
 .pressure-edit { border-top: 1px solid var(--grid); margin-top: 22px; padding-top: 18px; }
 .pressure-edit .phead { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px 16px; flex-wrap: wrap; }
 .pressure-edit .ptext { min-width: 0; flex: 1 1 420px; }
@@ -396,7 +399,7 @@ ol.order .name .now { display: block; color: var(--muted); font-size: 12px; }
                 <li>It does not wait for a longer job: an agent between two steps counts as idle.</li>
               </ol>
             </div>
-            <div class="explain ask">
+            <div class="explain c-ask">
               <b><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9a6 6 0 0 1 12 0c0 6 2.5 7.5 2.5 7.5h-17S6 15 6 9z"></path><path d="M10 20a2 2 0 0 0 4 0"></path></svg>Ask me</b>
               <ol>
                 <li>A notification says when it was last used and asks: unload now, or keep it?</li>
@@ -404,7 +407,7 @@ ol.order .name .now { display: block; color: var(--muted); font-size: 12px; }
                 <li>A workload waits for your answer. A game can't wait, so it runs with what's left until you answer.</li>
               </ol>
             </div>
-            <div class="explain keep">
+            <div class="explain c-keep">
               <b><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path></svg>Keep loaded</b>
               <ol>
                 <li>It stays, and you get a warning.</li>
@@ -604,6 +607,12 @@ async function postJSON(url, body) {
 
 async function refresh() {
   document.body.classList.toggle("loading", !state.status);
+  // The rules card is drawn from the policy alone, and that read does not queue behind the status
+  // one: status walks every workload's API and the card, so on a dashboard that has just started -
+  // or one whose workloads are not answering - it is the slowest thing on the page. An owner who
+  // opens the page during that read would otherwise stare at an empty editor with nothing saying
+  // why, so the card is drawn as soon as the rules are in hand.
+  const policy = loadPolicy().then(() => { if (rules.base) renderRules(); });
   try {
     state.status = await getJSON("/api/status");
     const until = Date.now() / 1000, since = until - state.range;
@@ -615,7 +624,7 @@ async function refresh() {
       getJSON(`/api/logs?${q}&limit=2000`),
       getJSON(`/api/cost?${q}`).catch(() => ({ error: "no power.price_per_kwh in the config" })),
       getJSON("/api/why").catch(() => null),
-      loadPolicy(),               // skipped while the rules editor holds unsaved edits
+      policy,                   // skipped while the rules editor holds unsaved edits
     ]);
     Object.assign(state, { samples, events, logs, cost, why, since, until, error: null });
   } catch (e) {
@@ -1336,15 +1345,33 @@ function editDraft(fn) {
   askTry();
 }
 
-// What a workload is doing, in the short form the order list and each grid row carry: its own
-// state, what it holds on the card, and when it was last seen working.
-function rulesNow(n, withVram) {
-  const s = state.status, w = s[n] || {}, used = (s.last_used || {})[n] || {};
-  const bits = [workloadState(w)];
+// What a workload is doing, in the few words a table cell and an order row can hold: its state, and
+// either what it has on the card or when it last worked. The long sentence the status prints -
+// "API not answering, nothing has recorded it working since this started" - is what the CLI and the
+// notification say, and in a grid cell beside a select it is six lines of text that repeat what the
+// row already says. Where there is no stamp, that is said as itself rather than as a sentence.
+const shortState = (w) => !w.service ? "not running" : !w.reachable ? "not answering"
+  : "loaded" in w ? (w.loaded ? "loaded" : "idle")
+  : (w.running || w.pending) ? "working" : w.holds_models ? "loaded" : "idle";
+const shortAgo = (ago) => ago == null ? "last use unknown"
+  : ago < 60 ? `used ${Math.round(ago)} s ago`
+  : ago < 3600 ? `used ${Math.round(ago / 60)} min ago` : `used ${(ago / 3600).toFixed(1)} h ago`;
+const cap = (t) => t.charAt(0).toUpperCase() + t.slice(1);
+
+// want: "hold" for a row about who is holding the GPU, "use" for a row about who gives way.
+function rulesNow(n, want) {
+  const s = state.status || {}, w = s[n] || {}, used = (s.last_used || {})[n] || {};
   const held = (s.gpu || {})[`${n}_mib`];
-  if (withVram && held) bits.push(`${gib(held)} GiB`);
-  if (used.phrase) bits.push(used.phrase);
-  return bits.join(" · ");
+  const second = want === "hold" && held ? `${gib(held)} GiB` : shortAgo(used.ago_s);
+  return `${cap(shortState(w))} · ${second}`;
+}
+
+// The same facts read as the tail of a sentence: "…while Strata is loaded (21.0 GiB), used 40 s
+// ago". The grid cells say the same things in their own voice; this one has a verb in front of it.
+function tryState(n) {
+  const s = state.status || {}, w = s[n] || {}, used = (s.last_used || {})[n] || {};
+  const held = (s.gpu || {})[`${n}_mib`];
+  return shortState(w) + (held ? ` (${gib(held)} GiB)` : "") + ", " + shortAgo(used.ago_s);
 }
 
 // The number a row shows before a save is written: the same span the server numbers the order with
@@ -1385,7 +1412,7 @@ function renderOrder() {
 // manage usually hold: the same peaks and floor the fits table is worked out from, so the bars and
 // the pair verdicts under them cannot disagree with each other.
 function renderFits() {
-  const s = state.status, g = s.gpu || {}, total = g.total_mib || 0, floor = s.floor || 0;
+  const s = state.status || {}, g = s.gpu || {}, total = g.total_mib || 0, floor = s.floor || 0;
   $("fitsNote").textContent = "Each at the most it has been seen using, on top of the "
     + `${gib(floor)} GiB your desktop apps usually hold.`;
   const floorPct = total ? Math.min(100, (100 * floor) / total) : 0;
@@ -1426,7 +1453,7 @@ function cellControl(row, col) {
   sel.value = saved;
   sel.onchange = () => editDraft((d) => { d.cells[row][col.id] = sel.value; });
   pick.append(sel);
-  return el("label", { class: `cell ${saved}` }, pick,
+  return el("label", { class: `cell c-${saved}` }, pick,
     // The line under the choice is the server's sentence for the choice now showing, so picking
     // Ask me says what Ask me does before the save that would make it true.
     el("span", { class: "line" }, rules.base.says_for[row][col.id][saved]));
@@ -1447,7 +1474,7 @@ function renderGrid() {
   for (const row of Object.keys(base.matrix)) {
     const label = el("span", { class: "col-head" });
     label.append(keyBox(row), labelOf(row));
-    const th = el("th", { scope: "row" }, label, el("span", { class: "now" }, rulesNow(row)));
+    const th = el("th", { scope: "row" }, label, el("span", { class: "now" }, rulesNow(row, "hold")));
     const tr = el("tr", {}, th);
     for (const c of base.requesters) {
       if (c.id === row) {
@@ -1467,8 +1494,8 @@ function renderGrid() {
 // the draft grid this page is holding: the state the outcome is about is the card's, not a state
 // the page could set to demo a rule.
 function tryHolder() {
-  const m = state.status.mode;
-  return state.status.workloads.includes(m) ? m : null;
+  const s = state.status || {};
+  return s.workloads && s.workloads.includes(s.mode) ? s.mode : null;
 }
 const tryLabel = (r) => r.id === "claims" ? "A game"
   : r.id === "pressure" ? "Another app needs room" : r.label;
@@ -1478,12 +1505,12 @@ const tryLabel = (r) => r.id === "claims" ? "A game"
 // box belongs to a card that no longer exists, so it is asked again - and the rounding is what
 // keeps a GPU whose figure moves every second from asking again on every poll.
 function trySituation() {
-  const s = state.status, h = tryHolder();
+  const s = state.status || {}, h = tryHolder();
   if (!h) return `none|${rules.tryReq}`;
   const used = (s.last_used || {})[h] || {};
   const ago = used.ago_s == null ? "never"
     : used.ago_s < (rules.base ? rules.base.ask.timeout_s : 120) ? "recent" : "long";
-  return [h, workloadState(s[h] || {}), Math.round(((s.gpu || {})[`${h}_mib`] || 0) / 512), ago,
+  return [h, shortState(s[h] || {}), Math.round(((s.gpu || {})[`${h}_mib`] || 0) / 512), ago,
     rules.tryReq].join("|");
 }
 
@@ -1502,7 +1529,7 @@ function renderTry() {
   line.replaceChildren();
   if (holder) {
     line.append(el("span", { class: "sub" }, "…while "), el("b", { class: "sub" }, labelOf(holder)),
-      el("span", { class: "sub" }, ` is ${rulesNow(holder, true)}`));
+      el("span", { class: "sub" }, ` is ${tryState(holder)}`));
   }
   const out = $("tryOutcome");
   out.className = "outcome";
@@ -1510,7 +1537,7 @@ function renderTry() {
   const sit = trySituation();
   if (sit !== rules.trySit) { rules.trySit = sit; rules.tryOut = null; askTry(); }
   if (!rules.tryOut) { out.append(el("span", { class: "sub" }, "working out what this would do…")); return; }
-  out.classList.add(rules.tryOut.tone);
+  out.classList.add("t-" + rules.tryOut.tone);
   out.append(el("b", {}, rules.tryOut.title), el("span", {}, rules.tryOut.detail));
 }
 
@@ -1559,11 +1586,21 @@ function pressureToPost() {
   return out;
 }
 
+// What a save posts. The order goes only when the owner actually moved it: a config where every
+// workload sits at the same priority has no order written in it, and posting one anyway would give
+// each workload a priority number the bar never said anything about - the file would change in a
+// way the page had not listed. Everything else in the body is a key the bar does name.
+function saveBody() {
+  const body = { version: rules.base.version, matrix: rules.draft.cells, ask: rules.draft.ask,
+    pressure: pressureToPost() };
+  if (orderMoved()) body.priorities = orderToPost(rules.draft.order);
+  return body;
+}
+
 async function saveRules() {
   for (const b of $("savebar").querySelectorAll("button")) b.disabled = true;
   try {
-    await postJSON("/api/policy", { version: rules.base.version, priorities: orderToPost(rules.draft.order),
-      matrix: rules.draft.cells, ask: rules.draft.ask, pressure: pressureToPost() });
+    await postJSON("/api/policy", saveBody());
     rules.conflict = null; rules.error = null; rules.justSaved = true;
     rules.base = null; rules.draft = null;
     await loadPolicy(true);
@@ -1616,7 +1653,9 @@ function renderSavebar() {
 }
 
 function renderRules() {
-  const s = state.status, err = $("rulesError");
+  // The card is drawn whether or not a status read has landed: the rules are the config's, and an
+  // owner deciding them wants to see them while the workloads are still being asked.
+  const s = state.status || {}, err = $("rulesError");
   err.hidden = !s.config_error;
   if (s.config_error) {
     // What the grid shows is the last set of rules that read, because that is what the arbiter is

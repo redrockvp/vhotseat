@@ -774,3 +774,82 @@ def test_the_low_vram_inputs_are_the_config_keys_in_the_units_the_page_shows(tmp
     # which an owner watching one can read in the Pressure card but has no reason to tune.
     assert set(shown) | {"end_margin_mib"} == set(pressure.KEYS) - {"enabled", "ignore"}
 
+
+def js_function(script: str, name: str) -> str:
+    """One named function out of the page's script, braces matched rather than regexed: the
+    functions worth running are the ones that build a POST body, and those have nested objects."""
+    start = script.index(f"function {name}(")
+    depth = 0
+    for i in range(script.index("{", start), len(script)):
+        depth += script[i] == "{"
+        depth -= script[i] == "}"
+        if depth == 0:
+            return script[start:i + 1]
+    raise AssertionError(f"unbalanced {name} in the page script")
+
+
+def js_let(script: str, decl: str) -> str:
+    """A one-line `const NAME = ...;` from the page script."""
+    line = next((ln for ln in script.splitlines() if ln.startswith(decl)), None)
+    assert line, f"the page has no {decl}"
+    return line
+
+
+SAVE_STUBS = """
+const rules = { base: {version: "v1", order: [{workload: "strata"}, {workload: "comfy"},
+            {workload: "unsloth"}]},
+  draft: {order: ORDER, cells: {strata: {comfy: "yes"}}, ask: {timeout_s: 120, fallback: "keep"},
+    pressure: {enabled: true, ignore: [], grow_mib: 2000, min_free_mib: 512, sustain_s: 30,
+      headroom_mib: 1000, cooldown_s: 600}} };
+function pressureToPost() { return { enabled: rules.draft.pressure.enabled }; }
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this box")
+def test_a_save_posts_the_order_only_when_the_owner_moved_it(tmp_path):
+    """The order is the one part of the body that can write something the save bar never mentioned.
+    A config where every workload sits at the same priority has no order in it: post the list
+    anyway and the save gives each workload a priority number - 10 for one, 90 for another - while
+    the bar still reads "1 unsaved change", the grid cell the owner did touch. So the page leaves
+    priorities out unless the drawn order differs from the one it read, and this runs the page's
+    own body builder over both cases."""
+    script = page_script()
+    page_js = chr(10).join([
+        js_let(script, "const baseOrder = "), js_let(script, "const tiedOrder = "),
+        js_let(script, "const orderMoved = "), js_function(script, "orderToPost"),
+        js_function(script, "saveBody")])
+
+    def post(order: str) -> dict:
+        done = subprocess.run([shutil.which("node"), "-e",
+                               SAVE_STUBS.replace("ORDER", order) + chr(10) + page_js
+                               + chr(10) + "console.log(JSON.stringify(saveBody()))"],
+                              capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+        return json.loads(done.stdout)
+
+    same = post('["unsloth", "comfy", "strata"]')      # the drawn order, as it was read
+    assert "priorities" not in same, same
+    assert same["version"] == "v1" and same["matrix"] == {"strata": {"comfy": "yes"}}
+    moved = post('["strata", "comfy", "unsloth"]')     # the owner moved Strata to the top
+    assert moved["priorities"] == ["unsloth", "comfy", "strata"], moved
+
+
+def test_the_rules_are_read_before_the_slowest_thing_on_the_page():
+    """A cold dashboard's first status read is its slowest: it walks every workload's API, and a
+    workload that isn't answering is only known to be so after its request has been given up on.
+    The editor used to wait behind that - and an owner who opened the page during it saw an empty
+    Rules card, with no order, no grid and no explanation. So the policy read starts first and the
+    card is drawn when it lands, and this checks the order they start in, because putting the
+    policy read back into the batch behind status reproduces the blank card."""
+    script = page_script()
+    policy_read = script.index("const policy = loadPolicy()")
+    status_read = script.index('state.status = await getJSON("/api/status")')
+    assert policy_read < status_read, "the rules are queued behind the status read again"
+    assert "if (rules.base) renderRules()" in script[policy_read:policy_read + 200], \
+        "the card is not drawn when the rules arrive"
+    # The card's own renderers take a status if one has arrived, and not otherwise: they are the
+    # part of the page that can be drawn before any workload has been asked.
+    for name in ("renderRules", "renderFits", "tryHolder", "trySituation", "rulesNow", "tryState"):
+        body = js_function(script, name)
+        assert body.count("state.status") == body.count("state.status || {}"), \
+            f"{name} reads state.status without saying it may not have arrived yet"
