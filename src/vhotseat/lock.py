@@ -19,10 +19,27 @@ config file, where the thing being kept in turn is a read-check-write, not a
 handover.
 """
 
+import contextlib
 import os
+import time
 from pathlib import Path
 
 from . import util
+
+# A lock file beside the file whose write is being taken turns on, and how long to wait for it.
+# A write of one of these files is milliseconds, so the wait is there for the writer that is
+# wedged, not the one that is busy - and a refused write the caller can retry beats a hang.
+LOCK_SUFFIX = ".lock"
+LOCK_WAIT_S = 5.0
+LOCK_POLL_S = 0.05
+
+
+class Locked(Exception):
+    """Another process - or another thread of this one - is mid-write to this file and wouldn't let
+    go inside the wait. Nothing was written, which is the point: the alternative is two callers both
+    told they succeeded, over one file holding one of the two decisions. Worth trying again: unlike
+    a version conflict, there is nothing here to re-read first."""
+
 
 if os.name == "nt":
     import msvcrt
@@ -52,6 +69,45 @@ else:
 
     def unlock(f) -> None:
         pass  # closing the file releases a flock
+
+
+@contextlib.contextmanager
+def write_turn(path, *, what: str, wait_s: float | None = None, poll_s: float | None = None):
+    """One write to `path` at a time, across processes as well as threads.
+
+    This is the guard for a write that is really a read-check-write: read a file, decide what it
+    should hold now, replace it. Two writers that read inside each other's gap each write a file
+    built from the state they read; both are told they succeeded, and the file holds one of the two
+    decisions. The turn is taken on a lock file beside the one being written - not on that file,
+    which the write replaces - with the operating system's lock, because the other writer is often
+    another process: the watcher, a second dashboard, a gate in a command someone just typed.
+
+    It waits `wait_s` (the module's `LOCK_WAIT_S` unless the caller says otherwise) rather than
+    failing at once, because whoever holds the turn is milliseconds from letting go, and it gives up
+    rather than waiting forever, because whoever holds it might be wedged: a caller told nothing was
+    written can try again, and a caller that hangs cannot. When it raises `Locked` nothing was
+    written. The lock file stays where it is: removing a lock file is the race this closes.
+    """
+    target = Path(path)
+    wait = LOCK_WAIT_S if wait_s is None else wait_s
+    poll = LOCK_POLL_S if poll_s is None else poll_s
+    f = open(target.with_name(target.name + LOCK_SUFFIX), "a+", encoding="utf-8")
+    try:
+        deadline = time.monotonic() + wait
+        while not try_lock(f):
+            if time.monotonic() >= deadline:
+                raise Locked(f"{target.name}: something else is still {what} - nothing was written")
+            util.sleep(poll)
+    except BaseException:
+        # Not ours: close without touching the range, which belongs to whoever has it - on
+        # Windows, unlocking a range you don't hold is an error of its own.
+        f.close()
+        raise
+    try:
+        yield
+    finally:
+        unlock(f)
+        f.close()
 
 
 class Held:

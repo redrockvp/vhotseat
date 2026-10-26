@@ -20,6 +20,7 @@ test can pop a toast on whoever is running the suite. Nothing here writes anyone
 the dashboard's file is always a copy in `tmp_path`.
 """
 
+import contextlib
 import re
 import threading
 import time
@@ -30,7 +31,7 @@ from test_claim_release import NAME, NOTE, claim_rule, running_render
 from test_policy_api import get, post, rig_config_text
 from test_pressure_episode import scene
 
-from vhotseat import api, notify, policy, setup, web
+from vhotseat import api, arbiter, events, lock, notify, policy, setup, web
 from vhotseat.lock import Held
 
 
@@ -108,6 +109,34 @@ def join(th, box, within=6.0):
 
 def open_ask(rig, workload, requester):
     return lambda: rig.arb.events.open_ask(workload, requester)
+
+
+@pytest.fixture
+def waiters(monkeypatch):
+    """The ask ids each request has actually sat down to wait on.
+
+    A row in the log is not yet a request waiting on it: between writing the question and starting
+    to poll for its answer, the request isn't waiting for anything, and an answer written in that
+    gap closes the question the request then finds already answered - so it asks a fresh one, and
+    the test is measuring a second question rather than the one it means to measure. `await_asks`
+    notes the ids here as it begins to poll; `awaiting` waits for that."""
+    seen: list[str] = []
+    real = arbiter.Arbiter.await_asks
+
+    def noting(self, asks, own_deadline=None):
+        seen.extend(a["id"] for a in asks)
+        return real(self, asks, own_deadline=own_deadline)
+
+    monkeypatch.setattr(arbiter.Arbiter, "await_asks", noting)
+    return seen
+
+
+def awaiting(rig, waiters, workload, requester, within=6.0):
+    """The pair's open ask, once the request that asked it is waiting for its answer."""
+    asked = wait_for(open_ask(rig, workload, requester),
+                     f"the question about {workload} for {requester}", within)
+    wait_for(lambda: asked["id"] in waiters, "the request waiting on that question", within)
+    return asked
 
 
 # --- the question ---------------------------------------------------------------------
@@ -210,14 +239,14 @@ def test_an_ask_pair_is_only_asked_about_when_the_config_says_ask(rig):
 # --- the answer, and what it is worth ---------------------------------------------------
 
 
-def test_answering_release_lets_the_waiting_load_through(rig):
+def test_answering_release_lets_the_waiting_load_through(rig, waiters):
     """A load nobody chose is the one that can wait: nothing is running that an unload would cut
     off, and the newcomer was being allowed or refused either way. The answer is the only thing
     that ends the wait, and it comes back through the log rather than down the request."""
     ask_first(rig, strata=["comfy"])
     rig.strata.loaded = True
     th, box = in_thread(lambda: rig.cli("switch", "comfy", "--request"))
-    asked = wait_for(open_ask(rig, "strata", "comfy"), "the guard's request", 6)
+    asked = awaiting(rig, waiters, "strata", "comfy")
     assert rig.strata.loaded, "the asking unloaded a model before it was answered"
     assert rig.arb.open_asks()[0]["left_s"] > 0
     code, body = rig.arb.answer_ask(asked["id"], policy.RELEASE)
@@ -229,7 +258,7 @@ def test_answering_release_lets_the_waiting_load_through(rig):
     assert [(r["answer"], r["by"]) for r in rows(rig, "ask-answer")] == [("release", "owner")]
 
 
-def test_answering_keep_is_the_same_refusal_in_the_owner_s_own_words(rig):
+def test_answering_keep_is_the_same_refusal_in_the_owner_s_own_words(rig, waiters):
     """The refusal is the one that was always there; only the sentence about it changes. An owner
     who clicked Keep reads the next refusal as their decision rather than a rule they forgot they
     wrote - and the ask closes, so the next request asks again instead of obeying this answer
@@ -237,7 +266,7 @@ def test_answering_keep_is_the_same_refusal_in_the_owner_s_own_words(rig):
     ask_first(rig, strata=["comfy"])
     rig.strata.loaded = True
     th, box = in_thread(lambda: rig.cli("switch", "comfy", "--request"))
-    asked = wait_for(open_ask(rig, "strata", "comfy"), "the guard's request")
+    asked = awaiting(rig, waiters, "strata", "comfy")
     assert rig.arb.answer_ask(asked["id"], policy.KEEP)[0] == 200
     assert join(th, box) == 1
     assert rig.strata.loaded and "POST /unload" not in rig.strata.calls
@@ -247,8 +276,9 @@ def test_answering_keep_is_the_same_refusal_in_the_owner_s_own_words(rig):
     assert not rig.arb.open_asks()
     # And the next request is a fresh question.
     th2, box2 = in_thread(lambda: rig.cli("switch", "comfy", "--request"))
-    assert wait_for(open_ask(rig, "strata", "comfy"), "the second request's question")["id"] != asked["id"]
-    rig.arb.answer_ask(rig.arb.events.open_ask("strata", "comfy")["id"], policy.RELEASE)
+    second = awaiting(rig, waiters, "strata", "comfy")
+    assert second["id"] != asked["id"]          # the answer closed that one; this is a new question
+    rig.arb.answer_ask(second["id"], policy.RELEASE)
     assert join(th2, box2) == 0 and not rig.strata.loaded
 
 
@@ -271,6 +301,66 @@ def test_the_first_answer_is_the_answer_and_a_second_is_refused(rig):
     assert rig.arb.answer_ask("nosuchask", policy.KEEP)[0] == 404
     assert rig.arb.answer_ask(asked["id"], "maybe")[0] == 400
     assert rig.arb.answer_ask(asked["id"], policy.KEEP, by="a_stranger")[0] == 400
+
+
+def slow_log_reads(monkeypatch):
+    """A log read that takes the time a real one takes on a busy disk, which is the moment two
+    answerers overlap: both read the ask as open, and only one of them should get to say so."""
+    real = events.EventLog._read
+
+    def slow(self):
+        lines = real(self)
+        time.sleep(0.05)
+        return lines
+
+    monkeypatch.setattr(events.EventLog, "_read", slow)
+
+
+def test_keep_and_release_written_at_the_same_time_leave_one_answer(rig, monkeypatch):
+    """The owner clicking Keep and a watcher giving up and applying a fallback Release are separate
+    processes on this box, and they can be in flight in the same moment. One answer is written, and
+    the caller whose answer didn't get written is told so.
+
+    Two `ask-answer` rows for one ask is not untidiness: whichever path acts next acts on the row its
+    own reading happened to see first, so the workload can be unloaded on a fallback after the owner
+    said keep, or stay loaded on a keep after the fallback said release - and the log, read back
+    afterwards, can be made to say either. The first answer has to win in the file, not in a
+    reading of it."""
+    rig.strata.loaded = True
+    asked = rig.arb.ask_now("strata", "comfy", held_mib=STRATA_VRAM, source="guard")
+    slow_log_reads(monkeypatch)
+    keep, box_keep = in_thread(lambda: rig.arb.answer_ask(asked["id"], policy.KEEP))
+    release, box_release = in_thread(lambda: rig.arb.answer_ask(asked["id"], policy.RELEASE))
+    got = [join(keep, box_keep), join(release, box_release)]
+    answers = rows(rig, "ask-answer")
+    assert len(answers) == 1, f"both answers were written: {[a['answer'] for a in answers]}"
+    assert sorted(code for code, _ in got) == [200, 409], f"both callers were told they won: {got}"
+    winner = next(body["ask"] for code, body in got if code == 200)
+    assert winner["answer"] == answers[0]["answer"] == rig.arb.events.ask_by_id(asked["id"])["answer"]
+    loser = next(body for code, body in got if code == 409)
+    assert f"was answered {answers[0]['answer']}" in loser["error"]
+
+
+def test_an_answer_that_couldnt_be_written_is_not_an_answer(rig, monkeypatch):
+    """The log can be busy with a writer that has wedged. An answer that didn't get written is then
+    refused out loud rather than accepted: a button that disappears while its row is still unsent
+    leaves the owner believing the GPU is coming down, and the question they can still answer on the
+    dashboard is the one whose answer was never recorded."""
+    rig.strata.loaded = True
+    asked = rig.arb.ask_now("strata", "comfy", held_mib=STRATA_VRAM, source="guard")
+
+    @contextlib.contextmanager
+    def wedged(*args, **kwargs):
+        raise lock.Locked("events.jsonl: something else is still writing the log - nothing written")
+        yield                                                # unreachable: the turn isn't granted
+
+    monkeypatch.setattr(events.lock, "write_turn", wedged)
+    code, body = rig.arb.answer_ask(asked["id"], policy.KEEP)
+    assert code == 503 and "still open" in body["error"]
+    assert rows(rig, "ask-answer") == []
+    assert [a["id"] for a in rig.arb.open_asks()] == [asked["id"]]
+    monkeypatch.undo()
+    assert rig.arb.answer_ask(asked["id"], policy.KEEP)[0] == 200
 
 
 def test_nobody_answering_in_time_is_answered_by_the_fallback(rig):
@@ -302,14 +392,14 @@ def test_a_fallback_of_release_gives_the_card_away_when_nobody_answers(rig):
     assert not rows(rig, "policy-refused")
 
 
-def test_a_question_keeps_the_wait_it_was_asked_with(rig):
+def test_a_question_keeps_the_wait_it_was_asked_with(rig, waiters):
     """The timeout and the fallback are copied into the row when it opens, so an owner who saves a
     different pair of numbers while a question is standing doesn't move the goalposts under the one
     waiting - and what fires on a timeout is what they were told when they were asked."""
     ask_first(rig, strata=["comfy"])
     rig.strata.loaded = True
     th, box = in_thread(lambda: rig.cli("switch", "comfy", "--request"))
-    asked = wait_for(open_ask(rig, "strata", "comfy"), "the guard's request")
+    asked = awaiting(rig, waiters, "strata", "comfy")
     assert (asked["timeout_s"], asked["fallback"]) == (120, "keep")
     rig.arb.ask.update({"timeout_s": 0.05, "fallback": policy.RELEASE})
     assert rig.arb.events.ask_by_id(asked["id"])["fallback"] == "keep"
@@ -317,7 +407,7 @@ def test_a_question_keeps_the_wait_it_was_asked_with(rig):
     assert join(th, box) == 0 and not rig.strata.loaded
 
 
-def test_answering_takes_no_gpu_lock_so_a_question_survives_a_handover(rig):
+def test_answering_takes_no_gpu_lock_so_a_question_survives_a_handover(rig, waiters):
     """The answer is written while a handover holds the card: an answer that had to wait for the
     GPU lock could not be written during the very release it is deciding, which is when a person is
     most likely to be answering it. The release is owed by whoever asked, so the answer is only a
@@ -325,7 +415,7 @@ def test_answering_takes_no_gpu_lock_so_a_question_survives_a_handover(rig):
     ask_first(rig, strata=["comfy"])
     rig.strata.loaded = True
     th, box = in_thread(lambda: rig.cli("switch", "comfy", "--request"))
-    asked = wait_for(open_ask(rig, "strata", "comfy"), "the guard's request")
+    asked = awaiting(rig, waiters, "strata", "comfy")
     # Ours, not the ask's: the row is in the log a moment before the opener gives the lock back.
     def ours():
         got = rig.arb.lock.try_take("switch comfy")
@@ -337,7 +427,7 @@ def test_answering_takes_no_gpu_lock_so_a_question_survives_a_handover(rig):
     assert join(th, box) == 0 and not rig.strata.loaded
 
 
-def test_no_notifications_still_asks_where_a_person_can_see_it(rig):
+def test_no_notifications_still_asks_where_a_person_can_see_it(rig, waiters):
     """A `watch` at logon over a disconnected RDP session, a Linux box, a machine without the toast
     library: the asking is the log and the dashboard, and a notification is only a way in. Losing
     one changes what is shown, never what is asked - and the status says so, because waiting for a
@@ -346,7 +436,7 @@ def test_no_notifications_still_asks_where_a_person_can_see_it(rig):
     rig.arb.notify = notify.NullNotifier("no desktop session for this process")
     rig.strata.loaded = True
     th, box = in_thread(lambda: rig.cli("switch", "comfy", "--request"))
-    asked = wait_for(open_ask(rig, "strata", "comfy"), "the guard's request")
+    asked = awaiting(rig, waiters, "strata", "comfy")
     assert asked["workload"] == "strata"
     s = rig.arb.probe()
     assert s["notifications"] == {"available": False, "how": "none",
@@ -360,21 +450,21 @@ def test_no_notifications_still_asks_where_a_person_can_see_it(rig):
 # --- the paths that wait -----------------------------------------------------------------
 
 
-def test_a_gate_hook_waits_for_the_answer_instead_of_refusing_the_agent(rig):
+def test_a_gate_hook_waits_for_the_answer_instead_of_refusing_the_agent(rig, waiters):
     """The load is inside the hook, so the waiting has to be too: the point of an Ask me at a gate
     is that the owner gets asked rather than the agent getting a refusal. The release the answer
     agrees to then happens under the lock, in the same hook, as it always did."""
     ask_first(rig, comfy=["strata"])
     rig.comfy.vram = COMFY_MODEL_VRAM
     th, box = in_thread(lambda: rig.arb.gate("strata"))
-    asked = wait_for(open_ask(rig, "comfy", "strata"), "the gate's question")
+    asked = awaiting(rig, waiters, "comfy", "strata")
     assert rig.comfy.vram == COMFY_MODEL_VRAM, "the gate unloaded the holder before asking"
     assert rig.arb.answer_ask(asked["id"], policy.RELEASE)[0] == 200
     assert join(th, box) is True
     assert rig.comfy.vram == 400 and not rows(rig, "policy-refused")
 
 
-def test_a_gate_that_runs_out_of_its_own_time_leaves_the_question_open(rig):
+def test_a_gate_that_runs_out_of_its_own_time_leaves_the_question_open(rig, waiters):
     """The hook's timeout is the gate's, not the ask's: running out of it stops this waiter and
     refuses this load, but the question stays open - timed from when it was asked - for the next
     request and for whoever is at the dashboard. A hook that closed the ask on its own deadline
@@ -390,14 +480,15 @@ def test_a_gate_that_runs_out_of_its_own_time_leaves_the_question_open(rig):
     # The next request joins that question rather than opening a second one, and the answer that
     # eventually comes is what decides it.
     rig.arb.workloads["strata"].gate = {"timeout": 60}
+    waiters.clear()           # the request that already gave up is not the one being waited on now
     th, box = in_thread(lambda: rig.arb.gate("strata"))
-    assert wait_for(open_ask(rig, "comfy", "strata"), "the second request")
-    assert len(rows(rig, "ask")) == 1
+    second = awaiting(rig, waiters, "comfy", "strata")
+    assert second["id"] == asked["id"] and len(rows(rig, "ask")) == 1
     rig.arb.answer_ask(asked["id"], policy.RELEASE)
     assert join(th, box) is True and rig.comfy.vram == 400
 
 
-def test_a_proxy_waits_and_a_second_request_joins_the_question(rig):
+def test_a_proxy_waits_and_a_second_request_joins_the_question(rig, waiters):
     """The library's Seat is what a proxy in front of a server with no load hook runs: it waits on
     the same log, needs no channel back to anything, and stamps the workload as used because on
     that box nothing else knows a request arrived at all. And the queue behind it asks once: fifty
@@ -406,12 +497,11 @@ def test_a_proxy_waits_and_a_second_request_joins_the_question(rig):
     rig.strata.loaded = True
     seat = api.Seat(rig.arb)
     th, box = in_thread(lambda: seat.acquire("comfy"))
-    asked = wait_for(open_ask(rig, "strata", "comfy"), "the proxy's question")
+    asked = awaiting(rig, waiters, "strata", "comfy")
     assert rig.arb.last_used().get("comfy"), "the proxy didn't note its own request arriving"
     th2, box2 = in_thread(lambda: rig.arb.ask_before_request("comfy", source="gate"))
-    assert wait_for(lambda: th.is_alive() and th2.is_alive() and len(rows(rig, "ask")) == 1
-                    and "joined",
-                    "the second request joining the one question")
+    wait_for(lambda: th.is_alive() and th2.is_alive() and waiters.count(asked["id"]) == 2,
+             "the second request joining the one question")
     assert len(rows(rig, "ask")) == 1
     rig.arb.answer_ask(asked["id"], policy.RELEASE)
     assert join(th, box) == []
@@ -494,6 +584,7 @@ def test_no_answer_for_a_claim_closes_on_the_fallback_not_forever(rig, monkeypat
     rig.strata.loaded = True
     web.watch(rig.arb, polls=1)
     assert rig.arb.events.open_ask("strata", policy.CLAIMS)
+    time.sleep(0.15)                 # the ask's own timeout, which is real time, has run out
     web.watch(rig.arb, polls=1)
     assert [(r["answer"], r["by"]) for r in rows(rig, "ask-answer")] == [("keep", "timeout")]
     assert rig.strata.loaded and [k["workload"] for k in rows(rig, "policy-kept")] == ["strata"]
@@ -548,14 +639,14 @@ def test_status_names_the_open_question_and_why_points_at_it(rig, capsys):
     assert [(r["answer"], r["by"]) for r in rows(rig, "ask-answer")] == [("keep", "owner")]
 
 
-def test_the_dashboard_shows_the_question_and_its_button_answers_it(served, rig):
+def test_the_dashboard_shows_the_question_and_its_button_answers_it(served, rig, waiters):
     """The page is the other way in: `/api/status` carries the open question with its words and its
     countdown, and the button posts to the ask's own id - so the numbers an owner answered are the
     numbers they were shown, and an answer can't be applied to a question they never saw."""
     ask_first(rig, strata=["comfy"])
     rig.strata.loaded = True
     th, box = in_thread(lambda: rig.cli("switch", "comfy", "--request"))
-    asked = wait_for(open_ask(rig, "strata", "comfy"), "the guard's request")
+    asked = awaiting(rig, waiters, "strata", "comfy")
     code, s, _ = get(served + "/api/status")
     assert code == 200
     view = s["asks"][0]
@@ -610,7 +701,7 @@ def test_making_room_now_overrides_the_question_and_writes_no_rule(served, rig):
     assert post(served + "/api/make-room", {"for": "comfy"}, edit=None)[0] == 403
 
 
-def test_a_saved_policy_starts_the_asking_without_a_restart(served, rig):
+def test_a_saved_policy_starts_the_asking_without_a_restart(served, rig, waiters):
     """The owner sets an Ask me on the dashboard, and the watcher - a process that has been running
     all day - is the one that has to obey it: the save, the reload and the first question are one
     story, and a restart would leave the editor saying one thing and the card doing another."""
@@ -625,7 +716,7 @@ def test_a_saved_policy_starts_the_asking_without_a_restart(served, rig):
     assert rig.arb.workloads["strata"].asks_for == ("comfy",)
     rig.strata.loaded = True
     th, box = in_thread(lambda: rig.cli("switch", "comfy", "--request"))
-    asked = wait_for(open_ask(rig, "strata", "comfy"), "the question the saved policy owes")
+    asked = awaiting(rig, waiters, "strata", "comfy")
     assert asked["source"] == "guard"
     rig.arb.answer_ask(asked["id"], policy.RELEASE)
     assert join(th, box) == 0 and not rig.strata.loaded

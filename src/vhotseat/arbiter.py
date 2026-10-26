@@ -13,11 +13,13 @@ or the request is refused. Ownership is derived from the live workloads each
 time, never stored, so it can't drift.
 """
 
+import contextlib
 import datetime
 import json
 import os
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -29,7 +31,7 @@ from .config_edit import version_of
 from .drivers.base import Workload
 from .errors import Busy, PolicyRefused, ReleaseFailed, SwitchError
 from .events import EventLog, row_time
-from .lock import GpuLock, Held
+from .lock import GpuLock, Held, Locked, write_turn
 from .telemetry import READ_ERRORS
 
 NONE = "none"
@@ -266,29 +268,45 @@ class Arbiter:
     def note_used(self, name: str, when: float | None = None) -> None:
         """Record that `name` was seen working at `when` (now, by default).
 
-        The merge is a max per workload and the write is a rename over the file, because `watch`
-        and the dashboard both stamp and neither may lose the other's reading: whoever writes last
-        and writes the newest stamp it holds for *every* workload, and an older one read off the
-        file afterwards is dropped rather than put back. What that leaves is a stamp another
-        process wrote in the same instant being lost, which a later stamp overwrites: the question
-        says "idle for 6 min" when the workload was working 3 s ago, for as long as nothing newer
-        is seen. A workload that is genuinely not being used says "idle for ..." truthfully, and
-        the ask's release/keep decision doesn't read the stamp at all: it is there to tell the
-        owner to pause their work, not to decide for them."""
+        The merge is a max per workload, and the read of the file, the merge and the write back are
+        one turn of it, taken the way a config save and a log row are taken: `watch` and the
+        dashboard both stamp the same file from different processes, and each stamp is a
+        read-check-write over the whole of it. Unguarded, an older reading read before the other
+        process wrote gets written back afterwards and puts a stale stamp back - which is the small
+        harm - and the two writers also arrive at one shared temp name, where the loser's rename
+        fails outright. Inside the turn, whoever writes last has read the other's newest stamp and
+        keeps it: an older one read off the file is dropped rather than put back, and a stamp that
+        was genuinely the newer one is never lost.
+
+        A workload that is genuinely not being used says "idle for ..." truthfully, and the answer a
+        question gets doesn't read the stamp at all: it is there to tell the owner to pause their
+        work, not to decide for them."""
         if name not in self.workloads:
             return
         when = time.time() if when is None else when
-        merged = self.last_used()
-        if (merged.get(name) or 0) >= when:
-            return                     # someone else saw it working later than this
-        merged[name] = when
         try:
+            # The directory before the turn: the turn's lock file lives beside the stamp file, and
+            # on a box that has never stamped anything neither exists yet.
             self.used_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.used_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(merged, sort_keys=True), encoding="utf-8")
-            util.replace(tmp, self.used_path)
-        except OSError:
-            return     # a state file that can't be written costs the question its "used 40 s ago"
+            with write_turn(self.used_path, what="stamping what was working"):
+                merged = self.last_used()
+                if (merged.get(name) or 0) >= when:
+                    return               # someone else saw it working later than this
+                merged[name] = when
+                fd, tmp = tempfile.mkstemp(dir=str(self.used_path.parent),
+                                           prefix=self.used_path.name + ".", suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(json.dumps(merged, sort_keys=True))
+                    util.replace(Path(tmp), self.used_path)
+                finally:
+                    with contextlib.suppress(OSError):
+                        Path(tmp).unlink(missing_ok=True)
+        except (OSError, Locked):
+            # A state file that can't be written, or a writer that won't let go, costs the question
+            # its "used 40 s ago" and nothing else: it is asked with "nothing has recorded it"
+            # instead, which is true of this file rather than a guess about the workload.
+            return
 
     def used_ago(self, name: str) -> float | None:
         """How long ago a workload was last seen working, or None when nothing recorded it."""
@@ -417,24 +435,32 @@ class Arbiter:
     def _open_ask(self, workload: str, requester: str, *, held_mib: int, source: str,
                   name: str | None, note: str | None, free_mib: int | None,
                   pid: int | None) -> dict | None:
-        """Write the `ask` row and return it, or None when the lock we waited for found the
-        question already written - the same recheck after taking the lock that a pressure episode
-        does, and the reason a pair gets one question and one notification rather than two. Called
-        with the lock held."""
-        if self.events.open_ask(workload, requester) is not None:
-            return None                          # written between the look above and the lock
-        row = {"id": uuid.uuid4().hex[:12], "workload": workload, "requester": requester,
-               "source": source, "held_mib": held_mib, "free_mib": free_mib,
-               "timeout_s": self.ask["timeout_s"], "fallback": self.ask["fallback"],
-               "last_used": self.last_used().get(workload), "name": name, "note": note}
-        if pid:
-            row["pid"] = pid
-        # The row's own time, chosen here rather than left to the log: the wait, the countdown the
-        # question shows, and "when was it last working" are all measured from the moment these
-        # numbers were taken, and the view built below has to be timed from the same instant the
-        # row is stored with. `EventLog.record` takes a `time` it is given.
-        row["time"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
-        self.events.record("ask", **row)
+        """Write the `ask` row and return it, or None when the question is already in the log -
+        the same recheck after taking a lock that a pressure episode does, and the reason a pair gets
+        one question and one notification rather than two. Called with the GPU lock held.
+
+        The look and the write are one turn of the log, for the same reason an answer is: two
+        processes that both find no ask for the pair and both write one leave two open questions for
+        one pair, which is two notifications and two countdowns for the same decision, and a second
+        one to answer. The GPU lock usually keeps them apart, but a `web`, a `watch` and a gate in a
+        fresh process reach here from three different places, and the log turn is what makes "is it
+        already asked?" mean the same thing as the row that follows it.
+        """
+        with self.events.turn(what="opening an ask"):
+            if self.events.open_ask(workload, requester) is not None:
+                return None              # written between the look above and this turn
+            row = {"id": uuid.uuid4().hex[:12], "workload": workload, "requester": requester,
+                   "source": source, "held_mib": held_mib, "free_mib": free_mib,
+                   "timeout_s": self.ask["timeout_s"], "fallback": self.ask["fallback"],
+                   "last_used": self.last_used().get(workload), "name": name, "note": note}
+            if pid:
+                row["pid"] = pid
+            # The row's own time, chosen here rather than left to the log: the wait, the countdown
+            # the question shows, and "when was it last working" are all measured from the moment
+            # these numbers were taken, and the view built later has to be timed from the same
+            # instant the row is stored with. `EventLog.record` takes a `time` it is given.
+            row["time"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+            self.events.record("ask", **row)
         return row
 
     def _raise_question(self, row: dict) -> dict:
@@ -460,24 +486,31 @@ class Arbiter:
         a row, and taking the lock to write it would mean a question could not be answered while
         the handover it is waiting for is running - which is when the owner is most likely to be
         answering it.
+
+        Whether this answer is the answer is decided inside the log, not in here: `EventLog.answer_ask`
+        holds the log's write turn across the check that the ask is open and the row that answers it,
+        so Keep written by the owner and Release applied by a timeout are one write apart rather than
+        a race whose loser is told it won. 503 is the case where neither got written: nothing is
+        recorded, and the question is still open to be answered again.
         """
         if answer not in policy.ANSWERS:
             return 400, {"error": f"an ask is answered {' or '.join(policy.ANSWERS)}, not {answer!r}"}
         if by not in policy.ANSWERED_BY:
             return 400, {"error": f"an ask is answered by {' or '.join(policy.ANSWERED_BY)}"}
-        ask = self.events.ask_by_id(ask_id)
-        if ask is None:
+        state, row = self.events.answer_ask(ask_id, answer, by)
+        if state == "missing":
             return 404, {"error": f"no ask {ask_id} in the event log"}
-        if ask.get("answer"):
-            return 409, {"error": (f"ask {ask_id} was answered {ask['answer']} "
-                                   f"({ask.get('by') or 'owner'}) already"),
-                         "ask": self.ask_view(ask)}
-        self.events.record("ask-answer", id=ask_id, answer=answer, by=by,
-                           workload=ask.get("workload"), requester=ask.get("requester"))
-        row = self.events.ask_by_id(ask_id) or {**ask, "answer": answer, "by": by}
+        if state == "answered":
+            return 409, {"error": (f"ask {ask_id} was answered {row.get('answer')} "
+                                   f"({row.get('by') or 'owner'}) already"),
+                         "ask": self.ask_view(row)}
+        if state == "locked":
+            return 503, {"error": f"the event log is busy: nothing was written for ask {ask_id} - "
+                                  "the question is still open, answer it again"}
         if by == "owner":
-            util.log(f"ask: {self.label(ask.get('workload'))} for "
-                     f"{self.ask_view(row)['requester_label']}: you said {self.ask_view(row)['answer_says']}")
+            view = self.ask_view(row)
+            util.log(f"ask: {self.label(row.get('workload'))} for "
+                     f"{view['requester_label']}: you said {view['answer_says']}")
         return 200, {"ask": self.ask_view(row)}
 
     def expire_asks(self, reason: str | None = None) -> list[dict]:

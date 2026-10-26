@@ -1,10 +1,15 @@
 """The decision log: every switch, hold and gate decision, one JSON object per line."""
 
+import contextlib
 import datetime
 import json
+import os
+import tempfile
+import threading
 from pathlib import Path
 
-from . import pressure, util
+from . import lock, pressure, util
+from .lock import Locked
 
 # The rows that say a claim is open, and what has been done about it.
 CLAIM_ROWS = ("claim", "claim-end", "claim-release", "claim-release-targets",
@@ -12,6 +17,10 @@ CLAIM_ROWS = ("claim", "claim-end", "claim-release", "claim-release-targets",
 # The rows that make an ask: `ask` opens the question (one per workload and requester at a
 # time) and `ask-answer` closes it, answered by the owner or by nobody answering in time.
 ASK_ROWS = ("ask", "ask-answer")
+# How long a row waits for another writer to let go before the write is refused: appending is
+# milliseconds of file work, so this waits out a writer that is wedged, not one that is busy.
+LOCK_WAIT_S = 5.0
+LOCK_POLL_S = 0.05
 
 
 def row_time(e: dict) -> datetime.datetime | None:
@@ -29,19 +38,83 @@ class EventLog:
         self.keep = keep
         # Gets a copy of every event, kept for its retention window rather than `keep` lines.
         self.telemetry = telemetry
+        # Which thread holds this log's write turn, so the turn can be taken again in the same
+        # thread that holds it (see `turn`). A thread id and not a counter: a second thread of this
+        # process is a second writer, and on Linux two of its file descriptors would otherwise
+        # reach the OS lock thinking the turn was already ours.
+        self._turn_by = None
+
+    @contextlib.contextmanager
+    def turn(self, *, what: str = "writing the log"):
+        """One writer to this log at a time, in this process and in every other one.
+
+        Appending a row is a read-check-write over the whole file - read the retained lines, trim,
+        add one, write it all back through a rename - so two processes that append in the same
+        moment each write a file built from the state they read, and one of the two rows is gone
+        with nothing saying it was ever written. That is not a lost line of history: the rows are
+        how this box knows what it decided, which claims are open, which workloads were already
+        reported, and which question the owner has answered. A row lost under a concurrent write is
+        vhotseat acting as if a decision it made had never been made.
+
+        The turn is taken with the operating system's lock on a file beside the log, the same two
+        primitives `lock.py` and a config save use, and it waits a bounded while: whoever holds it
+        is a millisecond away from letting go, and a caller that has to be told "nothing was
+        written" is the wedged writer, not the busy one.
+
+        Held by the thread that took it, and re-entrant for that thread: the check-then-write paths
+        (`answer_ask` is one) take the turn themselves so their read and their write are the same
+        reading of the file, and the `record()` that follows is the same write, not a second turn.
+        """
+        mine = threading.get_ident()
+        if self._turn_by == mine:
+            yield
+            return
+        with lock.write_turn(self.path, what=what, wait_s=LOCK_WAIT_S, poll_s=LOCK_POLL_S):
+            self._turn_by = mine
+            try:
+                yield
+            finally:
+                self._turn_by = None
 
     def record(self, kind: str, **fields) -> None:
-        """Append one event; the log is trimmed to the last `keep` lines."""
+        """Append one event; the log is trimmed to the last `keep` lines. The whole read-trim-write
+        is inside `turn()`, which is what makes a row survive being written beside another row.
+
+        A row that can't be written because another writer wouldn't let go is said out loud and
+        dropped rather than raised: the decision it records has already happened, and a handover or
+        a watcher killed by a log that is busy would be worse than a row the owner can see is
+        missing from the log line it prints."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         event = {"time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
                  "event": kind, **fields}
-        lines = self._read() if self.path.exists() else []
-        lines = [*lines[-(self.keep - 1):], json.dumps(event)]
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        util.replace(tmp, self.path)
+        try:
+            with self.turn():
+                self._append(event)
+        except Locked as e:
+            util.log(f"event log: {kind} row not written: {e}")
+            return
         if self.telemetry is not None:
             self.telemetry.event(event)
+
+    def _append(self, event: dict) -> None:
+        """The write itself, taken with the turn held: the retained lines plus this one, into a
+        temp file named for this write, renamed over the log.
+
+        The name is unique because a shared one is a second way for two writers to collide: on
+        Windows the loser of that race gets a `PermissionError` out of the rename and its row is
+        lost even when the lock below it didn't fail. A temp file left behind by a write that
+        failed is removed; a log is not a place for litter with a name like the log's."""
+        lines = self._read() if self.path.exists() else []
+        lines = [*lines[-(self.keep - 1):], json.dumps(event)]
+        fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix=self.path.name + ".",
+                                   suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            util.replace(Path(tmp), self.path)
+        finally:
+            with contextlib.suppress(OSError):
+                Path(tmp).unlink(missing_ok=True)
 
     def _read(self) -> list[str]:
         """The log's lines, retried the way `util.replace` retries the write beside it. On Windows
@@ -160,6 +233,37 @@ class EventLog:
                 out[ask_id].update(answer=e.get("answer"), by=e.get("by") or "owner",
                                    answered_at=e.get("time"))
         return [out[i] for i in order]
+
+    def answer_ask(self, ask_id: str, answer: str, by: str) -> tuple[str, dict | None]:
+        """Write the answer to an open ask, inside the same turn as the check that it is still open.
+
+        Returns (state, the ask as it reads now), where state is `"ok"` when this answer is the one
+        in the log, `"answered"` when a different answer got there first, `"missing"` when the log
+        holds no such ask, and `"locked"` when another writer wouldn't let go - which says nothing
+        was written, instead of two answers both being believed.
+
+        The check and the write share the turn because an answer is a decision with a winner. Read
+        the log here and write there, and an owner clicking Keep while a watcher gives up and
+        applies a fallback Release leaves two `ask-answer` rows with no order between them: the log
+        reads the first as the answer, and which of the two that is depends on which writer won a
+        rename. Then whoever acts on it - unloading a workload the owner said to keep, or keeping
+        one the fallback says to unload - is acting on a row that may not be the answer the box is
+        showing. This is one write, so the first answer wins in the file rather than in a reading of
+        it.
+        """
+        try:
+            with self.turn(what="answering an ask"):
+                ask = self.ask_by_id(ask_id)
+                if ask is None:
+                    return "missing", None
+                if ask.get("answer"):
+                    return "answered", ask
+                self._append({"time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+                              "event": "ask-answer", "id": ask_id, "answer": answer, "by": by,
+                              "workload": ask.get("workload"), "requester": ask.get("requester")})
+                return "ok", self.ask_by_id(ask_id) or {**ask, "answer": answer, "by": by}
+        except Locked:
+            return "locked", None
 
     def open_asks(self, limit: int = 500) -> list[dict]:
         """The asks the log shows as unanswered. What `/api/status` shows as the open question, and
