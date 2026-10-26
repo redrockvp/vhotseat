@@ -717,7 +717,9 @@ def test_a_log_that_never_lets_go_stops_the_wait_rather_than_hanging_it(rig, mon
     because no answer ever said otherwise, and the question is left open in the log - the next
     actor that can write it, or the owner's click, still closes it."""
     monkeypatch.setattr(events, "LOCK_WAIT_S", 0.05)
-    rig.arb.ask.update({"timeout_s": 1, "fallback": policy.RELEASE})
+    # Long enough that the log is wedged below before the fallback is due: at 1 s a busy machine
+    # sometimes got the fallback written first, and the test then failed on the answer it found.
+    rig.arb.ask.update({"timeout_s": 4, "fallback": policy.RELEASE})
     rig.arb.ask_write_tries = 2
     ask_first(rig, strata=["comfy"])
     rig.strata.loaded = True
