@@ -196,6 +196,21 @@ class Arbiter:
                 if n != reason and policy.may_ask(self.workloads[n].yields_to,
                                                   self.workloads[n].asks_for, reason)]
 
+    def claim_refusal(self, hits: list | None = None) -> str | None:
+        """The sentence that refuses a load nobody chose while a claimed process owns the card, or
+        None when nothing is claimed. One sentence because the claim says the same thing whoever is
+        asked - a gate hook, a guard's `--request`, a proxy's Seat - and it is asked more than once
+        per request on purpose: a request that waited for an Ask me answer has just been out of the
+        decision for the length of `ask.timeout_s`, and the game that started inside that is exactly
+        what the rule is about. The gate asks under the lock, as it always has; a request that
+        waited outside it asks again before the handover it was waiting for begins.
+
+        `hits` reuses a scan the caller has already done - the process table is read tens of
+        milliseconds at a time, but not twice for no reason inside one locked decision."""
+        hits = self.claim_hits() if hits is None else hits
+        return None if not hits else (
+            f"the card is claimed by {claims.describe(hits)}: nothing new loads while it runs")
+
     def wont_give_way(self, reason: str, gpu: dict) -> list[str]:
         """The loaded workloads that won't make room for `reason` on the config's own authority:
         the ones that refuse it, and the ones that want asking first.
@@ -1317,9 +1332,7 @@ class Arbiter:
         with got:
             gpu = self.snapshot()
             hits = self.claim_hits()
-            reason = (gpu.get("error")
-                      or (f"the card is claimed by {claims.describe(hits)}: nothing new loads while it runs"
-                          if hits else None)
+            reason = (gpu.get("error") or self.claim_refusal(hits)
                       or next((r for y in others if (r := y.busy())), None))
             if not reason:
                 # Already loaded (a hook fired again, or `vhotseat gate` run by hand):
@@ -1850,13 +1863,19 @@ class Arbiter:
                 util.log(f"can't switch to {name} inside `hold {held}`")
                 return {"ok": False, "error": f"inside hold {held}", "inside_hold": held}
             return {"ok": True, "held": held}
-        if request and (hits := self.claim_hits()) and self.probe()["mode"] != name:
-            why = f"the card is claimed by {claims.describe(hits)}: nothing new loads while it runs"
-            self.events.record("switch", to=name, ok=False, error=why)
-            util.log(f"switch to {name} refused: {why}")
-            return {"ok": False, "error": why}
+        if request:
+            claim = self.claim_refusal()
+            if claim and self.probe()["mode"] != name:
+                self.events.record("switch", to=name, ok=False, error=claim)
+                util.log(f"switch to {name} refused: {claim}")
+                return {"ok": False, "error": claim}
         consent: set[str] = set()
         if request:
+            claim = self.claim_refusal()
+            if claim and self.probe()["mode"] != name:
+                self.events.record("switch", to=name, ok=False, error=claim)
+                util.log(f"switch to {name} refused: {claim}")
+                return {"ok": False, "error": claim}
             # A workload the policy wants asked about first is not refused: the request waits for
             # the answer, up to the ask's own timeout, and then proceeds or refuses per the answer
             # or the fallback. Before any waiting and outside the lock: while the owner decides,
@@ -1869,6 +1888,16 @@ class Arbiter:
                 self.events.record("switch", to=name, ok=False, error=why)
                 util.log(f"switch to {name} refused: {why}")
                 return {"ok": False, "error": why, "exception": e}
+            # The claim, again: waiting for an answer is two minutes of somebody else's time, and a
+            # game can start inside it. What the owner agreed to unload is unloaded for the game
+            # that is on the card now, not the one that was running when the question was opened -
+            # and if there is one now, this is the same refusal the request would have got had it
+            # arrived a minute later, which is the only reason it was waiting.
+            claim = self.claim_refusal()
+            if claim and self.probe()["mode"] != name:
+                self.events.record("switch", to=name, ok=False, error=claim)
+                util.log(f"switch to {name} refused: {claim}")
+                return {"ok": False, "error": claim}
         # Wait for the others' running work *without* the lock: a ComfyUI job's guard
         # needs the lock to start, so holding it while waiting for ComfyUI's queue
         # to drain would stop the queue (it did, until 2026-10-17: the batch stalled

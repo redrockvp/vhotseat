@@ -26,7 +26,7 @@ import threading
 import time
 
 import pytest
-from fakes import COMFY_MODEL_VRAM, STRATA_VRAM
+from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, STRATA_VRAM
 from test_claim_release import NAME, NOTE, claim_rule, running_render
 from test_policy_api import get, post, rig_config_text
 from test_pressure_episode import scene
@@ -448,6 +448,32 @@ def test_no_notifications_still_asks_where_a_person_can_see_it(rig, waiters):
 
 
 # --- the paths that wait -----------------------------------------------------------------
+
+
+def test_a_game_starting_during_the_wait_refuses_the_request(rig, monkeypatch, waiters):
+    """A request that waits for an answer waits for as long as `ask.timeout_s` says - two minutes of
+    somebody being away from the keyboard - and a game can start inside that. The claim rule is about
+    a model not going onto the card while a game owns it, so the claim is asked about again when the
+    waiting ends: the request is refused on the sentence it would have got had it arrived a minute
+    later, rather than putting a server's weights under the game that started meanwhile. The gate hook
+    re-checks under its own lock; a guard's `--request` and a proxy's Seat wait outside any lock, so
+    they owe the re-check themselves. What the owner agreed to unload is not unloaded by a refused
+    request either: the claim's own release path frees the card for the game, and says so under the
+    claim's name rather than this request's."""
+    procs = claim_rule(rig, monkeypatch)
+    pid, game = procs.popitem()                 # the game starts after the request begins waiting
+    ask_first(rig, strata=["comfy"])
+    rig.strata.loaded = True
+    th, box = in_thread(lambda: rig.cli("switch", "comfy", "--request"))
+    asked = awaiting(rig, waiters, "strata", "comfy")
+    assert rig.arb.claim_hits() == [], "the game was claiming before it started"
+    procs[pid] = game
+    assert rig.arb.claim_hits(), "the fake game isn't in the process table"
+    assert rig.arb.answer_ask(asked["id"], policy.RELEASE)[0] == 200
+    assert join(th, box) == 1, "the request loaded ComfyUI on top of a game that had just started"
+    assert "claimed by EldenRing.exe (Elden Ring)" in rows(rig, "switch")[-1]["error"]
+    assert rig.comfy.vram == COMFY_CONTEXT_VRAM, "ComfyUI loaded its weights anyway"
+    assert rig.strata.loaded, "the refusal unloaded something it was no longer asked to unload"
 
 
 def test_a_gate_hook_waits_for_the_answer_instead_of_refusing_the_agent(rig, waiters):
