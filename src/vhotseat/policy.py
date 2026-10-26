@@ -82,6 +82,11 @@ PHRASE = {CLAIMS: "a claim on the card", PRESSURE: "the card running short"}
 # called, and the line under it that says who that is.
 SPECIAL_REQUESTERS = ((CLAIMS, "A game", "or any app that claims the GPU"),
                       (PRESSURE, "Low VRAM", "another app squeezes the card"))
+# ...and how each one reads in the middle of a sentence, which is neither of those: the heading
+# names the column and the line under it says who it is, while a row summary and a control's
+# aria-label have to fit the words they sit between ("makes room for a game", "stays loaded for
+# low VRAM").
+SUMMARY_PHRASE = {CLAIMS: "a game", PRESSURE: "low VRAM"}
 
 
 def ask_cfg(raw: dict | None) -> dict:
@@ -178,11 +183,18 @@ def used_phrase(ago_s: float | None) -> str:
     if ago_s is None:
         return "nothing has recorded it working since this started"
     s = int(round(ago_s))
-    if s < 90:
+    if s < USED_RECENTLY_S:
         return f"used {s} s ago"
     if s < 5400:
         return f"idle for {s // 60} min"
     return f"idle for {s // 3600} h"
+
+
+# Under this, a workload was seen working moments ago: recent enough that the next thing it
+# does may already be on its way. It is the line `used_phrase` switches its wording on, and the
+# one the editor's "try it" outcome uses to say "this may be mid-task" rather than "it is idle",
+# so the two can't drift into disagreeing about the same stamp.
+USED_RECENTLY_S = 90
 
 
 def wait_phrase(timeout_s: float) -> str:
@@ -238,4 +250,143 @@ def matrix(rows, requesters) -> dict:
                            "says": says(c, label, rid, rlabel)}
                      for rid, rlabel in requesters if rid != name}
     return out
+
+
+def phrase(rid: str, label: str) -> str:
+    """How a requester is named in the middle of a sentence: a workload by its label, a game and
+    a short card by the two words that fit between other words."""
+    return SUMMARY_PHRASE.get(rid, label)
+
+
+def says_all(rows, requesters) -> dict:
+    """Every cell of the grid with all three of its choices and the sentence each one carries.
+
+    The cell on the page is a select, and the consequence line under it has to change the moment
+    the owner picks a different answer - before anything is saved, and before this process has
+    their draft at all. So the page is given the three sentences and shows one of them, rather
+    than holding a sentence of its own for a choice it has never asked about."""
+    return {name: {rid: {c: says(c, label, rid, rlabel) for c in CHOICES}
+                   for rid, rlabel in requesters if rid != name}
+            for name, label, _yields_to, _asks_for in rows}
+
+
+def join_and(items) -> str:
+    """A short list as it is read out: "a game", "ComfyUI and low VRAM", "a game, ComfyUI and low
+    VRAM"."""
+    if len(items) <= 1:
+        return " and ".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def row_says(rows, requesters) -> dict:
+    """What a whole row of the grid says about one workload, as the sentence under it: "Strata
+    makes room for a game and asks you first for ComfyUI."
+
+    The page holds every choice and could build this itself; it doesn't, for the same reason
+    `matrix` exists. A summary the page writes is a second account of the rule, and it is the
+    half that goes stale when the reading of the two config keys changes. A row that makes room
+    for everything says "anything" rather than the names, because that is what the file says and
+    what a workload added next week will read too."""
+    out = {}
+    for name, label, yields_to, asks_for in rows:
+        by = {c: [phrase(rid, rlabel) for rid, rlabel in requesters
+                  if rid != name and choice(yields_to, asks_for, rid) == c] for c in CHOICES}
+        if not by["ask"] and not by["keep"]:
+            out[name] = f"{label} makes room for anything, including workloads you add later."
+            continue
+        parts = []
+        if by["yes"]:
+            parts.append("makes room for " + join_and(by["yes"]))
+        if by["ask"]:
+            parts.append("asks you first for " + join_and(by["ask"]))
+        if by["keep"]:
+            parts.append("stays loaded for " + join_and(by["keep"]))
+        out[name] = f"{label} {join_and(parts)}."
+    return out
+
+
+def gib(mib) -> str:
+    """MiB as the GiB the dashboard shows its owner: 21642 is "21.1 GiB". Said as a size the
+    owner can spend, not as the number the driver returned."""
+    return f"{mib / 1024:.1f} GiB"
+
+
+def doing_phrase(label: str, working: bool, ago_s) -> str:
+    """What a loaded workload is doing, as the sentence an outcome opens with: it is answering
+    something now, it was used a moment ago so something may be mid-task, or it has been idle.
+
+    Those are the three states the owner is weighing the consequence against, and they come from
+    the two facts the release itself acts on - whether it is working, and when it was last seen
+    working. No record is said as no record, the way `used_phrase` does it: a workload whose work
+    was never stamped being called "idle" is exactly how an agent gets unloaded between steps."""
+    if working:
+        return f"{label} is answering a request right now. "
+    if ago_s is None:
+        return f"Nothing has recorded {label} working since this started, so it may be mid-task. "
+    if ago_s < USED_RECENTLY_S:
+        return f"{label} was {used_phrase(ago_s)}, so something may be mid-task. "
+    return f"{label} has been {used_phrase(ago_s)}. "
+
+
+def _cap(text: str) -> str:
+    """A phrase at the start of a sentence: "the other app" reads "The other app"."""
+    return text[0].upper() + text[1:]
+
+
+# How each of the three answers plays out for each kind of requester, in the words the editor's
+# "try it" shows before the owner has saved anything. `tone` is which of the three colours the
+# page draws the box in: good for the answer that costs nothing they are in the middle of, warn
+# for the one that interrupts or leaves them short, info for the one that stops and asks.
+def outcome(*, holder: str | None, requester: str, requester_id: str, cell: str,
+            working: bool, ago_s, held_mib, ask: dict, pressure_on: bool = True,
+            loaded: bool = True) -> dict:
+    """What one cell of the grid would do, as {title, detail, tone}.
+
+    Built from the draft the page is holding plus the card's real state - is the workload working
+    now, when was it last seen working, how much does it hold - because the demo of a rule has to
+    be about the card as it is, not about a state the page made up to click through. It says
+    nothing that the rule does not do: a kept row says who is refused, an ask says who waits and
+    what happens when nobody answers, and a release says what comes free."""
+    who = {CLAIMS: "the game", PRESSURE: "the other app"}.get(requester_id, requester)
+    if requester_id == PRESSURE and not pressure_on:
+        return {"tone": "info", "title": "Nothing is unloaded",
+                "detail": "Low VRAM release is off."}
+    if not loaded or not holder:
+        return {"tone": "info", "title": "Nothing is loaded",
+                "detail": "Nothing is on the card right now, so this would not unload anything."}
+    if cell == "keep":
+        detail = ("A game can't be refused, so it starts with what is free."
+                  if requester_id == CLAIMS else
+                  "Nothing is released. The other app has to manage with what is free."
+                  if requester_id == PRESSURE else
+                  f"{requester} is refused. The warning has a Make room now button, and the "
+                  "refusal is logged.")
+        return {"tone": "warn", "title": f"{holder} stays loaded, and you get a warning",
+                "detail": detail}
+    if cell == "ask":
+        waits = ("The game runs with what is free until you answer." if requester_id == CLAIMS
+                 else _cap(who) + " waits for your answer.")
+        return {"tone": "info", "title": "You get a notification asking first",
+                "detail": doing_phrase(holder, working, ago_s)
+                          + "Pause your work if you need to, then choose Unload now or Keep it. "
+                          + waits + " No answer in " + wait_phrase(ask.get("timeout_s")) + ": "
+                          + (f"{holder} stays loaded." if ask.get("fallback") == KEEP
+                             else f"{holder} unloads.")}
+    if working:
+        freed = f" and frees {gib(held_mib)} for {who}" if held_mib else ""
+        return {"tone": "good", "title": f"{holder} finishes its current request, then unloads",
+                "detail": "The request in progress is never cut off. As soon as it ends, "
+                          f"{holder} unloads in about 2 s{freed}."}
+    if ago_s is None or ago_s < USED_RECENTLY_S:
+        return {"tone": "warn", "title": f"{holder} unloads at the next pause, even mid-task",
+                "detail": doing_phrase(holder, working, ago_s)
+                          + "An agent between two steps counts as idle, so " + holder
+                          + " unloads now and its next step has to wait until the GPU is free "
+                            "again. Choose Ask me if you'd rather decide."}
+    return {"tone": "good", "title": f"{holder} unloads right away",
+            "detail": doing_phrase(holder, working, ago_s)
+                      + (f"Frees {gib(held_mib)} in about 2 s. It loads again the next time "
+                         "something asks for it." if held_mib else
+                         "It comes off in about 2 s and loads again the next time something "
+                         "asks for it.")}
 

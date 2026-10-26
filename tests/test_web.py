@@ -9,8 +9,8 @@ import time
 import urllib.request
 
 import pytest
-
 from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, STRATA_VRAM
+
 from vhotseat import claims, config, host, telemetry, util, web
 from vhotseat.telemetry import Telemetry
 
@@ -557,3 +557,154 @@ def test_the_spill_into_system_ram_is_recorded_as_evidence(rig):
     assert sample["vram_shared"] == 13000
     rig.gpu.shared_of = {}                    # a backend with no such counter, not an empty card
     assert rig.arb.probe()["gpu"]["shared_mib"] is None
+
+
+# --- the rules editor: the sentences it is handed, and the questions it asks -----------
+
+
+def post(url, body, edit="1"):
+    """POST the way the page does, with the header and content type the guard asks for. `edit=None`
+    is the way a page on somebody else's origin does it."""
+    headers = {"Content-Type": "application/json"}
+    if edit is not None:
+        headers[web.EDIT_HEADER] = edit
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers=headers)
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def policy_api(server) -> dict:
+    return json.loads(get(server + "/api/policy")[1])
+
+
+def preview(server, row, col, choice, **extra):
+    """Ask the editor's question: what would the (row, col) cell do if the grid said this? The
+    draft matrix is the one the page would post - the saved grid with the one cell changed - so
+    the answer is about an answer the owner has not committed to yet."""
+    cells = {name: {c: v["choice"] for c, v in cols.items()}
+             for name, cols in policy_api(server)["matrix"].items()}
+    cells[row][col] = choice
+    return post(f"{server}/api/policy/preview", {"requester": col, "workload": row,
+                                                 "matrix": cells, **extra})
+
+
+def test_the_policy_api_hands_the_page_the_row_sentence_and_all_three_cell_lines(rig, server):
+    """The grid's words are the server's. Each cell comes with the sentence each of its three
+    choices carries - so picking Ask me changes the line under it before anything is saved, and
+    the page never holds a consequence of its own to fall out of step with the arbiter - and each
+    row comes with the sentence it adds up to, which is what says what a whole row does without
+    reading five cells."""
+    body = policy_api(server)
+    assert body["summaries"]["strata"] == ("Strata makes room for anything, including workloads "
+                                           "you add later.")
+    assert body["says_for"]["strata"]["comfy"] == {
+        "yes": "Strata unloads once idle",
+        "ask": "ComfyUI waits for your answer",
+        "keep": "ComfyUI is refused"}
+    assert body["says_for"]["strata"]["pressure"]["keep"] == "nothing is freed"
+    assert "strata" not in body["says_for"]["strata"]      # nothing unloads itself
+    # The words each column reads in the middle of a sentence: the page's own labels have to use
+    # them, or its headings, its aria-labels and its summaries name one thing three ways.
+    assert [r["phrase"] for r in body["requesters"]] == ["Strata", "ComfyUI", "a game", "low VRAM"]
+    rig.arb.workloads["strata"].asks_for = ("claims",)
+    assert policy_api(server)["summaries"]["strata"] == (
+        "Strata makes room for ComfyUI and low VRAM and asks you first for a game.")
+
+
+def test_the_preview_says_what_an_unsaved_cell_would_do_on_this_card(rig, server):
+    """Before the owner saves a rule they are told what it does, and the sentence is about the
+    card they are looking at: which answer the cell holds, and whether the workload on it is
+    answering something now, was used a moment ago so something may be mid-task, or is idle. A
+    demo whose state the page could set would be a demo of a situation the owner is not in."""
+    rig.strata.loaded = True
+    rig.arb.note_used("strata", time.time() - 3600)          # an hour since anything asked
+    code, out = preview(server, "strata", "comfy", "keep")
+    assert code == 200 and out["tone"] == "warn"
+    assert out["title"] == "Strata stays loaded, and you get a warning"
+    assert out["detail"] == ("ComfyUI is refused. The warning has a Make room now button, and the "
+                             "refusal is logged.")
+    code, out = preview(server, "strata", "comfy", "yes")
+    assert code == 200 and out["title"] == "Strata unloads right away"
+    assert "Strata has been idle for 60 min." in out["detail"]
+    assert "Frees 13.7 GiB in about 2 s" in out["detail"]
+    code, out = preview(server, "strata", "comfy", "ask")
+    assert out["title"] == "You get a notification asking first"
+    assert "ComfyUI waits for your answer." in out["detail"]
+    assert "No answer in 2 min: Strata stays loaded." in out["detail"]
+    # The draft's own ask numbers, not the saved ones: the question the preview describes is the
+    # one the owner's unsaved ask block would ask.
+    _, out = preview(server, "strata", "comfy", "ask", ask={"timeout_s": 60, "fallback": "release"})
+    assert "No answer in 60 s: Strata unloads." in out["detail"]
+    # A game and an app that grew cannot be refused, so keeping loaded costs memory rather than a
+    # refusal, and the preview says which of the two it is.
+    assert preview(server, "strata", "claims", "keep")[1]["detail"] == (
+        "A game can't be refused, so it starts with what is free.")
+    assert preview(server, "strata", "pressure", "keep",
+                   pressure={"enabled": False})[1]["title"] == "Nothing is unloaded"
+
+
+def test_the_preview_reads_the_workload_s_real_state(rig, server):
+    """The same cell answers differently depending on what the loaded workload is doing, and the
+    states that matter are the states the release itself obeys: it is working, so its current
+    request finishes first; or it is not working but was used a moment ago, so unloading it may
+    cut across a task mid-step. Not knowing when it last worked is a third state and is said as
+    that, never as idle."""
+    rig.strata.loaded = True
+    rig.arb.note_used("strata")                             # seconds ago: may well be mid-task
+    _, out = preview(server, "strata", "comfy", "yes")
+    assert out["tone"] == "warn"
+    assert out["title"] == "Strata unloads at the next pause, even mid-task"
+    assert "Strata was used 0 s ago, so something may be mid-task." in out["detail"]
+    assert "Choose Ask me if you'd rather decide." in out["detail"]
+    # A box where nothing has ever stamped this workload has no evidence that it is idle, and
+    # calling it idle here is how an agent loses its model between two steps.
+    rig.arb.used_path.unlink()
+    _, out = preview(server, "strata", "comfy", "yes")
+    assert "Nothing has recorded Strata working since this started" in out["detail"]
+    # And a workload answering something keeps answering it: the preview says the request in front
+    # of it is never the one that gets cut off.
+    rig.arb.workloads["strata"].busy = lambda: "Strata is busy"
+    _, out = preview(server, "strata", "comfy", "yes")
+    assert out["title"] == "Strata finishes its current request, then unloads"
+    assert "frees 13.7 GiB for ComfyUI" in out["detail"]
+
+
+def test_a_preview_changes_no_rule_no_card_and_no_log(rig, server):
+    """The preview is a question about the rules, not an edit of them: nothing is written, no cell
+    moves, and no row is recorded. It is guarded like the writes all the same, because what it
+    hands back is the owner's rules read out loud next to their live card, and a page on another
+    origin has no business asking - least of all with a draft grid this page never showed."""
+    rig.strata.loaded = True
+    before = policy_api(server)
+    assert preview(server, "strata", "comfy", "keep")[0] == 200
+    after = policy_api(server)
+    assert after["matrix"] == before["matrix"] and after["version"] == before["version"]
+    assert rig.events() == []
+    # Nothing was asked of the card: reading it costs a GET to each API, and the preview that sent
+    # one of those is the one that must never send a POST.
+    assert not [c for c in rig.strata.calls if c.startswith("POST")]
+    assert post(f"{server}/api/policy/preview", {"requester": "comfy"}, edit=None)[0] == 403
+    for body in ({"requester": "nosuch"}, {"requester": "comfy", "workload": "nosuch"},
+                 {"requester": "strata", "workload": "strata"},
+                 {"requester": "comfy", "workload": "strata",
+                  "matrix": {"strata": {"comfy": "maybe"}}},
+                 {"requester": "comfy", "ask": {"timeout_s": 0}}, "not an object"):
+        code, out = post(f"{server}/api/policy/preview", body)
+        assert code == 400 and out["error"], body
+    assert rig.arb.open_asks() == [] and rig.strata.loaded   # still holding, as it was
+
+
+def test_nothing_on_the_card_is_answered_as_nothing(rig, server):
+    """The card is free, so the rule has nothing to do, and the preview says that instead of
+    describing a release that would not happen. Asked with no workload named, which is what the
+    page does when its own reading of the card says nobody holds it."""
+    assert rig.arb.probe()["mode"] == "none"
+    code, out = post(f"{server}/api/policy/preview", {"requester": "comfy"})
+    assert code == 200 and out["tone"] == "info"
+    assert out["title"] == "Nothing is loaded"
+    assert out["detail"] == "Nothing is on the card right now, so this would not unload anything."
+
