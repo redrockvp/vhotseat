@@ -93,8 +93,6 @@ class EventLog:
         except Locked as e:
             util.log(f"event log: {kind} row not written: {e}")
             return
-        if self.telemetry is not None:
-            self.telemetry.event(event)
 
     def _append(self, event: dict) -> None:
         """The write itself, taken with the turn held: the retained lines plus this one, into a
@@ -103,7 +101,17 @@ class EventLog:
         The name is unique because a shared one is a second way for two writers to collide: on
         Windows the loser of that race gets a `PermissionError` out of the rename and its row is
         lost even when the lock below it didn't fail. A temp file left behind by a write that
-        failed is removed; a log is not a place for litter with a name like the log's."""
+        failed is removed; a log is not a place for litter with a name like the log's.
+
+        This is the only place a row is written, so it is also the only place a row is handed to the
+        durable history (`telemetry.db`, which keeps decisions far past the log's last 500 lines).
+        Handing it over in `record()` instead - the plain-append call - is how the asks went
+        missing from the history: an `ask` and the `ask-answer` that closes it are written by the
+        check-then-write path, which never passed the copy. The question the owner was asked, and
+        what they said, then existed only while the log retained them, and the history - the thing
+        that says which unload was a person's decision - never had them. Copying here means a row
+        reaches the history exactly when it reaches the log, and a row a wedged writer failed to
+        write is in neither."""
         lines = self._read() if self.path.exists() else []
         lines = [*lines[-(self.keep - 1):], json.dumps(event)]
         fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix=self.path.name + ".",
@@ -115,6 +123,8 @@ class EventLog:
         finally:
             with contextlib.suppress(OSError):
                 Path(tmp).unlink(missing_ok=True)
+        if self.telemetry is not None:
+            self.telemetry.event(event)       # reached only once the row has actually landed
 
     def _read(self) -> list[str]:
         """The log's lines, retried the way `util.replace` retries the write beside it. On Windows

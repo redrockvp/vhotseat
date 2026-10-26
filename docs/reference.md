@@ -455,8 +455,10 @@ gate, opened once and asked before every request - reloads the same way, on each
 
 **History doesn't need the page open.** Every vhotseat command records into
 `~/.local/state/vhotseat/telemetry.db` (SQLite) as it runs: each status probe
-is a sample, each event and log line a row, and a `hold` or a waiting `switch`
-samples every `interval_s` while it lasts. So a dashboard started later shows
+is a sample, each event and log line a row - an Ask me and the answer to it are
+events, so the history is where you can still see, weeks later, which unload was a
+person's decision - and a `hold` or a waiting `switch` samples every `interval_s`
+while it lasts. So a dashboard started later shows
 what happened before. Between commands nothing samples, which shows as gaps;
 for an unbroken history run the recorder as a service:
 

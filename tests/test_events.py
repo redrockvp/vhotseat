@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from vhotseat import events, lock, util
+from vhotseat import events, lock, telemetry, util
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -168,3 +168,35 @@ def test_a_write_that_couldnt_get_the_log_says_so(log, monkeypatch):
     # An answer is the write that must not pretend: `arbiter.answer_ask` turns the same refusal
     # into 503, so a button that didn't get its row written says so instead of going away.
     assert refused().__class__.__name__ == "_GeneratorContextManager" or True
+
+
+def test_the_history_gets_every_row_the_log_writes(tmp_path):
+    """`telemetry.db` is the longer memory behind the dashboard's event feed: it keeps rows past the
+    last 500 lines of the log, and it is filled by a copy handed over as each row is written.
+
+    Attaching that copy to `record()` - the plain-append call - is what left the asks out: an `ask`
+    and its `ask-answer` are written by the check-then-write path, which never went through the
+    place the copy lived. The question the owner was asked, and the answer they gave, were in the
+    log for as long as it retained them and nowhere else: nothing in the history says this box ever
+    asked anyone anything, and a week later the owner cannot see which unload was their decision.
+
+    It goes the other way too. A row that was *not* written - a writer that wouldn't let go - must
+    not be copied into history as if it had been. So the copy belongs to the one write path: every
+    row that lands in the log lands in the history, and a row that did not land stays out of both."""
+    tel = telemetry.Telemetry(tmp_path / "t.db", retention_hours=1)
+    log = events.EventLog(tmp_path / "events.jsonl", telemetry=tel)
+
+    log.record("switch", workload="comfyui", actor="owner")
+    log.record("ask", id="a1", workload="strata", requester="comfyui", timeout_s=120,
+               fallback="keep")
+    assert log.answer_ask("a1", "release", "owner")[0] == "ok"
+    # refused: no such ask in the log, so nothing was written and nothing may be copied
+    assert log.answer_ask("nope", "release", "owner")[0] == "missing"
+
+    rows = tel.events(0, time.time() + 5)
+    kinds = [r["event"] for r in rows]
+    assert kinds.count("switch") == 1, "a plain row was copied twice: the copy lives in two places"
+    assert "ask" in kinds, "the question never reached the history, only the log"
+    assert "ask-answer" in kinds, "the owner's answer never reached the history, only the log"
+    answered = [r for r in rows if r["event"] == "ask-answer"][0]
+    assert (answered["id"], answered["answer"], answered["by"]) == ("a1", "release", "owner")
