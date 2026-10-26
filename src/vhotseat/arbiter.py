@@ -1308,11 +1308,17 @@ class Arbiter:
         # waiting for a person would stop every other handover on the box with it. Nothing is
         # asked while another actor holds the lock: that path answers from the note, as it always
         # has, and that actor is deciding this same card right now.
+        # The hook's whole run - the asking, and the handover the answer authorises - has to fit in
+        # the workload's own limit (`gate.timeout`), so the limit is taken once, here. Measured twice
+        # (one reading for the asking, another started when the answer arrives) it hands the handover
+        # a budget the host stopped paying for: the restart guard inside it is told a whole timeout
+        # is left when the waiting spent it, and a restart cut off in the middle of a killed hook is
+        # worse than a refusal - the service is off, the model isn't loaded, and the agent retries.
+        deadline = ((time.monotonic() + x.gate["timeout"] * util.SCALE) if x.gate.get("timeout")
+                    else None)
         consent: set[str] = set()
         if not self.lock.holder():
-            own = (time.monotonic() + x.gate["timeout"] * util.SCALE
-                   if x.gate.get("timeout") else None)
-            consent, blockers, why = self.ask_before_request(name, own_deadline=own, source="gate")
+            consent, blockers, why = self.ask_before_request(name, own_deadline=deadline, source="gate")
             if why:
                 self._policy_refused("gate", name, blockers, why)
                 self.events.record(kind, source="request", allowed=False, reason=why)
@@ -1327,8 +1333,7 @@ class Arbiter:
                 util.log(f"refusing {x.label} load: {holder} is in progress")
             return allowed
 
-        # The hook's whole run must fit in the workload's own limit (gate.timeout).
-        deadline = time.monotonic() + x.gate["timeout"] * util.SCALE if x.gate.get("timeout") else None
+        # The whole hook - the asking included - runs against the deadline taken above.
         with got:
             gpu = self.snapshot()
             hits = self.claim_hits()

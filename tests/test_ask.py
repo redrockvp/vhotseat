@@ -450,6 +450,65 @@ def test_no_notifications_still_asks_where_a_person_can_see_it(rig, waiters):
 # --- the paths that wait -----------------------------------------------------------------
 
 
+class FakeMonotonic:
+    """A clock the test turns by hand: one `monotonic()` for the arbiter to measure a hook against,
+    advanced by the test rather than by waiting. Only `monotonic` is faked - the wall clock the rows
+    are stamped with stays real, so a question that is still open and a hook that has run out of time
+    are two separate things, which is exactly the pair the hook has to get right."""
+
+    def __init__(self, real):
+        self.real, self.t = real, real.monotonic()
+
+    def monotonic(self):
+        return self.t
+
+    def time(self):
+        return self.real.time()
+
+    def advance(self, seconds):
+        self.t += seconds
+
+
+def test_the_hook_and_the_wait_share_one_deadline(rig, monkeypatch, waiters):
+    """`gate.timeout` is the whole hook's budget: the waiting for an answer, and the handover the
+    answer authorises, both fit inside it. Measured twice - once for the asking, once started again
+    when the answer arrives - the handover is handed a budget the host stopped paying for, and its
+    restart guard ("don't start a 20 s restart the gate can't finish") is told a whole timeout is
+    left when the waiting spent it. Same rig, same answer: the restart happens when time is left and
+    is refused when the waiting used it up.
+
+    The suite runs waits at a tenth (`util.SCALE`), so a 60 s hook budget is 6 of the units this
+    clock is turned in, and the restart guard wants 2 of them."""
+    clock = FakeMonotonic(time)
+    monkeypatch.setattr(arbiter, "time", clock)
+    ask_first(rig, comfy=["strata"])
+    rig.arb.workloads["strata"].gate = {"timeout": 60}
+
+    def handover(spent):
+        """One gate hook: the question asked, `spent` of the hook's budget gone, the owner's answer,
+        and what the hook then does."""
+        rig.comfy.vram = COMFY_MODEL_VRAM
+        rig.host.mem["comfyui"] = {"ram_mib": 6000, "swap_mib": 1000, "file_mib": 0}
+        rig.host.available_mib = 42000                      # ComfyUI's process is what's short
+        rig.host.on_restart["comfyui"] = lambda: (rig.comfy.restarted(),
+                                                  setattr(rig.host, "available_mib", 49000))
+        th, box = in_thread(lambda: rig.arb.gate("strata"))
+        asked = awaiting(rig, waiters, "comfy", "strata")
+        clock.advance(spent)             # the owner takes this long to answer
+        assert rig.arb.answer_ask(asked["id"], policy.RELEASE)[0] == 200
+        return join(th, box), asked
+
+    ok, _ = handover(spent=0)
+    assert ok is True and rig.host.restarts == ["comfyui"], "an answer with time left didn't restart"
+
+    rig.host.restarts = []
+    ok, asked = handover(spent=5)        # 5 of the hook's 6: 1 left, and the guard wants 2
+    assert ok is False, "the hook started a restart it has no time to finish"
+    assert rig.host.restarts == [], "it restarted ComfyUI into a hook the host is about to kill"
+    assert "no time left to restart anything" in rows(rig, "strata-load")[-1]["reason"]
+    assert rig.arb.events.ask_by_id(asked["id"])["answer"] == policy.RELEASE
+
+
 def test_a_game_starting_during_the_wait_refuses_the_request(rig, monkeypatch, waiters):
     """A request that waits for an answer waits for as long as `ask.timeout_s` says - two minutes of
     somebody being away from the keyboard - and a game can start inside that. The claim rule is about
