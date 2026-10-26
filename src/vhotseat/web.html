@@ -17,6 +17,10 @@
   --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
   --other: #b9b8b0; --none: #e1e0d9;
   --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  /* The two coloured answers of the rules grid - Ask me and Keep loaded - as the three shades
+     each needs (fill, line, ink), so the theme button and dark mode carry them like anything else. */
+  --ask: #e7effb; --ask-line: #6f9fdc; --ask-ink: #13365f;
+  --keep: #fdf0d2; --keep-line: #d99a00; --keep-ink: #4d3200;
 }
 /* Dark: the OS setting, unless the theme button picked light; or the button picked dark. */
 @media (prefers-color-scheme: dark) {
@@ -26,6 +30,8 @@
     --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.05);
     --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
     --other: #5c5b57; --none: #2c2c2a;
+    --ask: #16283c; --ask-line: #4a76ab; --ask-ink: #cfe0f5;
+    --keep: #33260c; --keep-line: #a87a12; --keep-ink: #f0dcae;
   }
 }
 :root[data-theme="dark"] {
@@ -34,6 +40,8 @@
   --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.05);
   --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
   --other: #5c5b57; --none: #2c2c2a;
+  --ask: #16283c; --ask-line: #4a76ab; --ask-ink: #cfe0f5;
+  --keep: #33260c; --keep-line: #a87a12; --keep-ink: #f0dcae;
 }
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
@@ -155,6 +163,126 @@ td.nw { color: var(--ink); }
 .err { color: var(--critical); }
 .loading { opacity: .55; transition: opacity .2s; }
 [hidden] { display: none !important; }
+button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible {
+  outline: 2px solid var(--s1); outline-offset: 2px;
+}
+
+/* --- the rules editor ------------------------------------------------------------
+   The same three answers everywhere, each with its own shade, and a sticky bar that says
+   what the page has changed that the config file has not. The colours are the tokens above:
+   the neutral answer takes the surface, and Ask me and Keep loaded take theirs, so a cell,
+   its explainer card and the outcome box read as one vocabulary. */
+.rules { display: flex; flex-wrap: wrap; gap: 20px; }
+.rules > .col-a { flex: 1 1 340px; min-width: 0; display: flex; flex-direction: column; gap: 20px; }
+.rules > .col-b { flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column; gap: 20px; }
+.rules h3 { margin-bottom: 2px; }
+.rules h3 + .sub { margin: 0 0 10px; }
+.cap { font-size: 12px; color: var(--ink-2); margin: 0 0 6px 4px; display: flex; align-items: center; gap: 6px; }
+.cap svg { width: 14px; height: 14px; flex: none; }
+.cap.after { margin: 6px 0 0 4px; }
+.key.dot { width: 12px; height: 12px; border-radius: 3px; }
+.num { width: 22px; height: 22px; border-radius: 50%; background: var(--surface); box-shadow: 0 0 0 1px var(--ring);
+  display: inline-flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 650; flex: none; }
+ol.order { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+ol.order li { display: flex; align-items: center; gap: 10px; background: var(--wash); border-radius: 10px; padding: 5px 5px 5px 10px; }
+ol.order .name { flex: 1 1 auto; min-width: 0; }
+ol.order .name b { font-weight: 600; overflow-wrap: anywhere; }
+ol.order .name .now { display: block; color: var(--muted); font-size: 12px; }
+.move { width: 44px; height: 44px; border: 0; border-radius: 8px; background: transparent; color: var(--ink);
+  display: inline-flex; align-items: center; justify-content: center; cursor: pointer; flex: none; }
+.move:hover { background: var(--wash); }
+.move:disabled { opacity: .35; cursor: default; }
+.fits { display: flex; flex-direction: column; gap: 10px; }
+.fit .top { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; }
+.fit .top span { color: var(--ink-2); }
+.fitbar { height: 10px; border-radius: 5px; background: var(--wash); margin-top: 5px; display: flex; overflow: hidden; }
+.fitbar i { display: block; height: 100%; }
+.pairs { background: var(--wash); border-radius: 10px; padding: 10px 14px; font-size: 13px; margin-top: 12px; }
+.pairs b { display: block; margin-bottom: 4px; font-weight: 650; }
+.pairs .pair { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; border-top: 1px solid var(--grid); }
+.pairs .pair span:last-child { font-weight: 600; white-space: nowrap; }
+.grid-scroll { overflow: auto; border-radius: 10px; box-shadow: 0 0 0 1px var(--ring); }
+.grid-scroll table { min-width: 700px; border-collapse: separate; }
+.grid-scroll th { background: var(--surface); vertical-align: bottom; }
+.grid-scroll th[scope="col"] { color: var(--ink-2); border-bottom: 1px solid var(--axis); }
+.grid-scroll th .col-head { display: flex; align-items: center; gap: 6px; color: var(--ink); }
+.grid-scroll th .col-sub { display: block; color: var(--muted); font-weight: 400; font-size: 11px; }
+.grid-scroll th[scope="row"] { width: 160px; border-bottom: 1px solid var(--grid); vertical-align: top; color: var(--ink); }
+.grid-scroll th[scope="row"] .now { display: block; color: var(--muted); font-weight: 400; font-size: 12px; margin-top: 2px; }
+.grid-scroll td { border-bottom: 1px solid var(--grid); vertical-align: top; padding: 8px; }
+.grid-scroll td.self { text-align: center; color: var(--muted); }
+.grid-scroll tr.sum td { background: var(--surface); color: var(--ink-2); padding: 6px 12px 12px; border-bottom: 1px solid var(--axis); }
+.cell { min-height: 44px; min-width: 128px; border-radius: 8px; padding: 5px 9px; display: flex;
+  flex-direction: column; gap: 1px; cursor: pointer; }
+.cell.yes { background: var(--surface); color: var(--ink); box-shadow: 0 0 0 1px var(--axis); }
+.cell.ask { background: var(--ask); color: var(--ask-ink); box-shadow: 0 0 0 1px var(--ask-line); }
+.cell.keep { background: var(--keep); color: var(--keep-ink); box-shadow: 0 0 0 1px var(--keep-line); }
+.cell .pick { display: flex; align-items: center; gap: 6px; }
+.cell select { font: inherit; font-weight: 600; font-size: 13px; color: inherit; background: transparent;
+  border: 0; padding: 2px 0; flex: 1 1 auto; min-width: 0; cursor: pointer; }
+.cell .line { font-size: 11px; line-height: 1.3; }
+.explains { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-top: 12px; }
+.explain { border-radius: 10px; padding: 12px 14px; background: var(--surface); box-shadow: 0 0 0 1px var(--axis); }
+.explain b { display: flex; align-items: center; gap: 6px; font-weight: 650; margin-bottom: 6px; }
+.explain ol { margin: 0; padding-left: 18px; font-size: 12px; color: var(--ink-2); }
+.explain.ask { background: var(--ask); box-shadow: 0 0 0 1px var(--ask-line); color: var(--ask-ink); }
+.explain.ask ol { color: inherit; }
+.explain.keep { background: var(--keep); box-shadow: 0 0 0 1px var(--keep-line); color: var(--keep-ink); }
+.explain.keep ol { color: inherit; }
+.askline { display: flex; align-items: center; gap: 6px 8px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; }
+.inlabel { display: inline-flex; align-items: center; gap: 4px; }
+.inlabel input, .askline input, .askline select, .pline input, .pline select {
+  font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--axis);
+  border-radius: 6px; padding: 4px 6px; cursor: pointer;
+}
+.inlabel input[type="text"], .pline input[type="text"] { cursor: text; }
+.sq { width: 56px; }
+.sq3 { width: 84px; }
+.sq2 { width: 76px; }
+.tryit { background: var(--wash); border-radius: 12px; padding: 14px 16px; }
+.pills { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.pill { min-height: 44px; border-radius: 999px; padding: 6px 14px; font: inherit; font-size: 13px; border: 0;
+  background: var(--surface); color: var(--ink); box-shadow: 0 0 0 1px var(--ring); cursor: pointer; }
+.pill[aria-pressed="true"] { background: var(--ink); color: var(--page); font-weight: 650; }
+.trywhile { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.outcome { border-radius: 10px; padding: 12px 14px; font-size: 13px; background: var(--surface);
+  box-shadow: 0 0 0 1px var(--ring); }
+.outcome b { display: block; font-size: 15px; font-weight: 650; margin-bottom: 2px; }
+.outcome.good { box-shadow: inset 4px 0 0 var(--good), 0 0 0 1px var(--ring); }
+.outcome.warn { box-shadow: inset 4px 0 0 var(--warning), 0 0 0 1px var(--ring); }
+.outcome.info { box-shadow: inset 4px 0 0 var(--s1), 0 0 0 1px var(--ring); }
+.pressure-edit { border-top: 1px solid var(--grid); margin-top: 22px; padding-top: 18px; }
+.pressure-edit .phead { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px 16px; flex-wrap: wrap; }
+.pressure-edit .ptext { min-width: 0; flex: 1 1 420px; }
+.pressure-edit .ptext p { margin: 0; }
+.pressure-edit .seg button { min-height: 40px; min-width: 56px; }
+.pline { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 6px; margin-top: 14px; font-size: 14px; }
+.pline.chips { font-size: 13px; margin-top: 12px; }
+.igchip { display: inline-flex; align-items: center; gap: 2px; background: var(--wash); border-radius: 999px; padding: 0 0 0 10px; }
+.igchip code { font-size: 12px; }
+.igchip button { width: 32px; height: 32px; border: 0; border-radius: 999px; background: transparent;
+  color: var(--ink-2); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
+.soft { height: 32px; border: 0; border-radius: 8px; padding: 0 12px; background: var(--wash); color: var(--ink);
+  font: inherit; cursor: pointer; }
+.vh-only { position: absolute; left: -9999px; }
+#ignoreChips { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.savebar { position: sticky; bottom: 0; z-index: 6; padding: 8px 0 4px; }
+.savebar .box { background: var(--ink); color: var(--page); border-radius: 12px; padding: 12px 14px 12px 18px;
+  display: flex; align-items: center; gap: 12px 16px; flex-wrap: wrap; box-shadow: 0 8px 28px rgba(0,0,0,.22); }
+.savebar .changes { flex: 1 1 420px; min-width: 0; }
+.savebar .changes ul { margin: 4px 0 0; padding-left: 18px; color: var(--page); opacity: .78; font-size: 13px; }
+.savebar .changes li { margin: 2px 0; }
+/* The bar is the page's ink colour with its paper colour written on it, so a warning on it is the
+   page's own bad colour mixed towards that paper: legible on the bar in either theme. */
+.savebar .bad { margin-top: 6px; color: color-mix(in srgb, var(--serious) 55%, var(--page)); font-size: 13px; }
+.savebar button { height: 44px; border: 0; border-radius: 8px; padding: 0 16px; font: inherit; cursor: pointer;
+  background: transparent; color: var(--page); box-shadow: inset 0 0 0 1px var(--ring); }
+.savebar button.primary { background: var(--page); color: var(--ink); font-weight: 650; padding: 0 18px; }
+.savebar button:disabled { opacity: .5; cursor: default; }
+.savebar .saved { background: var(--surface); color: var(--ink); border-radius: 12px; padding: 12px 18px;
+  box-shadow: 0 0 0 1px var(--ring), 0 8px 28px rgba(0,0,0,.12); display: flex; align-items: center; gap: 10px; }
+.savebar .tick { width: 20px; height: 20px; border-radius: 50%; background: var(--good); color: var(--surface);
+  display: inline-flex; align-items: center; justify-content: center; flex: none; }
 
 /* Phones: tighter padding, two tiles a row, tables become stacked rows. */
 @media (max-width: 640px) {
@@ -172,6 +300,11 @@ td.nw { color: var(--ink); }
   .scroll { max-height: 70vh; }
   table, tbody, tr, td { display: block; }
   thead { display: none; }
+  /* ...but not the rules grid: its cells are a matrix, and stacked they answer a question about
+     one pair with five rows. It keeps its table and scrolls inside its own box instead. */
+  .grid-scroll table, .grid-scroll thead, .grid-scroll tbody, .grid-scroll tr { display: revert; }
+  .grid-scroll th, .grid-scroll td { display: revert; border-bottom: 1px solid var(--grid); padding: 8px; }
+  .grid-scroll thead th { background: var(--surface); }
   tr { padding: 8px 0; border-bottom: 1px solid var(--grid); display: grid; grid-template-columns: auto auto 1fr; gap: 2px 10px; }
   td { border: 0; padding: 0; }
   td.wide { grid-column: 1 / -1; color: var(--ink-2); }
@@ -223,12 +356,118 @@ td.nw { color: var(--ink); }
   </section>
 
   <section class="card" id="policy-card">
-    <div class="head"><h2>Who gives way for whom</h2><span class="right" id="policyNote"></span></div>
-    <div class="holders" id="policyRows"></div>
-    <div class="chart-head"><h3>Fits alongside</h3></div>
-    <div class="tiles" id="fitsTiles"></div>
-    <p class="notice" id="fitsNote"></p>
+    <div class="head"><h2>Rules</h2><span class="right">A switch you type yourself always goes through.</span></div>
+    <p class="sub" style="margin:-6px 0 16px">Decide what may unload what. Saved to your config file and used straight away.</p>
+    <div class="warn" id="rulesError" hidden></div>
+    <div class="rules">
+      <div class="col-a">
+        <div>
+          <h3>Unload order</h3>
+          <p class="sub">When more than one could make room, the one at the bottom goes first.</p>
+          <div class="cap">
+            <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path></svg>
+            Kept longest
+          </div>
+          <ol class="order" id="rulesOrder"></ol>
+          <div class="cap after">
+            <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"></path><path d="M6 13l6 6 6-6"></path></svg>
+            Unloaded first
+          </div>
+        </div>
+        <div>
+          <h3>What fits at once</h3>
+          <p class="sub" id="fitsNote"></p>
+          <div class="fits" id="fitRows"></div>
+          <div class="legend" id="fitLegend"></div>
+          <div class="pairs" id="fitPairs"></div>
+        </div>
+      </div>
+      <div class="col-b">
+        <div>
+          <h3>While something is loaded</h3>
+          <p class="sub">Each row is a workload holding the GPU. Each column is what wants it next. The same three choices everywhere.</p>
+          <div class="grid-scroll"><table id="rulesGrid"></table></div>
+          <div class="explains">
+            <div class="explain">
+              <b><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"></path></svg>Make room</b>
+              <ol>
+                <li>A request it is answering always finishes first.</li>
+                <li>It unloads at the first idle moment, in about 2 s. Nothing is closed.</li>
+                <li>It does not wait for a longer job: an agent between two steps counts as idle.</li>
+              </ol>
+            </div>
+            <div class="explain ask">
+              <b><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9a6 6 0 0 1 12 0c0 6 2.5 7.5 2.5 7.5h-17S6 15 6 9z"></path><path d="M10 20a2 2 0 0 0 4 0"></path></svg>Ask me</b>
+              <ol>
+                <li>A notification says when it was last used and asks: unload now, or keep it?</li>
+                <li>You can pause your work first, then answer.</li>
+                <li>A workload waits for your answer. A game can't wait, so it runs with what's left until you answer.</li>
+              </ol>
+            </div>
+            <div class="explain keep">
+              <b><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path></svg>Keep loaded</b>
+              <ol>
+                <li>It stays, and you get a warning.</li>
+                <li>A workload is refused.</li>
+                <li>A game can't be refused, so it runs with what's left.</li>
+              </ol>
+            </div>
+          </div>
+          <div class="askline">
+            <span>If you don't answer an Ask me within</span>
+            <label class="inlabel"><input id="askTimeout" class="sq" type="number" min="1" step="1" aria-label="Minutes to wait for an answer"> min,</label>
+            <select id="askFallback" aria-label="What happens with no answer">
+              <option value="keep">keep it loaded</option>
+              <option value="release">make room</option>
+            </select>
+          </div>
+        </div>
+        <div class="tryit">
+          <h3>Try it</h3>
+          <p class="sub" id="tryHead"></p>
+          <div class="pills" id="tryReqs" role="group" aria-label="What starts"></div>
+          <div class="trywhile" id="tryWhile"></div>
+          <div class="outcome" id="tryOutcome" aria-live="polite"></div>
+        </div>
+      </div>
+    </div>
+    <div class="pressure-edit">
+      <div class="phead">
+        <div class="ptext">
+          <h3>Low VRAM from other apps</h3>
+          <p class="sub">When an app vhotseat doesn't manage (Blender, a script, a browser) squeezes the card, the Low VRAM column above decides what happens. These numbers decide when it counts.</p>
+        </div>
+        <div class="seg" id="pressureToggle" role="group" aria-label="Low VRAM release">
+          <button type="button" id="pressureOn">On</button>
+          <button type="button" id="pressureOff">Off</button>
+        </div>
+      </div>
+      <div id="pressureForm">
+        <div class="pline">
+          <span>When an app grows by</span>
+          <label class="inlabel"><input id="pGrow" class="sq3" type="number" min="500" step="250" aria-label="App growth in MiB"> MiB</label>
+          <span>and free VRAM stays under</span>
+          <label class="inlabel"><input id="pFree" class="sq2" type="number" min="128" step="128" aria-label="Free VRAM floor in MiB"> MiB</label>
+          <span>for</span>
+          <label class="inlabel"><input id="pSustain" class="sq" type="number" min="5" step="5" aria-label="Seconds it has to stay that low"> s,</label>
+          <span>free up</span>
+          <label class="inlabel"><input id="pHeadroom" class="sq3" type="number" min="0" step="250" aria-label="Extra room to free in MiB"> MiB</label>
+          <span>extra. Then wait</span>
+          <label class="inlabel"><input id="pCooldown" class="sq" type="number" min="1" step="1" aria-label="Minutes before it can happen again"> min</label>
+          <span>before doing it again.</span>
+        </div>
+        <div class="pline chips">
+          <span class="sub">Never count these apps:</span>
+          <span id="ignoreChips"></span>
+          <label class="inlabel"><span class="vh-only">App to ignore</span><input id="ignoreNew" type="text" placeholder="e.g. vmware-vmx.exe" style="width:170px"></label>
+          <button type="button" id="ignoreAdd" class="soft">Add</button>
+        </div>
+      </div>
+      <p class="sub" id="pressureOffNote" hidden>Off: nothing is ever unloaded because another app needs room. Games and the rules above still apply.</p>
+    </div>
   </section>
+
+  <div class="savebar" id="savebar" hidden></div>
 
   <section class="card" id="pressure-card" hidden>
     <div class="head"><h2>Pressure</h2><span class="right" id="pressureNote"></span></div>
@@ -302,14 +541,17 @@ const state = { range: 3600, status: null, samples: [], events: [], logs: [], ev
 
 const $ = (id) => document.getElementById(id);
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
-const el = (tag, attrs = {}, text) => {
+const el = (tag, attrs = {}, ...kids) => {
   const ns = ["svg", "path", "line", "rect", "text", "g"].includes(tag) ? "http://www.w3.org/2000/svg" : null;
   const e = ns ? document.createElementNS(ns, tag) : document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
   // A node passed here means a node child, not its toString(): twice now a panel has
-  // rendered "[object HTMLElement]" because a caller passed an element by mistake.
-  if (text instanceof Node) e.append(text);
-  else if (text !== undefined) e.textContent = text;
+  // rendered "[object HTMLElement]" because a caller passed an element by mistake. Several
+  // children can be passed, which is what lets a row of the rules grid be built in one call.
+  for (const kid of kids) {
+    if (kid instanceof Node) e.append(kid);
+    else if (kid !== undefined && kid !== null) e.append(String(kid));
+  }
   return e;
 };
 const gib = (mib) => mib == null ? "–" : (mib / 1024).toFixed(1);
@@ -340,15 +582,21 @@ async function getJSON(url) {
   return body;
 }
 
-// The two POSTs that act on the card, and the policy save: all three send the header and the JSON
+// The POSTs that act on the card and the policy save: all four send the header and the JSON
 // content type the server checks for, which is what a page on somebody else's origin can't send
-// from a form. A cross-origin fetch that could set both needs a preflight the server never answers.
+// from a form. A cross-origin fetch that could set both needs a preflight the server never
+// answers. The status code rides along on the error, because the rules editor has to tell a save
+// the file refused (the message goes next to the bar) from one the file changed under (reload).
 async function postJSON(url, body) {
   const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json",
                                                          "X-Vhotseat-Edit": "1" },
                                body: JSON.stringify(body) });
   const out = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(out.error || r.statusText);
+  if (!r.ok) {
+    const e = new Error(out.error || r.statusText);
+    e.status = r.status;
+    throw e;
+  }
   return out;
 }
 
@@ -367,6 +615,7 @@ async function refresh() {
       getJSON(`/api/logs?${q}&limit=2000`),
       getJSON(`/api/cost?${q}`).catch(() => ({ error: "no power.price_per_kwh in the config" })),
       getJSON("/api/why").catch(() => null),
+      loadPolicy(),               // skipped while the rules editor holds unsaved edits
     ]);
     Object.assign(state, { samples, events, logs, cost, why, since, until, error: null });
   } catch (e) {
@@ -956,38 +1205,482 @@ async function makeRoom(name, button) {
   refresh();
 }
 
-// The config's policy, read-only: what each workload gives way for, what it costs at its
-// worst, and which pairs of them can be on the card at the same time.
-function renderPolicy() {
-  const s = state.status, g = s.gpu || {}, pol = s.policy || {}, peaks = s.peaks || {};
-  const total = g.total_mib || 0;
-  $("policyNote").textContent = "from the config: who may unload what, and in what order";
-  $("policyRows").replaceChildren(...(s.workloads || []).map((n) => {
-    const p = pol[n] || {};
-    const row = el("div", { class: "hrow" });
-    const top = el("div", { class: "top" });
-    top.append(el("b", {}, labelOf(n)), el("span", {}, `priority ${p.priority ?? "–"}`));
-    const bar = el("div", { class: "bar" }), fill = el("i");
-    fill.style.width = total && g[`${n}_mib`] ? `${Math.min(100, Math.round(100 * g[`${n}_mib`] / total))}%` : "0%";
-    fill.style.background = colorOf(n);
-    bar.append(fill);
-    row.append(top, bar, el("div", { class: "who" },
-      `gives way for: ${p.gives_way_for ?? "anyone"} · now ${gib(g[`${n}_mib`])} GiB · peak ${gib(peaks[n])} GiB`));
-    return row;
-  }));
-  const rows = s.fits || [];
-  $("fitsTiles").replaceChildren(...rows.map((f) => {
-    const name = `${labelOf(f.a)} + ${labelOf(f.b)}`;
-    if (f.fits === null || f.fits === undefined) return tile(name, "unknown", "", f.why || "no recorded samples");
-    return tile(name, f.fits ? "fits" : "no room", "", `${gib(f.mib)} of ${gib(total)} GiB at their recorded peaks`,
-      f.fits ? css("--good") : css("--critical"));
-  }));
-  const unknown = rows.filter((f) => f.fits === null).map((f) => `${labelOf(f.a)} + ${labelOf(f.b)}`);
-  $("fitsNote").textContent = rows.length
-    ? `each pair at the most the history recorded each of them holding, plus the ${gib(s.floor)} GiB processes vhotseat doesn't manage usually hold (dwm, a browser, an overlay): their worst hour isn't counted, because a game's memory comes back when it closes` + (unknown.length ? ` · never seen holding models: ${unknown.join(", ")}` : "")
-    : (g.error ? "the card couldn't be read: there's nothing to compare the pairs against"
-               : "one workload on the card: there's no pair to compare");
+// --- the rules editor ---------------------------------------------------------------
+// The card that edits the policy: the unload order, one choice per workload per requester, the
+// `ask:` and `pressure:` numbers, and a bar listing what has not been saved. The three answers and
+// their labels are the design's; what each one *does* is the server's - every cell's three
+// sentences, each row's summary, and the answer to "what would this do?" come from the API. A page
+// that wrote those sentences would be a second account of the rule, and the one that goes stale.
+//
+// The draft (rules.draft) is what the owner has changed; the base (rules.base) is the last policy
+// read from the config file, and the bar is the difference between the two. Polling re-reads the
+// base only while nothing is unsaved, so a refresh can never overwrite a draft.
+const CHOICE_LABEL = { yes: "Make room", ask: "Ask me", keep: "Keep loaded" };
+const CHOICE_ORDER = ["yes", "ask", "keep"];
+// The order is drawn with the workload kept longest at the top, and the order a save posts is an
+// unload order whose first name gives way first - the order the policy API reports - so the save
+// posts the drawn list backwards. This one function holds that turn, and tests/test_web.py runs
+// it, because backwards is every pair in the config swapping on every save.
+function orderToPost(order) {
+  return order.slice().reverse();
 }
+// The low-VRAM numbers the card edits: the id of the input, the config key, the name the change
+// list calls it by, the unit shown, and what divides the config's value into that number
+// (cooldown is kept in seconds and shown in minutes).
+const PRESSURE_FIELDS = [
+  ["pGrow", "grow_mib", "App growth", "MiB", 1],
+  ["pFree", "min_free_mib", "Free VRAM floor", "MiB", 1],
+  ["pSustain", "sustain_s", "Wait before acting", "s", 1],
+  ["pHeadroom", "headroom_mib", "Extra room freed", "MiB", 1],
+  ["pCooldown", "cooldown_s", "Cooldown", "min", 60],
+];
+const ICONS = {
+  yes: '<path d="M5 12.5l4.5 4.5L19 7.5"></path>',
+  up: '<path d="M6 15l6-6 6 6"></path>',
+  down: '<path d="M6 9l6 6 6-6"></path>',
+  x: '<path d="M6 6l12 12M18 6L6 18"></path>',
+};
+const rules = { base: null, draft: null, readError: null, tryReq: "claims", tryOut: null,
+  trySeq: 0, trySit: null, conflict: null, error: null, justSaved: false };
+
+function iconSvg(name, size, width = 2) {
+  const s = el("svg", { viewBox: "0 0 24 24", width: size, height: size, "aria-hidden": "true",
+    fill: "none", stroke: "currentColor", "stroke-width": width, "stroke-linecap": "round",
+    "stroke-linejoin": "round" });
+  s.innerHTML = ICONS[name];
+  return s;
+}
+const keyBox = (id, cls = "key dot") => {
+  const k = el("i", { class: cls });
+  k.style.background = colorOf(id);
+  return k;
+};
+
+// The draft in the shape the page works in, built off the policy the API returned: the unload
+// order drawn kept-longest-first (which is why the save posts it backwards), one choice per cell,
+// and the two number blocks with the ignore list copied rather than shared.
+function draftOf(base) {
+  return { order: base.order.map((o) => o.workload).reverse(),
+    cells: Object.fromEntries(Object.entries(base.matrix).map(([row, cols]) =>
+      [row, Object.fromEntries(Object.entries(cols).map(([col, cell]) => [col, cell.choice]))])),
+    ask: { ...base.ask },
+    pressure: { ...base.pressure, ignore: [...(base.pressure.ignore || [])] } };
+}
+
+// The editor's base: the policy as the config file has it. Read only while nothing is unsaved, so
+// a poll can never overwrite a draft; the save and the bar's Discard/Reload ask for it regardless.
+// Checked again once the answer is in, because an owner can click a cell while the read is on the
+// wire - and what that edit is dirty against is the policy this page was showing when the read
+// began, not the one that has just arrived.
+async function loadPolicy(force) {
+  if (!force && changeList().length) return;
+  try {
+    const base = await getJSON("/api/policy");
+    if (!force && changeList().length) return;
+    rules.base = base;
+    rules.readError = null;
+    rules.draft = draftOf(base);
+  } catch (e) {
+    rules.readError = String(e.message || e);
+  }
+}
+
+const baseOrder = () => rules.base.order.map((o) => o.workload).reverse();
+const tiedOrder = () => rules.base.order.every((o) => o.priority === rules.base.order[0].priority);
+const orderMoved = () => rules.draft.order.join() !== baseOrder().join();
+
+// What is unsaved, in words: the order, each cell that moved with when it applies, the ask's two
+// numbers, and every low-VRAM number by the name the sentence around it gives it.
+function changeList() {
+  if (!rules.base || !rules.draft) return [];
+  const s = rules.base, c = rules.draft, out = [];
+  const named = (order) => order.map(labelOf).join(" › ");
+  if (orderMoved()) {
+    out.push(tiedOrder() ? `Unload order set to ${named(c.order)} (all were equal)`
+      : `Unload order: ${named(c.order)} (was ${named(baseOrder())})`);
+  }
+  const when = (col) => col === "claims" ? "when a game starts"
+    : col === "pressure" ? "on low VRAM" : `when ${labelOf(col)} wants the GPU`;
+  for (const [row, cols] of Object.entries(c.cells)) {
+    for (const [col, v] of Object.entries(cols)) {
+      const was = s.matrix[row][col].choice;
+      if (was === v) continue;
+      out.push(`${labelOf(row)}, ${when(col)}: ${CHOICE_LABEL[v]} (was ${CHOICE_LABEL[was]})`);
+    }
+  }
+  if (s.ask.timeout_s !== c.ask.timeout_s || s.ask.fallback !== c.ask.fallback) {
+    out.push(`No answer after ${c.ask.timeout_s / 60} min: `
+      + (c.ask.fallback === "keep" ? "keep it loaded" : "make room"));
+  }
+  if (s.pressure.enabled !== c.pressure.enabled) {
+    out.push(`Low VRAM release turned ${c.pressure.enabled ? "on" : "off"}`);
+  }
+  for (const [, key, label, unit, scale] of PRESSURE_FIELDS) {
+    if (s.pressure[key] === c.pressure[key]) continue;
+    out.push(`${label}: ${s.pressure[key] / scale} → ${c.pressure[key] / scale} ${unit}`);
+  }
+  if ((s.pressure.ignore || []).join() !== c.pressure.ignore.join()) {
+    out.push(`Ignored apps: ${c.pressure.ignore.length ? c.pressure.ignore.join(", ") : "none"}`);
+  }
+  return out;
+}
+
+// One edit to the draft, then the page and the "try it" answer follow it. The callback runs before
+// anything is redrawn, so a control can hand over the value it was clicked to.
+function editDraft(fn) {
+  if (!rules.draft) return;          // nothing to edit until the policy has been read
+  fn(rules.draft);
+  rules.error = null;
+  rules.justSaved = false;
+  renderRules();
+  askTry();
+}
+
+// What a workload is doing, in the short form the order list and each grid row carry: its own
+// state, what it holds on the card, and when it was last seen working.
+function rulesNow(n, withVram) {
+  const s = state.status, w = s[n] || {}, used = (s.last_used || {})[n] || {};
+  const bits = [workloadState(w)];
+  const held = (s.gpu || {})[`${n}_mib`];
+  if (withVram && held) bits.push(`${gib(held)} GiB`);
+  if (used.phrase) bits.push(used.phrase);
+  return bits.join(" · ");
+}
+
+// The number a row shows before a save is written: the same span the server numbers the order with
+// (10 at one end, 90 at the other, from the order it is posted), so the row can't promise a
+// numbering the save won't write. The file's numbers are the server's; this is only what the row
+// says about a change that hasn't landed yet.
+const prioShown = (i, n) => n <= 1 ? 50 : Math.round(90 - i * (80 / (n - 1)));
+const prioText = (i, n) => tiedOrder() && !orderMoved() ? "Equal priority" : `Priority ${prioShown(i, n)}`;
+
+function moveOrder(i, dir) {
+  editDraft((d) => {
+    const j = i + dir;
+    if (j < 0 || j >= d.order.length) return;
+    const t = d.order[i]; d.order[i] = d.order[j]; d.order[j] = t;
+  });
+}
+
+function moveBtn(id, i, dir) {
+  const b = el("button", { type: "button", class: "move", "data-k": `move:${id}:${dir}`,
+    "aria-label": `Move ${labelOf(id)} ${dir < 0 ? "up" : "down"}` });
+  b.disabled = i + dir < 0 || i + dir >= rules.draft.order.length;
+  b.append(iconSvg(dir < 0 ? "up" : "down", 18));
+  b.onclick = () => moveOrder(i, dir);
+  return b;
+}
+
+function renderOrder() {
+  const d = rules.draft, n = d.order.length;
+  $("rulesOrder").replaceChildren(...d.order.map((id, i) => {
+    const name = el("span", { class: "name" });
+    name.append(el("b", {}, labelOf(id)), el("span", { class: "now" }, `${prioText(i, n)} · ${rulesNow(id)}`));
+    return el("li", {}, el("span", { class: "num" }, String(i + 1)), keyBox(id), name,
+      moveBtn(id, i, -1), moveBtn(id, i, 1));
+  }));
+}
+
+// Each workload at the most it has been *seen* using, on top of what the apps vhotseat doesn't
+// manage usually hold: the same peaks and floor the fits table is worked out from, so the bars and
+// the pair verdicts under them cannot disagree with each other.
+function renderFits() {
+  const s = state.status, g = s.gpu || {}, total = g.total_mib || 0, floor = s.floor || 0;
+  $("fitsNote").textContent = "Each at the most it has been seen using, on top of the "
+    + `${gib(floor)} GiB your desktop apps usually hold.`;
+  const floorPct = total ? Math.min(100, (100 * floor) / total) : 0;
+  $("fitRows").replaceChildren(...(s.workloads || []).map((n) => {
+    const peak = (s.peaks || {})[n];
+    const top = el("div", { class: "top" });
+    top.append(el("b", {}, labelOf(n)), el("span", {}, peak ? `${gib(peak)} GiB at its peak` : "not measured yet"));
+    const base = el("i"), fill = el("i");
+    base.style.width = `${floorPct}%`; base.style.background = css("--other");
+    fill.style.width = peak && total ? `${Math.min(100 - floorPct, (100 * peak) / total)}%` : "0%";
+    fill.style.background = colorOf(n);
+    return el("div", { class: "fit" }, top, el("div", { class: "fitbar" }, base, fill));
+  }));
+  legend("fitLegend", [["", css("--other"), "desktop apps"]]);
+  $("fitLegend").append(el("span", {}, `full bar ${gib(total)} GiB`));
+  const rows = s.fits || [], box = $("fitPairs");
+  box.replaceChildren();
+  if (!rows.length) { box.hidden = true; return; }
+  box.hidden = false;
+  const known = rows.filter((f) => f.fits !== null && f.fits !== undefined);
+  box.append(el("b", {}, known.some((f) => f.fits) ? "Some of these fit together"
+    : known.length ? "Only one of these fits at a time" : "Nothing has been recorded holding models yet"));
+  for (const f of rows) {
+    const verdict = f.fits === null || f.fits === undefined ? ["not known yet", css("--muted")]
+      : f.fits ? [`${gib(f.mib)} GiB · fits`, css("--good")] : [`${gib(f.mib)} GiB · no room`, css("--critical")];
+    const v = el("span", {}, verdict[0]); v.style.color = verdict[1];
+    box.append(el("div", { class: "pair" }, el("span", {}, `${labelOf(f.a)} + ${labelOf(f.b)}`), v));
+  }
+}
+
+function cellControl(row, col) {
+  const saved = rules.draft.cells[row][col.id];
+  const pick = el("span", { class: "pick" });
+  pick.append(iconSvg(saved, 15, saved === "yes" ? 2.2 : 2));
+  const sel = el("select", { "data-k": `cell:${row}:${col.id}`,
+    "aria-label": `While ${labelOf(row)} is loaded and ${col.phrase} wants the GPU` });
+  for (const c of CHOICE_ORDER) sel.append(el("option", { value: c }, CHOICE_LABEL[c]));
+  sel.value = saved;
+  sel.onchange = () => editDraft((d) => { d.cells[row][col.id] = sel.value; });
+  pick.append(sel);
+  return el("label", { class: `cell ${saved}` }, pick,
+    // The line under the choice is the server's sentence for the choice now showing, so picking
+    // Ask me says what Ask me does before the save that would make it true.
+    el("span", { class: "line" }, rules.base.says_for[row][col.id][saved]));
+}
+
+function renderGrid() {
+  const base = rules.base;
+  const head = el("tr");
+  head.append(el("th", { scope: "col" }, "If this is loaded…"));
+  for (const c of base.requesters) {
+    const label = el("span", { class: "col-head" });
+    label.append(keyBox(c.id, "key"), c.label);
+    const th = el("th", { scope: "col" }, label);
+    if (c.sub) th.append(el("span", { class: "col-sub" }, c.sub));
+    head.append(th);
+  }
+  const body = el("tbody");
+  for (const row of Object.keys(base.matrix)) {
+    const label = el("span", { class: "col-head" });
+    label.append(keyBox(row), labelOf(row));
+    const th = el("th", { scope: "row" }, label, el("span", { class: "now" }, rulesNow(row)));
+    const tr = el("tr", {}, th);
+    for (const c of base.requesters) {
+      if (c.id === row) {
+        tr.append(el("td", { class: "self" }, el("span", { "aria-label": "Same workload" }, "—")));
+      } else tr.append(el("td", {}, cellControl(row, c)));
+    }
+    body.append(tr);
+    // The row's own summary is the server's too: it is what the whole row adds up to, and a
+    // sentence the page stitched together would be one more place to disagree.
+    body.append(el("tr", { class: "sum" }, el("td", { colspan: base.requesters.length + 1 },
+      (base.summaries || {})[row] || "")));
+  }
+  $("rulesGrid").replaceChildren(el("thead", {}, head), body);
+}
+
+// The workload on the card, as the arbiter means it, and the "try it" answer from the server for
+// the draft grid this page is holding: the state the outcome is about is the card's, not a state
+// the page could set to demo a rule.
+function tryHolder() {
+  const m = state.status.mode;
+  return state.status.workloads.includes(m) ? m : null;
+}
+const tryLabel = (r) => r.id === "claims" ? "A game"
+  : r.id === "pressure" ? "Another app needs room" : r.label;
+
+// What the answer on screen is about: who is loaded, what it is doing, roughly how much it holds,
+// how recently it was working, and which newcomer was chosen. When that moves, the sentence in the
+// box belongs to a card that no longer exists, so it is asked again - and the rounding is what
+// keeps a GPU whose figure moves every second from asking again on every poll.
+function trySituation() {
+  const s = state.status, h = tryHolder();
+  if (!h) return `none|${rules.tryReq}`;
+  const used = (s.last_used || {})[h] || {};
+  const ago = used.ago_s == null ? "never"
+    : used.ago_s < (rules.base ? rules.base.ask.timeout_s : 120) ? "recent" : "long";
+  return [h, workloadState(s[h] || {}), Math.round(((s.gpu || {})[`${h}_mib`] || 0) / 512), ago,
+    rules.tryReq].join("|");
+}
+
+function renderTry() {
+  const holder = tryHolder();
+  $("tryHead").textContent = holder ? `${labelOf(holder)} is on the card. If this starts:`
+    : "Nothing is on the card. If this starts:";
+  if (rules.tryReq === holder) rules.tryReq = rules.base.requesters.find((r) => r.id !== holder).id;
+  $("tryReqs").replaceChildren(...rules.base.requesters.filter((r) => r.id !== holder).map((r) => {
+    const b = el("button", { type: "button", class: "pill", "data-k": `try:${r.id}`,
+      "aria-pressed": String(r.id === rules.tryReq) }, tryLabel(r));
+    b.onclick = () => { rules.tryReq = r.id; rules.tryOut = null; renderTry(); askTry(); };
+    return b;
+  }));
+  const line = $("tryWhile");
+  line.replaceChildren();
+  if (holder) {
+    line.append(el("span", { class: "sub" }, "…while "), el("b", { class: "sub" }, labelOf(holder)),
+      el("span", { class: "sub" }, ` is ${rulesNow(holder, true)}`));
+  }
+  const out = $("tryOutcome");
+  out.className = "outcome";
+  out.replaceChildren();
+  const sit = trySituation();
+  if (sit !== rules.trySit) { rules.trySit = sit; rules.tryOut = null; askTry(); }
+  if (!rules.tryOut) { out.append(el("span", { class: "sub" }, "working out what this would do…")); return; }
+  out.classList.add(rules.tryOut.tone);
+  out.append(el("b", {}, rules.tryOut.title), el("span", {}, rules.tryOut.detail));
+}
+
+let tryTimer;
+function askTry() {
+  clearTimeout(tryTimer);
+  tryTimer = setTimeout(fetchTry, 250);
+}
+
+async function fetchTry() {
+  const seq = ++rules.trySeq;
+  const answer = (out) => { if (seq === rules.trySeq) { rules.tryOut = out; renderTry(); } };
+  try {
+    answer(await postJSON("/api/policy/preview", { requester: rules.tryReq, workload: tryHolder(),
+      matrix: rules.draft.cells, ask: rules.draft.ask, pressure: { enabled: rules.draft.pressure.enabled } }));
+  } catch (e) {
+    answer({ tone: "info", title: "No answer from the dashboard", detail: String(e.message || e) });
+  }
+}
+
+// Set a control's value without taking it from whoever is typing in it: a field rewritten under an
+// owner mid-edit puts their caret back at the start of the number.
+function setVal(node, value) {
+  if (document.activeElement === node) return;
+  if (node.value !== String(value)) node.value = value;
+}
+
+function renderPressureEdit() {
+  const p = rules.draft.pressure;
+  $("pressureOn").setAttribute("aria-pressed", String(!!p.enabled));
+  $("pressureOff").setAttribute("aria-pressed", String(!p.enabled));
+  $("pressureForm").hidden = !p.enabled;
+  $("pressureOffNote").hidden = !!p.enabled;
+  for (const [id, key, , , scale] of PRESSURE_FIELDS) setVal($(id), p[key] / scale);
+  $("ignoreChips").replaceChildren(...p.ignore.map((name, i) => {
+    const b = el("button", { type: "button", "data-k": `ig:${i}`, "aria-label": `Stop ignoring ${name}` });
+    b.append(iconSvg("x", 12, 2.4));
+    b.onclick = () => editDraft((d) => { d.pressure.ignore.splice(i, 1); });
+    return el("span", { class: "igchip" }, el("code", {}, name), b);
+  }));
+}
+
+function pressureToPost() {
+  const p = rules.draft.pressure, out = { enabled: p.enabled, ignore: p.ignore };
+  for (const [, key] of PRESSURE_FIELDS) out[key] = p[key];
+  return out;
+}
+
+async function saveRules() {
+  for (const b of $("savebar").querySelectorAll("button")) b.disabled = true;
+  try {
+    await postJSON("/api/policy", { version: rules.base.version, priorities: orderToPost(rules.draft.order),
+      matrix: rules.draft.cells, ask: rules.draft.ask, pressure: pressureToPost() });
+    rules.conflict = null; rules.error = null; rules.justSaved = true;
+    rules.base = null; rules.draft = null;
+    await loadPolicy(true);
+    askTry();
+    renderRules();
+    setTimeout(() => { rules.justSaved = false; renderRules(); }, 10000);
+  } catch (e) {
+    // A 409 is the file having changed since this page read it. Nothing was written; the page says
+    // so and offers to re-read it. It never merges its draft into what it finds there, because
+    // that would be an edit nobody made.
+    if (e.status === 409) rules.conflict = e.message; else rules.error = e.message;
+    renderRules();
+  }
+}
+
+function renderSavebar() {
+  const bar = $("savebar"), list = changeList();
+  bar.replaceChildren();
+  if (rules.justSaved && !list.length) {
+    bar.hidden = false;
+    const tick = el("span", { class: "tick" }); tick.append(iconSvg("yes", 12, 3));
+    const box = el("div", { class: "saved", role: "status" }, tick);
+    box.append(el("span", {}, el("b", {}, "Saved."), " Your config file is updated (the previous "
+      + "version is kept as a backup), and the dashboard and gates use the new rules now."));
+    bar.append(box);
+    return;
+  }
+  if (!list.length) { bar.hidden = true; return; }
+  bar.hidden = false;
+  const left = el("div", { class: "changes" });
+  left.append(el("b", {}, list.length === 1 ? "1 unsaved change" : `${list.length} unsaved changes`));
+  const ul = el("ul");
+  for (const c of list) ul.append(el("li", {}, c));
+  left.append(ul);
+  if (rules.conflict) {
+    left.append(el("div", { class: "bad" }, "The config file changed since this page loaded. Nothing "
+      + "was written: reload to see what it says now, then save again if you still want these rules."));
+  } else if (rules.error) left.append(el("div", { class: "bad" }, rules.error));
+  const box = el("div", { class: "box" }, left);
+  const reload = el("button", { type: "button" }, rules.conflict ? "Reload" : "Discard");
+  reload.onclick = () => {
+    rules.conflict = null; rules.error = null;
+    loadPolicy(true).then(() => { renderRules(); askTry(); });
+  };
+  box.append(reload);
+  const save = el("button", { type: "button", class: "primary" }, "Save rules");
+  save.onclick = saveRules;
+  box.append(save);
+  bar.append(box);
+}
+
+function renderRules() {
+  const s = state.status, err = $("rulesError");
+  err.hidden = !s.config_error;
+  if (s.config_error) {
+    // What the grid shows is the last set of rules that read, because that is what the arbiter is
+    // still acting on. Saying so is the point: a page that quietly keeps showing the previous
+    // policy is how an owner believes a protection is in force when it isn't.
+    err.replaceChildren(el("div", { class: "whead" }, "The config file has an error"),
+      el("div", {}, `${s.config_error}. The rules in force are the last good ones, not what the `
+        + "file says now, and a save is refused until the file reads again."));
+  }
+  if (!rules.base || !rules.draft) {
+    const why = rules.readError || "reading the rules from the config file…";
+    $("rulesOrder").replaceChildren(el("li", {}, why));
+    $("rulesGrid").replaceChildren(el("tbody", {}, el("tr", {}, el("td", {}, why))));
+    renderSavebar();
+    return;
+  }
+  // The rebuilt parts keep their keyboard focus: this card redraws on every poll and every click,
+  // and would otherwise drop the owner out of the control they are in.
+  const at = document.activeElement, key = at && at.dataset ? at.dataset.k : null;
+  const caret = key && at.setSelectionRange ? [at.selectionStart, at.selectionEnd] : null;
+  renderOrder();
+  renderFits();
+  renderGrid();
+  renderTry();
+  renderPressureEdit();
+  setVal($("askTimeout"), rules.draft.ask.timeout_s / 60);
+  setVal($("askFallback"), rules.draft.ask.fallback);
+  renderSavebar();
+  if (key) {
+    const again = document.querySelector(`[data-k="${CSS.escape(key)}"]`);
+    if (again) { again.focus(); if (caret) again.setSelectionRange(caret[0], caret[1]); }
+  }
+}
+
+// The controls that aren't rebuilt on every render are wired once.
+$("pressureOn").onclick = () => editDraft((d) => { d.pressure.enabled = true; });
+$("pressureOff").onclick = () => editDraft((d) => { d.pressure.enabled = false; });
+for (const [id, key, , , scale] of PRESSURE_FIELDS) {
+  $(id).oninput = (e) => {
+    const v = parseFloat(e.target.value);
+    if (!Number.isFinite(v)) return;
+    editDraft((d) => { d.pressure[key] = Math.round(v * scale); });
+  };
+}
+$("askTimeout").oninput = (e) => {
+  const v = parseInt(e.target.value, 10);
+  if (!Number.isFinite(v) || v < 1) return;
+  editDraft((d) => { d.ask.timeout_s = v * 60; });
+};
+$("askFallback").onchange = (e) => editDraft((d) => { d.ask.fallback = e.target.value; });
+$("ignoreAdd").onclick = () => {
+  const v = $("ignoreNew").value.trim();
+  if (!v) return;
+  editDraft((d) => { if (!d.pressure.ignore.includes(v)) d.pressure.ignore.push(v); });
+  $("ignoreNew").value = "";
+};
+$("ignoreNew").onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); $("ignoreAdd").click(); } };
+// A closed tab loses an unsaved draft without a trace, and the bar that says so sits at the bottom
+// of a long page.
+window.addEventListener("beforeunload", (e) => {
+  if (!changeList().length) return;
+  e.preventDefault();
+  e.returnValue = "";
+});
 
 // The pressure trigger, read-only: the numbers it is reading now, and what an episode running in
 // front of the owner - or the last one that ran, after the fact - is doing about them. They come
@@ -1103,7 +1796,7 @@ function renderCharts() {
   renderHolders();
   renderWhy();
   renderWarnings();
-  renderPolicy();
+  renderRules();
   renderPressure();
   renderGpu();
   renderCost();

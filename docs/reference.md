@@ -209,8 +209,8 @@ enforced wherever vhotseat decides to unload something, and its direction matter
 
 `priority:` orders the workloads that *may* be unloaded - the lowest is asked first - and
 never overrules `yields_to:` or `asks_for:`. All three are shown by `vhotseat status` and
-`vhotseat why`, and edited through `GET`/`POST /api/policy`; the page that edits them is
-still to come.
+`vhotseat why`, and edited through `GET`/`POST /api/policy`: the **Rules** card of
+`vhotseat web` writes them.
 
 ## Talking to a server that isn't a plain server
 
@@ -374,11 +374,16 @@ One page, refreshed every 5 s, that works on a phone too:
 - **VRAM** and **RAM / Swap**: per workload, stacked against the totals.
 - **Power cost**: what the card's watts cost across the range you're looking at, in
   total and per holder, plus what it's drawing right now. Needs `power.price_per_kwh`.
-- **Who gives way for whom**: the policy as the config has it - each workload's priority,
-  what it gives way for, what it holds on the card now and what the history has seen it
-  holding at most - and for every pair of workloads a tile saying whether they fit on the
-  card at the same time. Read-only on the page for now; `GET`/`POST /api/policy` (below)
-  reads and writes the keys, and the page that edits them is the next part.
+- **Rules**: the policy as an editor. The unload order (kept longest at the top, moved with
+  up/down buttons), one `<select>` per workload per requester - Make room, Ask me, Keep loaded -
+  with the sentence saying what that choice does for that pair under it and the sentence the whole
+  row adds up to under that, each workload's peak against the card and which pairs of them fit at
+  the same time, the `ask:` wait and fallback, and the `pressure:` numbers with the apps never
+  counted as growers. "Try it" answers what a chosen newcomer would meet on the card *now*, for
+  rules you have not saved yet (`POST /api/policy/preview`). What is not saved is listed in a bar
+  at the bottom of the page; "Save rules" writes them and the processes on the box are running
+  them a moment later. The page never works out a consequence for itself: every sentence is the
+  server's, from the same two keys the arbiter reads.
 - **An open Ask me**: when a pair's answer is *ask me*, the question itself sits at the top
   of the page - what the workload holds, when it was last seen working, how long is left
   before the fallback applies, and the two buttons - in the same words the notification
@@ -407,12 +412,15 @@ running process.
 
 | Route | Returns |
 |---|---|
-| `GET /api/policy` | what the grid needs: the workloads in the order a handover unloads them, the columns a pair can be asked for (each other workload, `claims`, `pressure`), each cell's choice (`yes` / `ask` / `keep`) with the sentence saying what it does and why, the `ask:` and `pressure:` numbers, and a `version` (sha256 of the config file) to send back with a save. Grid and version are read from the file in one go, and those rules are what this process then acts on: rules remembered from an older file beside a version read fresh is how a save would write someone's hand-edit away and report success. A file that stopped being a config keeps the rules that were in force and carries `config_error` in the answer |
+| `GET /api/policy` | what the grid needs: the workloads in the order a handover unloads them, the columns a pair can be asked for (each other workload, `claims`, `pressure`, each with the words it reads by in the middle of a sentence), each cell's choice (`yes` / `ask` / `keep`) with the sentence saying what it does and why, `says_for` (the same again for all three choices, so a cell that hasn't been saved already says what picking it would do), `summaries` (what each whole row adds up to), the `ask:` and `pressure:` numbers, and a `version` (sha256 of the config file) to send back with a save. Grid and version are read from the file in one go, and those rules are what this process then acts on: rules remembered from an older file beside a version read fresh is how a save would write someone's hand-edit away and report success. A file that stopped being a config keeps the rules that were in force and carries `config_error` in the answer |
+| `POST /api/policy/preview` | `{title, detail, tone}`: what one cell of a grid that has not been saved would do, for the card as it is. Body: `requester` (required), and any of `workload` (whichever is on the card - the default is whoever `status` says holds it), `matrix`, `ask`, `pressure`. Read-only: no config write, no log row, no release, and the workload's state - working now, used a moment ago so it may be mid-task, idle, or never stamped - is read with the same GETs a status read costs. A free card is answered as a free card. `400` for a requester or workload the grid doesn't have, a choice that isn't one of the three, or a non-numeric `ask.timeout_s` |
 | `POST /api/policy` | `{"version": "..."}` when the file now says what was posted. Body: `version` (required) and any of `priorities` (the unload order), `matrix` (`{workload: {requester: "yes"\|"ask"\|"keep"}}`), `ask`, `pressure` - a key left out is left alone. `409` with the version that's on disk when the file changed since it was read (or without one, when another save is midway through the file and this one should simply try again); `400` with what `doctor` would say, when the result wouldn't load |
 | `POST /api/asks/<id>` | the ask as it now reads: `{ask: {...}}`. Body: `{answer: "release"\|"keep"}`. The id is the row's own, so an answer belongs to the question that was opened - its numbers, its timeout, its fallback - and not to whatever the pair looks like now. `409` for an ask answered or closed already - closed meaning answered, or retired without an answer because the game it was asked about has gone (the first answer wins, whoever wrote it: a notification's button, the page's button and a watcher applying the fallback all go through this call, and the check that the ask is still open plus the row answering it are written in one turn of the log, so which answer won is decided in the file rather than in a reading of it)); `404` for an id the log doesn't hold; `400` for a body that isn't one of the two answers; `503` when the log is held by a writer that wouldn't let go, which says plainly that nothing was written and the question is still open. Nothing is unloaded by this call: it writes the answer, and whoever owes the release - the request that waited, a watcher's next poll, the episode - acts on it through the normal path, which is what keeps a request in flight from being cut off |
 | `POST /api/make-room` | what the switch did: `{ok, done}`. Body: `{for: "workload"}`. The warning's "make room for X": one workload gets the card now whatever the rules say about who would have been refused, recorded as `policy-override` exactly as a `switch` typed at a terminal is, and asking nothing - not even a claim, since a person clicked it. It changes no rule and writes no config: wanting room this once and wanting the rule moved are different answers, and the second one belongs in the grid. `400` for a workload that isn't configured |
 
-The POSTs are guarded three ways, because a config and an unload are not page-refreshes: the
+The POSTs are guarded three ways, because a config and an unload are not page-refreshes, and
+the preview is guarded with them although it writes nothing: what it reads back is the owner's
+rules next to their live card, against a draft this page never showed. The
 `X-Vhotseat-Edit: 1` header, `Content-Type: application/json` - a page on another origin
 can set neither from a form, and to set both from a script it needs a preflight this server
 never answers - and an `Origin` that is this dashboard's own port when an `Origin` is sent at

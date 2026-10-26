@@ -3,15 +3,19 @@ CLI, read back by the dashboard's API, and pruned after their retention."""
 
 import datetime
 import json
+import re
+import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import urllib.request
+from pathlib import Path
 
 import pytest
 from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, STRATA_VRAM
 
-from vhotseat import claims, config, host, telemetry, util, web
+from vhotseat import claims, config, host, pressure, telemetry, util, web
 from vhotseat.telemetry import Telemetry
 
 
@@ -707,4 +711,66 @@ def test_nothing_on_the_card_is_answered_as_nothing(rig, server):
     assert code == 200 and out["tone"] == "info"
     assert out["title"] == "Nothing is loaded"
     assert out["detail"] == "Nothing is on the card right now, so this would not unload anything."
+# --- the page's own script, run without a browser --------------------------------------
+
+WEB_HTML = Path(__file__).resolve().parents[1] / "src" / "vhotseat" / "web.html"
+
+
+def page_script() -> str:
+    """The dashboard's script: the one at the end of the page, not the two-line theme snippet in
+    its head."""
+    text = WEB_HTML.read_text(encoding="utf-8")
+    start = text.index('<script>\n"use strict"')
+    return text[text.index("\n", start) + 1:text.rindex("</script>")]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this box")
+def test_the_page_script_is_still_a_script(tmp_path):
+    """The page is one script of plain JS with no build step and no JS test runner of its own, so
+    the free check on it is the parser's: a stray brace here is a dashboard that draws nothing at
+    all while every test in this file still passes."""
+    js = tmp_path / "page.js"
+    js.write_text(page_script(), encoding="utf-8")
+    done = subprocess.run([shutil.which("node"), "--check", str(js)], capture_output=True,
+                          text=True)
+    assert done.returncode == 0, done.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this box")
+def test_the_order_the_page_posts_is_the_reverse_of_the_order_it_draws(tmp_path):
+    """The list is drawn with the workload kept longest at the top, and the order a save posts is
+    an unload order whose first name gives way first - the order `GET /api/policy` reports - so
+    the save has to post the drawn list backwards. That one reversal is where the editor can get
+    the direction backwards, and backwards means every pair in the config swaps on every save:
+    the workload the owner just put last is the next one unloaded. So the helper is taken out of
+    the page and run."""
+    script = page_script()
+    helper = re.search(r"function orderToPost\(order\) \{[^{}]*\}", script)
+    assert helper, "the page has no orderToPost to check"
+    assert "orderToPost(rules.draft.order)" in script, "the save does not post through the helper"
+    done = subprocess.run([shutil.which("node"), "-e", helper.group(0) +
+                           "\nconsole.log(JSON.stringify(orderToPost([" +
+                           "'strata', 'comfy', 'unsloth'])))"], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == ["unsloth", "comfy", "strata"]
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this box")
+def test_the_low_vram_inputs_are_the_config_keys_in_the_units_the_page_shows(tmp_path):
+    """The Low VRAM block edits `pressure:` through five number inputs set in a sentence, four of
+    which show the config's own unit and one of which shows minutes where the file keeps seconds.
+    A key misspelled there is a number that looks saved and was never written; a scale wrong by 60
+    is a cooldown of ten hours typed as ten minutes. So the page's field list is run and compared
+    with the keys the trigger itself reads."""
+    block = re.search(r"const PRESSURE_FIELDS = \[.*?\n\];", page_script(), re.S)
+    assert block, "the page has no PRESSURE_FIELDS to check"
+    done = subprocess.run([shutil.which("node"), "-e", block.group(0)
+                           + "\nconsole.log(JSON.stringify(PRESSURE_FIELDS))"],
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    shown = {f[1]: (f[3], f[4]) for f in json.loads(done.stdout)}
+    assert shown == {"grow_mib": ("MiB", 1), "min_free_mib": ("MiB", 1), "sustain_s": ("s", 1),
+                     "headroom_mib": ("MiB", 1), "cooldown_s": ("min", 60)}
+    # end_margin_mib is deliberately not on the page: it decides when a release episode *stops*,
+    # which an owner watching one can read in the Pressure card but has no reason to tune.
+    assert set(shown) | {"end_margin_mib"} == set(pressure.KEYS) - {"enabled", "ignore"}
 
