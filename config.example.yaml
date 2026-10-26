@@ -88,12 +88,14 @@ workloads:
     #                              # rather than unloaded over, and the refusal is logged
     #                              # and shown. A `switch` you type is an order and goes
     #                              # through whatever this says.
-    # asks_for: [claims]          # ask me first, instead of making room or keeping loaded:
-    #                              # the same names as yields_to, without the "*" (an ask has
-    #                              # to say who is asking). It cannot be named in both keys.
-    #                              # The asking isn't built yet, so today an entry here keeps
-    #                              # it loaded exactly as if yields_to left it out - and
-    #                              # `vhotseat status` says it is asking, not refusing.
+    # asks_for: [claims]          # ask me first, instead of unloading or refusing: the same
+    #                              # names as yields_to, without the "*" (an ask has to say who
+    #                              # is asking). It cannot be named in both keys. You get a
+    #                              # notification, and a card on the dashboard, saying what it
+    #                              # holds and when it was last working. A load nobody chose
+    #                              # waits for your answer; a game or an app that grew keeps
+    #                              # running meanwhile and gets the release as soon as the answer
+    #                              # arrives. No answer within ask.timeout_s does ask.fallback.
 
   comfy:
     driver: comfyui    # built-in: /queue, /free, restart when /free isn't enough
@@ -218,10 +220,9 @@ power:
 #                                      # A workload whose yields_to: doesn't list "pressure" is not
 #                                      # a candidate whatever else the numbers say.
 #
-# ask: what an "asks_for:" wait is worth - how long vhotseat holds a handover still, and what
-# it does when nobody answers. The asking isn't built yet: nothing waits, nothing notifies you,
-# and a workload named in asks_for: stays loaded. These keys are recorded now so the asking has
-# something written to be built against, and so the editor can show you what it will do.
+# ask: what an "asks_for:" question is worth - how long a load nobody chose waits for your
+# answer, and what happens when nobody gives one. A workload named in asks_for: is never unloaded,
+# and never refused outright, without one of those two answers: yours, or nobody answering in time.
 # ask:
 #   timeout_s: 120                   # how long to wait for your answer
-#   fallback: keep                   # keep (leave it loaded, as now) or release (unload it)
+#   fallback: keep                   # keep (leave it loaded) or release (unload it anyway)
