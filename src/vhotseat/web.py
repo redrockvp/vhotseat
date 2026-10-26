@@ -625,13 +625,14 @@ def claim_transitions(arbiter, hits: list[dict]) -> None:
         events.record("claim-end", source="watch", pid=row.get("pid"), name=key[0], note=key[1],
                       processes=n)
         util.log(f"{key[0]}" + (f" x{n}" if n > 1 else "") + " is gone: the card is open to loads again")
-        # And the questions it was still asking go with it. A claim's ask is asked *about that
-        # process*: once it has exited there is nothing for an answer to free, so an open question
-        # left behind is a countdown the owner is invited to act on for a game that is gone - and
-        # the next game that matches the rule must not be joined to it. `ask_before_release` only
-        # asks again when nothing is open for the pair, so an unanswered question also stops the new
-        # game's own question, and its toast, from ever being raised.
-        arbiter.end_claim_asks(row)
+        # And the questions that claim was asking go with it. A question is asked *about that
+        # process*: once it has exited there is nothing left for an answer to free, and an open
+        # question left behind is a countdown the owner is invited to act on for a game that is
+        # gone. It closes that claim's questions and no others: a second game still playing keeps
+        # its own question and its own toast, and the next claim under the same rule is a different
+        # scope, so it is asked its own.
+        arbiter.end_scope_asks(policy.CLAIMS, arbiter.claim_scope(row.get("pid")),
+                               closed_by="claim-ended", says=arbiter.ended_says(row))
     state = events.claims_open()             # ours are in the record now
     for key, group in now.items():
         if (group[0].get("on_start") or "release") != "release":
@@ -806,6 +807,14 @@ def pressure_pass(arbiter, claimed: set = frozenset()) -> None:
     if reason:
         events.record("pressure-end", source="watch", name=ep["episode"].get("name"),
                       reason=reason, freed_mib=ep.get("freed_mib") or 0)
+        # The questions this episode was asking end with it, and only these: `cooldown_s` can be
+        # shorter than `ask.timeout_s`, so the next shortness of the same card can arrive while the
+        # old episode's question is still counting down, and an answer to that one would authorise
+        # an unload for an episode that is already over.
+        arbiter.end_scope_asks(
+            policy.PRESSURE, arbiter.episode_scope(ep["episode"]), closed_by="episode-ended",
+            says=f"{reason}: the question was asked about that episode, and there is nothing left "
+                 "to free for it")
         util.log(f"pressure: {reason}: the card is open to loads again")
         return
 

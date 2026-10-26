@@ -29,9 +29,9 @@ import pytest
 from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, STRATA_VRAM
 from test_claim_release import NAME, NOTE, claim_rule, running_render
 from test_policy_api import get, post, rig_config_text
-from test_pressure_episode import scene
+from test_pressure_episode import samples, scene
 
-from vhotseat import api, arbiter, events, lock, notify, policy, setup, web
+from vhotseat import api, arbiter, claims, events, host, lock, notify, policy, setup, web
 from vhotseat.lock import Held
 
 
@@ -554,32 +554,98 @@ def test_a_question_for_a_game_that_has_gone_is_closed_not_carried(rig, monkeypa
         "the answer to the new game's own question did not free the card for it"
 
 
-def test_a_claim_does_not_join_a_question_asked_about_another_process(rig):
-    """The join itself is checked, at the seam that does it: `ask_now` is handed the claim's pid,
-    and an open question whose pid is somebody else's is not this claim's question - so it is
-    retired the same way, and a fresh one is raised for the process that is asking now.
+def claim_two_games(rig, monkeypatch):
+    """Two games claiming the card at once - two rules, two processes, both owed the same
+    workload - in the fake process table. Returns the table: take one game out of it and that
+    claim ends while the other carries on. One question per (workload, reason) cannot serve this:
+    the two games want different answers, and one of them would spend the whole game with a
+    question that was really asked about the other."""
+    arb = rig.arb
+    monkeypatch.setattr(arb, "claim_rules", claims.rules(
+        [{"name": NAME, "note": NOTE, "on_start": "release"},
+         {"name": "Hades.exe", "note": "Hades", "on_start": "release"}], builtin=False))
+    monkeypatch.setattr(arb, "claim_ignore", claims.ignores())
+    procs = {
+        4242: {"pid": 4242, "ppid": 4, "name": NAME, "exe": r"D:\Libraries\elden\EldenRing.exe"},
+        9999: {"pid": 9999, "ppid": 7, "name": "Hades.exe", "exe": r"D:\Libraries\hades\Hades.exe"},
+    }
+    monkeypatch.setattr(host, "processes", lambda: procs)
+    return procs
 
-    This is the safety net behind the claim ending retiring its own asks. A question that somehow
-    outlives its claim - the log busy when the end was noticed, a watch that started up over a log
-    written by another one - must not be what the next game is joined to: `asks_for` already refuses
-    that answer by pid, so the card would say Unload now and the release would walk past it."""
-    first = rig.arb.ask_now("strata", policy.CLAIMS, held_mib=STRATA_VRAM, source="watch",
-                            name=NAME, note=NOTE, pid=4242, held=True)
-    again = rig.arb.ask_now("strata", policy.CLAIMS, held_mib=STRATA_VRAM, source="watch",
-                            name=NAME, note=NOTE, pid=9999, held=True)
-    assert again["id"] != first["id"], "the new process joined the old process's question"
-    assert again["pid"] == 9999 and rig.arb.events.ask_by_id(first["id"])["closed_by"] == \
-        "claim-restarted"
-    assert "4242" in rig.arb.events.ask_by_id(first["id"])["closed_reason"]
-    assert [a["id"] for a in rig.arb.notify.asks] == [first["id"], again["id"]], \
-        "the second question came with no notification of its own"
-    assert rig.arb.answer_ask(first["id"], policy.RELEASE)[0] == 409
-    assert [a["id"] for a in rig.arb.events.open_asks()] == [again["id"]]
-    # and a claim that is the same process keeps the question it already has
-    same = rig.arb.ask_now("strata", policy.CLAIMS, held_mib=STRATA_VRAM, source="watch",
-                           name=NAME, note=NOTE, pid=9999, held=True)
-    assert same["id"] == again["id"], "the same game got asked twice"
-    assert len(rig.arb.notify.asks) == 2
+
+def test_two_games_asking_about_one_workload_each_get_their_own_question(rig, monkeypatch):
+    """A question belongs to the thing that wants the memory freed, and that is part of what it is,
+    not something checked afterwards: a claim's questions belong to the game process that took the
+    card, an episode's to that episode, and a load nobody chose has no scope beyond the requester it
+    is named for.
+
+    Two games on one card wanting the same workload unloaded are two things wanting an answer. One
+    question between them means one of them runs the whole game with a countdown that was asked
+    about the other, an answer that releases for the wrong claim, and - worse, because it looks like
+    it worked - an Unload now that answers 200 and does nothing. So both are asked, each with its
+    own card and its own toast, and when one game exits it takes only its own question with it."""
+    procs = claim_two_games(rig, monkeypatch)
+    ask_first(rig, strata=["claims"])
+    rig.strata.loaded = True
+    web.watch(rig.arb, polls=1)
+
+    asked = {a["pid"]: a for a in rig.arb.events.open_asks()}
+    assert sorted(asked) == [4242, 9999], "one question for two games: one of them can never answer"
+    assert {a["id"] for a in rig.arb.notify.asks} == {a["id"] for a in asked.values()}, \
+        "a game playing with no question in front of it"
+    assert (asked[4242].get("scope"), asked[9999].get("scope")) == ("pid4242", "pid9999")
+    assert rig.arb.asks_for(policy.CLAIMS, "pid4242")["strata"]["id"] == asked[4242]["id"]
+    assert rig.arb.asks_for(policy.CLAIMS, "pid9999")["strata"]["id"] == asked[9999]["id"]
+
+    del procs[9999]                                   # Hades exits; Elden Ring keeps playing
+    web.watch(rig.arb, polls=1)
+    assert [(r["id"], r["closed_by"]) for r in rows(rig, "ask-end")] == \
+        [(asked[9999]["id"], "claim-ended")], "the wrong game's question closed, or none did"
+    assert [a["id"] for a in rig.arb.events.open_asks()] == [asked[4242]["id"]], \
+        "the game still playing lost its question because the other one went away"
+    assert rig.arb.answer_ask(asked[4242]["id"], policy.RELEASE)[0] == 200, \
+        "the question of a game that is still running was not answerable"
+    web.watch(rig.arb, polls=1)
+    assert not rig.strata.loaded and "POST /unload" in rig.strata.calls, \
+        "the answer Elden Ring was asked for did not free the card for Elden Ring"
+
+
+def test_a_second_pressure_episode_is_asked_its_own_question(rig, monkeypatch):
+    """The same identity on the other never-chosen requester: an episode is the row that opened it,
+    not the card being short. `cooldown_s` can be shorter than `ask.timeout_s`, so the card can go
+    short again while the previous episode's question is still counting down - and joining the new
+    episode to that question is the same broken click as the second game inheriting the first
+    game's: Unload now answers 200, the release walks past it because the episode it authorised is
+    over, and another question shows up a poll later.
+
+    So the episode ending closes the questions that episode was asking, and the new one is asked."""
+    grower_pid = scene(rig, monkeypatch)
+    grower = next(e for e in rig.gpu.extra if e["pid"] == grower_pid)
+    ask_first(rig, strata=["pressure"])
+    rig.arb.pressure_cfg["cooldown_s"] = 0            # next episode may start inside the timeout
+    web.pressure_pass(rig.arb)
+    first = rig.arb.events.open_ask("strata", policy.PRESSURE)
+    assert first and (first.get("scope") or "").startswith("ep"),         "the question has no episode it belongs to"
+    assert rig.strata.loaded, "an unanswered ask unloaded something"
+
+    grower["mib"] = 2000                    # the app let go of the memory
+    web.pressure_pass(rig.arb)
+    assert rig.arb.events.episode_open() is None
+    assert [(r["id"], r["closed_by"]) for r in rows(rig, "ask-end")] == \
+        [(first["id"], "episode-ended")], "the episode ended and its question stayed open"
+    assert rig.arb.answer_ask(first["id"], policy.RELEASE)[0] == 409, \
+        "a closed episode's question can still be answered"
+
+    grower["mib"] = 9000                    # the same card, short again
+    samples(rig, free=1176, other=1000)
+    web.pressure_pass(rig.arb)
+    again = rig.arb.events.open_ask("strata", policy.PRESSURE)
+    assert again and again["id"] != first["id"], "the new episode inherited the old one's question"
+    assert again.get("scope") not in (None, "", first.get("scope"))
+    assert rig.arb.answer_ask(again["id"], policy.RELEASE)[0] == 200
+    web.pressure_pass(rig.arb)
+    assert not rig.strata.loaded and "POST /unload" in rig.strata.calls, \
+        "the answer to the second episode's question authorised nothing"
 
 
 def test_a_fallback_the_log_wont_take_leaves_the_waiter_waiting(rig, monkeypatch, waiters):

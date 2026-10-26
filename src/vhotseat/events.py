@@ -17,11 +17,12 @@ CLAIM_ROWS = ("claim", "claim-end", "claim-release", "claim-release-targets",
 # The rows that make an ask: `ask` opens the question (one per workload and requester at a
 # time) and `ask-answer` closes it, answered by the owner or by nobody answering in time.
 ASK_ROWS = ("ask", "ask-answer")
-# A question can also be retired without ever being answered, because whoever would answer it is
-# gone: `claim-ended` when the claim it was asked about has ended, `claim-restarted` when the claim
-# now belongs to a different process than the one the question was asked about. `ask-end` closes the
-# ask for the same reason an answer does - so nothing waits on it or shows it - and `closed_by` says
-# which of the two it was, so a retired question is never read as a decision nobody made.
+# A question can also be retired without ever being answered, because the reason that wanted it is
+# over: `claim-ended` when the claim it was asked for has ended, `episode-ended` when the pressure
+# episode it was asked for has ended. `ask-end` closes the ask for the same reason an answer does -
+# so nothing waits on it or shows it - and `closed_by` says which of the two it was, so a retired
+# question is never read as a decision nobody made. Nothing closes a question because *another*
+# scope appeared: two games playing means two questions, not one replacing the other.
 ASK_CLOSE_ROW = "ask-end"
 # Everything that takes part in what an ask currently is: opened by one, ended by an answer or by a
 # close. Reading the log for asks means reading all three; reading it for answers alone is how a
@@ -351,11 +352,23 @@ class EventLog:
         question twice."""
         return [a for a in self.asks(limit) if ask_open(a)]
 
-    def open_ask(self, workload: str, requester: str, limit: int = 500) -> dict | None:
-        """The unanswered ask for this workload and this requester, if the log holds one. The one
-        question per pair is what stops a job queue asking the owner the same thing fifty times."""
+    def open_ask(self, workload: str, requester: str, scope: str | None = None,
+                 limit: int = 500) -> dict | None:
+        """The unanswered ask for this workload, this reason and this scope, if the log holds one.
+
+        The one question per (workload, reason, scope) is what stops a job queue asking the owner the
+        same thing fifty times, and the scope is what makes it *one question per thing that wants an
+        answer*: two games playing at once are two things wanting an answer about the same workload,
+        each with its own countdown and its own button, and neither one's question is closed because
+        the other turned up. A gate hook, a guard's request and a proxy's seat have no scope beyond
+        the requester they are named for, and pass "" as they always did. A caller that means "any
+        question about this pair, whichever scope it belongs to" - a report, a test - leaves `scope`
+        out rather than passing "": with two games playing there can be more than one answer, and
+        which one it gets is then whoever was asked first.
+        """
         return next((a for a in self.open_asks(limit)
-                     if a.get("workload") == workload and a.get("requester") == requester), None)
+                     if a.get("workload") == workload and a.get("requester") == requester
+                     and (scope is None or (a.get("scope") or "") == scope)), None)
 
     def ask_by_id(self, ask_id: str, limit: int = 500) -> dict | None:
         """One ask by its id, answered or not: what `POST /api/asks/<id>` answers, and what says it

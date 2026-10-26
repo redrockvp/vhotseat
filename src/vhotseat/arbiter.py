@@ -379,43 +379,34 @@ class Arbiter:
         buttons answer: same rows for every process on the box, whoever opened them."""
         return [self.ask_view(a) for a in self.events.open_asks()]
 
-    def asks_for(self, reason: str, name: str | None = None, note: str | None = None,
-                 since: str | None = None, pid: int | None = None) -> dict[str, dict]:
-        """The asks one requester has - this claim (matched by its process name, note and the pid
-        that started it) or this episode (matched by what grew, opened at or after `since`) - keyed
-        by workload, newest last.
+    def asks_for(self, reason: str, scope: str = "") -> dict[str, dict]:
+        """The asks this reason and this scope have, keyed by workload, newest last.
 
-        The scope matters: "the owner said unload Strata" is only consent for the game that was
-        playing when they said it. An answer left in the log must not be read as standing
-        permission for the next game, so an ask older than the reason it belongs to isn't this
-        reason's ask at all. The pid is what makes that hold in the same second: a row's timestamp
-        only goes to the second, so a game closing and another starting inside one second would
-        otherwise look like the same claim, with the old answer already given for it.
+        Scope is why an answer is not standing permission: "unload Strata" is consent for the game
+        that was playing when it was said, and the same rule matching a different game process - or
+        the card going short again after an episode ended - is a different question with a different
+        answer. The scope is in the row, so this is an equality, not a reading of timestamps: a row
+        stamped to the second cannot tell a game that closed and restarted inside that second apart,
+        and two games playing at once are two claims of the same rule.
         """
         out: dict[str, dict] = {}
-        start = row_time({"time": since}) if since else None
         for a in self.events.asks():
-            if a.get("requester") != reason:
-                continue
-            if reason == policy.CLAIMS:
-                if (a.get("name"), a.get("note")) != (name, note):
-                    continue
-                if pid and a.get("pid") and a.get("pid") != pid:
-                    continue            # the answer belongs to that game process, not this one
-            if reason == policy.PRESSURE and name and a.get("name") != name:
-                continue
-            when = row_time(a)
-            if start and (when is None or when < start):
-                continue
-            if a.get("workload"):
+            if a.get("requester") == reason and (a.get("scope") or "") == scope and a.get("workload"):
                 out[a["workload"]] = a
         return out
 
     def ask_now(self, workload: str, requester: str, *, held_mib: int, source: str,
                 name: str | None = None, note: str | None = None, free_mib: int | None = None,
-                pid: int | None = None, held: bool = False) -> dict | None:
-        """Open the one open ask for this (workload, requester) pair, or return the one that is
+                pid: int | None = None, held: bool = False, scope: str = "") -> dict | None:
+        """Open the one open ask for this (workload, requester, scope), or return the one that is
         already open. Returns the row, or None when this process couldn't open one.
+
+        The scope is whose question it is, and it is part of the identity rather than a detail to
+        check afterwards: a claim's questions belong to the game process that claimed the card, an
+        episode's to that episode, and a load nobody chose has no scope beyond the requester it is
+        named for. Two games on one workload therefore get two questions with two countdowns and two
+        buttons, each release acts on its own answer, and a question is closed only when its own
+        scope ends - never because somebody else's turned up.
 
         Under the GPU lock and with the log re-read after taking it, exactly as a pressure episode
         is opened: two actors can be told "nothing is open" in the same moment before either has
@@ -436,18 +427,7 @@ class Arbiter:
         release itself, and the question goes out from inside it because that is where the numbers
         were read.
         """
-        existing = self.events.open_ask(workload, requester)
-        moot = self.ask_moot(existing, requester=requester, pid=pid)
-        if moot:
-            # Joined to a question that is not this claim's to answer. Retire it and open this
-            # claim's own, so the card the owner sees is the one this release will act on.
-            code, _ = self.close_ask(existing["id"], closed_by=moot,
-                                     reason=self.moot_says(existing, pid))
-            if code != 200:
-                util.log(f"ask: couldn't retire the question asked about process "
-                         f"{existing.get('pid')}: code {code}; asking again next poll")
-                return self.events.open_ask(workload, requester) or existing
-            existing = self.events.open_ask(workload, requester)
+        existing = self.events.open_ask(workload, requester, scope)
         if existing:
             return existing
         if not held:
@@ -456,45 +436,33 @@ class Arbiter:
                 # Someone else is mid-open, mid-release or mid-switch. Their question - if they
                 # wrote one - is the one to wait on; if they didn't, this caller decides as it
                 # would have without the asking rather than waiting on nothing.
-                return self.events.open_ask(workload, requester)
+                return self.events.open_ask(workload, requester, scope)
             with got:
                 row = self._open_ask(workload, requester, held_mib=held_mib, source=source,
-                                     name=name, note=note, free_mib=free_mib, pid=pid)
-            return self._raise_question(row) if row else self.events.open_ask(workload, requester)
+                                     name=name, note=note, free_mib=free_mib, pid=pid, scope=scope)
+            return (self._raise_question(row) if row
+                    else self.events.open_ask(workload, requester, scope))
         row = self._open_ask(workload, requester, held_mib=held_mib, source=source, name=name,
-                             note=note, free_mib=free_mib, pid=pid)
-        return self._raise_question(row) if row else self.events.open_ask(workload, requester)
+                             note=note, free_mib=free_mib, pid=pid, scope=scope)
+        return self._raise_question(row) if row else self.events.open_ask(workload, requester, scope)
 
-    def ask_moot(self, ask: dict | None, *, requester: str,
-                 pid: int | None) -> str | None:
-        """Why this open ask is not the current claim's question (`claim-restarted`), or None when
-        it is the one to join.
+    @staticmethod
+    def claim_scope(pid: int | None) -> str:
+        """Which questions are this claim's: the game process that took the card. The pid is the
+        whole of it, because the claim that owned it has ended and been recorded before any other
+        process can own the same rule - and two games playing at once are two pids asking about the
+        same workload, which is the case a pid and nothing else separates."""
+        return f"pid{pid}" if pid else ""
 
-        A claim is a process, not a rule, and the release path already knows it: `asks_for` refuses
-        an answer whose pid isn't this process's, because "unload Strata" is consent for the game
-        that was playing when it was said. The look that *joins* an open question was never told the
-        same thing, and the mismatch is visible from the owner's side: game A exits without
-        answering, game B starts inside the timeout and joins A's question, so the card shows A's
-        countdown and Unload now answers 200 - and the next poll ignores it, because that consent
-        belongs to a process that no longer exists, then opens a second question a moment later. The
-        pid is what tells the two games apart inside one second, which a row's timestamp (whole
-        seconds) cannot.
-
-        A question asked without a pid, or by a claim that has none either way, is left as it was:
-        the pair is the only scope there is, and it is the scope the asking used.
-        """
-        if ask is None or requester != policy.CLAIMS:
-            return None
-        if pid and ask.get("pid") and ask["pid"] != pid:
-            return "claim-restarted"
-        return None
-
-    def moot_says(self, ask: dict, pid: int | None) -> str:
-        """The sentence on a question retired because the claim it was asked about became a
-        different process: what changed, and why that makes the question moot."""
-        return (f"{ask.get('name') or 'the game'} is now process {pid}; this question was asked "
-                f"about process {ask.get('pid')}, so answering it would unload for a game that "
-                "is gone")
+    @staticmethod
+    def episode_scope(episode: dict) -> str:
+        """Which questions are this episode's: the id of the row that opened it. An episode that has
+        ended is not the next shortness of the same card, so its unanswered question must not be what
+        the next episode is joined to - and `cooldown_s` can be shorter than `ask.timeout_s`, so the
+        next one can arrive while that question is still counting down. The id rather than the row's
+        timestamp because rows are stamped to the second, and a card that has been short all afternoon
+        can open its next episode inside one."""
+        return f"ep{episode['id']}" if episode.get("id") else ""
 
     def ended_says(self, claim: dict) -> str:
         """The sentence on a question retired because the claim itself ended."""
@@ -525,31 +493,30 @@ class Arbiter:
         util.log(f"ask: closed an unanswered question: {reason}")
         return 200, {"ask": self.ask_view(row)}
 
-    def end_claim_asks(self, claim: dict) -> int:
-        """Retire the questions a claim was asking, once the claim itself is over. Returns how many.
+    def end_scope_asks(self, reason: str, scope: str, *, closed_by: str, says: str) -> int:
+        """Retire the questions one scope was asking, once that scope is over: a claim that ended,
+        an episode that ended. Returns how many.
 
-        Otherwise a question outlives its questioner: the game closes mid-countdown and the card
-        goes on showing "Strata unloads for Elden Ring - answer within 1:40" with a button no
-        release will ever act on. Nothing waits on it either, so the only thing that would close it
-        is the fallback - which would record a decision about an unload nobody wants any more.
+        A question is asked *about* a thing that wants memory freed, and it stops meaning anything
+        when that thing is gone. Left open it is a card the owner is invited to act on for a game
+        that has already exited, with a button no release will ever act on, and nothing waits on it:
+        the only thing that would close it is the fallback, which would record a decision about an
+        unload nobody wants any more. Only its own scope ending closes it, so the other game still
+        playing keeps its question, and the next claim or episode - a different scope - is asked its
+        own.
         """
         n = 0
         for ask in self.events.open_asks():
-            if ask.get("requester") != policy.CLAIMS:
+            if ask.get("requester") != reason or (ask.get("scope") or "") != scope:
                 continue
-            if (ask.get("name"), ask.get("note")) != (claim.get("name"), claim.get("note")):
-                continue
-            if claim.get("pid") and ask.get("pid") and ask["pid"] != claim["pid"]:
-                continue            # another process's question: this claim ending says nothing about it
-            code, _ = self.close_ask(ask["id"], closed_by="claim-ended",
-                                     reason=self.ended_says(claim))
+            code, _ = self.close_ask(ask["id"], closed_by=closed_by, reason=says)
             if code == 200:
                 n += 1
         return n
 
     def _open_ask(self, workload: str, requester: str, *, held_mib: int, source: str,
                   name: str | None, note: str | None, free_mib: int | None,
-                  pid: int | None) -> dict | None:
+                  pid: int | None, scope: str = "") -> dict | None:
         """Write the `ask` row and return it, or None when the question is already in the log -
         the same recheck after taking a lock that a pressure episode does, and the reason a pair gets
         one question and one notification rather than two. Called with the GPU lock held.
@@ -562,12 +529,13 @@ class Arbiter:
         already asked?" mean the same thing as the row that follows it.
         """
         with self.events.turn(what="opening an ask"):
-            if self.events.open_ask(workload, requester) is not None:
+            if self.events.open_ask(workload, requester, scope) is not None:
                 return None              # written between the look above and this turn
             row = {"id": uuid.uuid4().hex[:12], "workload": workload, "requester": requester,
                    "source": source, "held_mib": held_mib, "free_mib": free_mib,
                    "timeout_s": self.ask["timeout_s"], "fallback": self.ask["fallback"],
-                   "last_used": self.last_used().get(workload), "name": name, "note": note}
+                   "last_used": self.last_used().get(workload), "name": name, "note": note,
+                   "scope": scope}
             if pid:
                 row["pid"] = pid
             # The row's own time, chosen here rather than left to the log: the wait, the countdown
@@ -782,7 +750,8 @@ class Arbiter:
 
     def ask_before_release(self, reason: str, cands: dict, want: dict, *, source: str,
                            name: str | None = None, note: str | None = None, since: str | None = None,
-                           pid: int | None = None, snap: dict | None = None) -> dict:
+                           pid: int | None = None, scope: str = "",
+                           snap: dict | None = None) -> dict:
         """The asking half of a release that is never refused - a claim, an episode: ask the
         candidates whose pair says Ask me, and return the ones that may be released now.
 
@@ -802,13 +771,14 @@ class Arbiter:
         if not asked:
             return cands
         self.expire_asks(reason)
-        known = self.asks_for(reason, name=name, note=note, since=since, pid=pid)
+        known = self.asks_for(reason, scope)
         said = self.events.kept_said(reason, name=name, note=note, since=since)
         for n in asked:
             ask = known.get(n)
             if ask is None:
                 self.ask_now(n, reason, held_mib=want.get(n) or 0, source=source, name=name,
-                             note=note, free_mib=(snap or {}).get("free_mib"), pid=pid, held=True)
+                             note=note, free_mib=(snap or {}).get("free_mib"), pid=pid, held=True,
+                             scope=scope)
                 continue
             answer = ask.get("answer")
             if answer == policy.RELEASE:
@@ -1592,9 +1562,9 @@ class Arbiter:
                 return {"declined": None, "by_actor": False, "would": [], "released": [],
                         "waiting": [], "freed_mib": 0}
             cands = self.ask_before_release(policy.CLAIMS, cands, want, source="claim",
-                                           name=claim.get("name"), note=claim.get("note"),
-                                           since=claim.get("since"), pid=claim.get("pid"),
-                                           snap=snap)
+                                            name=claim.get("name"), note=claim.get("note"),
+                                            pid=claim.get("pid"), snap=snap,
+                                            scope=self.claim_scope(claim.get("pid")))
             if not any(want.get(n) for n in cands):
                 # Everything it is still owed wants being asked first, and the answers haven't
                 # come. Nothing was released and nothing is `waiting`: the game is running with
@@ -1834,7 +1804,8 @@ class Arbiter:
             if readings.get("why"):
                 return _declined(readings["why"])
             grower = readings.get("grower") or {}
-            self.events.record("pressure", source=source, name=grower.get("name") or name,
+            self.events.record("pressure", id=uuid.uuid4().hex[:12], source=source,
+                               name=grower.get("name") or name,
                                pid=grower.get("pid"), other_mib=readings["other_mib"],
                                floor_mib=readings["floor_mib"], grew_mib=readings["grew_mib"],
                                free_mib=readings["free_mib"], total_mib=readings["total_mib"],
@@ -1892,8 +1863,10 @@ class Arbiter:
             return {"declined": None, "by_actor": False, "would": sorted(cands), "released": [],
                     "waiting": [], "freed_mib": 0}
         name = (ep.get("episode") or {}).get("name")
+        episode = ep.get("episode") or {}
         cands = self.ask_before_release(policy.PRESSURE, cands, want, source=source, name=name,
-                                       since=(ep.get("episode") or {}).get("time"), snap=snap)
+                                        since=episode.get("time"), snap=snap,
+                                        scope=self.episode_scope(episode))
         if not any(want.get(n) for n in cands):
             # Owed only workloads whose answer hasn't come: the card stays short, the question is
             # open, and nothing is waiting on an unload nobody agreed to.
