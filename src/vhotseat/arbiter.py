@@ -100,6 +100,13 @@ class Arbiter:
         # How often a process waiting on an answer looks at the log. Not a config key: it costs a
         # small file read, and what it is waiting for is a person.
         self.ask_poll_s = 1.0
+        # How many times a waiter tries to write an expired ask's fallback before it stops waiting
+        # on that question: at the defaults, a 1 s poll and a 5 s wait for the log's turn, five
+        # attempts is about half a minute of trying, and a request hung forever on a wedged log is
+        # worse than one refused as unanswered - which is how the caller reports it, and the
+        # question stays open in the log for whoever can write it. An attribute beside
+        # `ask_poll_s` and not a config key: no answer to a question is waiting on it.
+        self.ask_write_tries = 5
         # When each workload was last seen working, in a file every vhotseat process on this box
         # reads and stamps: the question has to be able to say "used 40 s ago" rather than
         # "loaded", because "used 40 s ago" is what tells the owner to pause their work first.
@@ -568,9 +575,21 @@ class Arbiter:
         closes once and says who didn't answer it. `own_deadline` - a gate hook's own time limit -
         stops *this* waiter without closing anything: the question stays open, still timed from
         when it was asked, for the next request and for the dashboard.
+
+        Applying a fallback is writing a row, so it can fail: another writer may be holding the
+        log's turn past the bounded wait, and then nothing has been written and the ask is as
+        unanswered as it was. That is not an answer, and this used to read it as one - ignore the
+        write, re-read the still-unanswered row, index a key that isn't there, and the waiting gate
+        hook, a guard's `switch --request` or a proxy's `Seat.acquire` dies of `KeyError` in the
+        middle of a handover. A fallback the log wouldn't take leaves the question pending: the
+        next poll tries again against the same deadline, and an answer is never read out of a row
+        that has none. Only a log that keeps refusing stops the wait at all, and then the request is
+        refused as unanswered rather than hanging - and whoever can write that log, a watcher, the
+        dashboard or the owner's next click, still closes the question.
         """
         pending = {a["id"] for a in asks if a.get("id")}
         out: dict[str, str] = {}
+        refused: dict[str, int] = {}
         while pending:
             for ask_id in sorted(pending):
                 cur = self.events.ask_by_id(ask_id)
@@ -580,9 +599,25 @@ class Arbiter:
                 if not cur.get("answer"):
                     if self.ask_view(cur)["left_s"] > 0:
                         continue
-                    self.answer_ask(ask_id, cur.get("fallback") or self.ask["fallback"],
-                                    by="timeout")
+                    code, body = self.answer_ask(
+                        ask_id, cur.get("fallback") or self.ask["fallback"], by="timeout")
+                    if code == 503:
+                        # The log wouldn't let go, so nothing was written: there is nothing here to
+                        # decide on, and the question stays open exactly as it was.
+                        refused[ask_id] = refused.get(ask_id, 0) + 1
+                        if refused[ask_id] == 1:
+                            util.log(f"ask: {body['error']}")
+                        if refused[ask_id] >= self.ask_write_tries:
+                            util.log("ask: the event log still won't let go, so this request stops "
+                                     "waiting on the question rather than guessing at an answer")
+                            pending.discard(ask_id)
+                        continue
+                    if code == 404:
+                        pending.discard(ask_id)  # aged out between reading it and answering it
+                        continue
                     cur = self.events.ask_by_id(ask_id) or cur
+                    if not cur.get("answer"):
+                        continue                # never decide from a row that has no answer in it
                 out[cur["workload"]] = cur["answer"]
                 pending.discard(ask_id)
             if not pending:

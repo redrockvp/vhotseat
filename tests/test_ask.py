@@ -509,6 +509,78 @@ def test_the_hook_and_the_wait_share_one_deadline(rig, monkeypatch, waiters):
     assert rig.arb.events.ask_by_id(asked["id"])["answer"] == policy.RELEASE
 
 
+def test_a_fallback_the_log_wont_take_leaves_the_waiter_waiting(rig, monkeypatch, waiters):
+    """When an ask's timeout runs out, the waiter applies its fallback - and the fallback is a row
+    in the log, which means writing it can fail the way any write here fails: another writer holds
+    the log and won't let go inside the bounded wait. That is not an answer, and treating it as one
+    is worse than the crash this test used to get.
+
+    The waiter used to ignore the write's outcome, then re-read an ask that was still unanswered and
+    index its answer: `KeyError`, out of a gate hook, a guard's `--request` and a proxy's
+    `Seat.acquire` alike - a request dying with a traceback because the log was busy, mid-handover.
+    So a fallback that was not written leaves the question pending: the waiter keeps waiting and
+    tries again on the next poll, still stopping at its own deadline, and an answer is never read
+    out of a row that has none. Once the log comes back, the fallback is written - once - and the
+    request that was waiting finishes on it."""
+    monkeypatch.setattr(events, "LOCK_WAIT_S", 0.05)     # the test-scale bounded wait: fail fast
+    # real seconds, unlike the sleeps: long enough to hold the log across the whole timeout
+    rig.arb.ask.update({"timeout_s": 2, "fallback": policy.RELEASE})   # a question timed in
+    ask_first(rig, strata=["comfy"])
+    rig.strata.loaded = True
+    th, box = in_thread(lambda: rig.cli("switch", "comfy", "--request"))
+    asked = awaiting(rig, waiters, "strata", "comfy")
+
+    stack = contextlib.ExitStack()
+    stack.enter_context(rig.arb.events.turn(what="a writer that never lets go"))
+    try:
+        wait_for(lambda: None if rig.arb.ask_view(asked)["left_s"] > 0 else asked,
+                 "the question's timeout running out while the log is held")
+        time.sleep(0.4)                     # several polls, each one refused by the held log
+        assert "error" not in box, f"the waiter died on a log it could not write: {box['error']!r}"
+        assert th.is_alive(), "the request stopped waiting before it had an answer of any kind"
+        assert rows(rig, "ask-answer") == [], "a fallback was recorded that was never written"
+    finally:
+        stack.close()
+
+    answered = wait_for(lambda: rig.arb.events.ask_by_id(asked["id"]).get("answer")
+                        and rig.arb.events.ask_by_id(asked["id"]),
+                        "the fallback, once the log was free")
+    assert (answered["answer"], answered["by"]) == (policy.RELEASE, "timeout")
+    assert len([r for r in rows(rig, "ask-answer") if r["id"] == asked["id"]]) == 1,         "the retried fallback was written more than once"
+    assert join(th, box) == 0, "the request did not finish on the fallback it was waiting for"
+    assert not rig.strata.loaded and "POST /unload" in rig.strata.calls,         "nobody answered, and the fallback said release"
+
+
+def test_a_log_that_never_lets_go_stops_the_wait_rather_than_hanging_it(rig, monkeypatch,
+                                                                        waiters):
+    """The retry has a limit, because a log held by a writer that never lets go is not a question
+    that will ever be answered. Without one, a waiting `--request` or `Seat.acquire` polls a log it
+    cannot write forever, hung behind a wedged process, and the owner watching the dashboard sees
+    nothing happen. So after `ask_write_tries` refused writes the waiter stops waiting on that
+    question: the request is refused the way an unanswered one is refused, the workload stays loaded
+    because no answer ever said otherwise, and the question is left open in the log - the next
+    actor that can write it, or the owner's click, still closes it."""
+    monkeypatch.setattr(events, "LOCK_WAIT_S", 0.05)
+    rig.arb.ask.update({"timeout_s": 1, "fallback": policy.RELEASE})
+    rig.arb.ask_write_tries = 2
+    ask_first(rig, strata=["comfy"])
+    rig.strata.loaded = True
+    th, box = in_thread(lambda: rig.cli("switch", "comfy", "--request"))
+    asked = awaiting(rig, waiters, "strata", "comfy")
+
+    stack = contextlib.ExitStack()
+    stack.enter_context(rig.arb.events.turn(what="a writer that never lets go"))
+    try:
+        assert join(th, box, within=12.0) == 1, "the request hung on a log it could not write"
+        assert "error" not in box, f"the waiter died on a log it could not write: {box['error']!r}"
+    finally:
+        stack.close()
+
+    assert rig.arb.events.ask_by_id(asked["id"]).get("answer") is None,         "a fallback that was never written still decided something"
+    assert rig.arb.open_asks(), "the wedged write closed the question the owner can still answer"
+    assert rig.strata.loaded and "POST /unload" not in rig.strata.calls,         "an answer nobody wrote unloaded a model"
+
+
 def test_a_game_starting_during_the_wait_refuses_the_request(rig, monkeypatch, waiters):
     """A request that waits for an answer waits for as long as `ask.timeout_s` says - two minutes of
     somebody being away from the keyboard - and a game can start inside that. The claim rule is about
