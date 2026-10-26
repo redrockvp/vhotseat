@@ -266,6 +266,9 @@ Two things a URL doesn't cover:
 A workload with nothing inside it that can ask for the GPU - no hook, no plugin - is
 declared `gate: {kind: hold}`: it is guarded only while it runs under `vhotseat hold`, so
 the habit is to take the card for it (`vhotseat switch NAME`) before loading anything there.
+What a load that skips the habit costs is bounded, not ignored: the watcher notices a `hold`-gated
+workload appearing on a card something else already holds and gives it the room the Rules grid says
+it is owed - see "A workload that loaded past a hold gate" below and docs/how-it-works.md §3.10.
 
 ## The ComfyUI guard
 
@@ -659,6 +662,21 @@ or hasn't been asked yet; while an episode is open the warning banner names the 
 workload that answers "unloaded" and keeps its VRAM is asked three times in total, then left for the
 rest of the episode - that is an unload that doesn't work, not a busy moment - and the card counts
 the tries from the rows, so `watch` and the dashboard aren't each allowing themselves three.
+
+**A workload that loaded past a hold gate.** `gate: {kind: hold}` means nothing inside that program
+asks vhotseat before a load - no hook, no plugin node, no proxy - so a model loaded from its own UI
+asks nobody and makes no room, and the card ends up with two residents and a model that sized itself,
+at launch, to whatever was free. `watch` and the dashboard's watcher notice it on their next pass and
+apply the Rules grid for that newcomer's column after the fact: Make room releases what was on the
+card, lowest `priority:` first; Ask me asks once about that load and releases when the answer says
+unload; Keep loaded leaves it holding and writes a `policy-kept` row. The load itself is never
+refused, undone or restarted, and a workload with work in flight is never interrupted. A hold-gated
+workload already resident when the watcher starts is not treated as an arrival - the first pass
+records the card and acts on nothing. The rows are `arrival`, `arrival-release-targets`,
+`arrival-release`, `arrival-release-waiting` and `arrival-end`, one episode per load, coordinated
+between the two watchers the way claim releases are; `vhotseat status` shows an `arrival:` line, and
+the release row carries the sentence saying to reload the model that sized itself smaller
+(docs/how-it-works.md §3.10).
 
 **Fits alongside.** The dashboard's policy panel answers the question the owner actually has:
 can these two run at the same time? It is arithmetic on what the card has been *seen* doing:

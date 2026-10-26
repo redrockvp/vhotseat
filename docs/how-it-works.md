@@ -396,6 +396,7 @@ work getting off the card.**
 | a load nobody chose: Strata's gate, ComfyUI's guard (`switch comfy --request`), a proxy's `Seat.acquire` | refused while a workload holding model memory won't give way for the newcomer: nothing is unloaded, nothing loads, and the refusal names the holder and what it does give way for (`policy-refused`) |
 | a `switch` / `hold` someone typed | goes through - it is an order, as everywhere else - and records whose policy it overrode (`policy-override`) |
 | a claim starting (`on_start: release`) | never refused: the workloads that don't cover `claims` are simply not targets, and the record and the dashboard say the game may be short of them (`policy-kept`) |
+| a workload loading past a `kind: hold` gate - nothing inside it ever asks (§3.10) | never refused and never undone either: the watcher applies that same cell after the fact, so Make room releases, Ask me asks once about that load, and Keep loaded writes a `policy-kept` row |
 | a workload at or below its `idle_vram_mib` | refuses nobody, whatever its keys say: there is nothing on the card to be short of |
 
 The gate checks it while it holds the lock, inside `_make_room`, rather than only in the
@@ -466,6 +467,57 @@ loaded - 30 s of it (six samples), 2000 MiB of growth over the median floor (ten
 desktop here jitters by), an episode ending only once free is back 2000 MiB wider than the trigger,
 and 600 s before another one starts. The readings, the open episode and the last closed one are on
 the dashboard's Pressure card and in `vhotseat status` / `why`.
+
+
+### 3.10 A workload loads past a gate that never asks
+
+`gate: {kind: hold}` means there is nothing inside that program that can ask for the GPU: no pre-load
+hook, no plugin node, no proxy in front of it. It is guarded only while it runs under `vhotseat hold`,
+so the documented habit is to take the card for it first. A model loaded some other way - from its own
+UI, or by a request that wakes it - asks nobody, makes no room, and is invisible to the watcher as
+well: `watch_pass` handles claims (games) and pressure, and pressure only counts memory vhotseat
+doesn't manage. What that costs is measurable: the model sizes itself, at launch, to whatever is free
+at that moment, so it keeps less of the card than it would have with the room made first, and it will
+keep holding less until it is loaded again.
+
+The watcher acts after the fact. An **arrival** is a `hold`-gated workload that was not on the card at
+the previous pass and is on it now, while at least one other workload is on the card too. Nothing else
+counts: a hook, plugin or proxy gate took the GPU lock and made room before its load, so one of those
+arriving beside another workload is a handover in progress, and racing it is worse than missing it.
+
+What happens is the Rules grid (§3.8) applied to the newcomer's column, through the same release path
+a claim's `on_start: release` uses - which is why the two cannot drift apart:
+
+- **Make room**: the workloads that held the card when it arrived are released through their normal
+  unload path, lowest `priority:` first, and the newcomer is left running with whatever it took.
+- **Ask me**: one question about that load (`ask` scoped to the arrival row's id), nothing released
+  while it is open, and the release happens when the answer says unload. The load is not waiting for
+  the answer - it already happened - and the question says so: "nothing is waiting for your answer,
+  and unloading ComfyUI gives it the room its gate would have asked for".
+- **Keep loaded**: nothing is released, and a `policy-kept` row says what is still holding and how
+  much, because the load may now be short of exactly that.
+- **Working**: never interrupted. Reported as `arrival-release-waiting` and retried on later passes
+  while the conflict lasts, with the same three-try limit as a claim on a workload that says it
+  unloaded and keeps its VRAM.
+
+What it never does is undo the load: nothing is refused, rolled back or restarted, and the newcomer is
+never a candidate for its own room.
+
+The episode is the conflict, and it lives in the log rather than in a process: `arrival` records the
+load, `arrival-release-targets` fixes which workloads it was owed at that moment, `arrival-release`
+says what came off, `arrival-release-waiting` what hasn't, and `arrival-end` why it stopped asking -
+the newcomer unloaded, or the card back to one workload. Its questions end with it, exactly as a
+claim's end with the game. So `watch` and the dashboard's watcher notice the same load once, and
+`vhotseat status` shows an `arrival:` line beside the claim and pressure lines.
+
+Two limits, both accepted. Which workloads are on the card is remembered in the process that polls, so
+the first pass after a start records the card and acts on nothing: a box that comes up with two models
+resident is not treated as an arrival, because one reading cannot say which of the two loaded second.
+And the release only makes the room - the model that already sized itself smaller is not reloaded, so
+the row carries the sentence that says what to do about it:
+
+> Unsloth Studio loaded while ComfyUI was on the card, so it sized itself to what was free. Reload the
+> model in Unsloth Studio to use the 5500 MiB freed.
 
 ## 4. Deadlocks
 
