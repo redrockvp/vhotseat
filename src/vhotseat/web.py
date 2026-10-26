@@ -14,15 +14,21 @@ The page (web.html) polls a small JSON API:
                                      does, the unload order, and the `ask:` and `pressure:` numbers,
                                      with the config file's version to send back with a save
   POST /api/policy                   save the policy to the config file - the only thing here that
-                                     writes anything, and guarded three ways over (see `guard`)
+                                     writes the owner's config, and guarded three ways over (see `guard`)
+  POST /api/asks/<ID>                answer an open ask: {answer: "release"|"keep"}. Same guard.
+  POST /api/make-room                {for: WORKLOAD}: unload what is in that workload's way once,
+                                     changing no rule. Same guard.
   GET /api/cost?since=&until=        kWh and money over that window, per holder (needs power.price)
   GET /api/history?since=&until=     samples between two Unix times, averaged into at most `points` buckets
   GET /api/events?since=&until=      events, newest first
   GET /api/logs?since=&until=        vhotseat's log lines from every process, newest first
 
-It reads the live state: nothing here switches or releases anything, and the one POST
-rewrites the owner's policy in their config file rather than touching the card. While it
-runs it also records samples, like `vhotseat record`.
+It reads the live state, and the one POST that writes anything writes the owner's policy in their
+config file rather than touching the card. The two that do touch the card - answering an Ask me,
+and the warning's "make room now" - are things a person decided, and they go through the same
+three guards as the policy save. While it runs it also records samples, like `vhotseat record`,
+and notes which workloads are working, which is what lets an ask say "used 40 s ago" rather than
+"loaded".
 """
 
 import contextlib
@@ -303,6 +309,49 @@ class Dashboard:
         self.arbiter.reload_policy(force=True)
         return 200, {"version": version}
 
+    def answer_ask(self, ask_id: str, body: bytes) -> tuple[int, dict]:
+        """Answer the open ask `ask_id`: 200 with the ask as it now reads, 400 with the reason the
+        body isn't an answer, 404 for an id the log doesn't have, 409 for one that is answered or
+        closed already.
+
+        The id is the row's, so the answer means the question that was asked - the numbers in it
+        (what was holding, when it was last working, what the fallback was) are that question's,
+        and a second page opened later can't answer a question it never saw with a different set of
+        numbers. Nothing is unloaded by this call: the answer is a row, and whoever owes the
+        release - a watcher's next poll, the request that was waiting on it - acts on it through
+        the normal release path, which is what keeps a request in flight never cut off.
+        """
+        posted = _json_body(body)
+        if isinstance(posted, str):
+            return 400, {"error": posted}
+        answer = posted.get("answer")
+        if answer is None:
+            return 400, {"error": 'expected {answer: "release" | "keep"}'}
+        return self.arbiter.answer_ask(ask_id, answer)
+
+    def make_room(self, body: bytes) -> tuple[int, dict]:
+        """The warning's "Make room now": give the card to one workload once, changing nothing
+        else. 200 with what was done, 400 with the reason it can't be done, 1-shaped answers
+        carrying the switch's own error.
+
+        It is a command a person decided, so it goes through as an order rather than a request:
+        the policy that refused this workload is overridden and recorded as `policy-override`, the
+        same row a typed `vhotseat switch` writes. No rule moves, because wanting room this once
+        and wanting the rule changed are different answers, and the second one belongs in the
+        editor. Nothing is loaded that wasn't asked for: this frees the card for it, and its own
+        request or first job does the loading.
+        """
+        posted = _json_body(body)
+        if isinstance(posted, str):
+            return 400, {"error": posted}
+        name = posted.get("for")
+        if name not in self.arbiter.workloads:
+            return 400, {"error": f"no workload named {name!r}; configured: "
+                                  f"{', '.join(self.arbiter.workloads)}"}
+        result = self.arbiter.switch(name, posted.get("wait") or 0, load=False)
+        result.pop("exception", None)
+        return (200 if result.get("ok") else 409), result
+
     def api(self, path: str, query: dict) -> tuple[int, object]:
         if path == "/api/status":
             return 200, self.status()
@@ -370,8 +419,19 @@ class Dashboard:
 
             def do_POST(self):
                 url = urlparse(self.path)
-                if url.path != "/api/policy":
+                ask_id = (url.path[len("/api/asks/"):] if url.path.startswith("/api/asks/")
+                          else None)
+                if ask_id is not None:
+                    todo = lambda body: dash.answer_ask(ask_id, body)                # noqa: E731
+                elif url.path == "/api/make-room":
+                    todo = dash.make_room
+                elif url.path == "/api/policy":
+                    todo = dash.save_policy
+                else:
                     return self._json(404, {"error": f"no such endpoint: {url.path}"})
+                # The same three guards for all three: an ask's answer unloads a model, "make room
+                # now" unloads one, and a policy save rewrites the rules - none of them is
+                # something a page the visitor was only reading gets to do.
                 reason = guard(self.headers, self.server.server_address[1])
                 if reason:
                     return self._json(403, {"error": reason})
@@ -383,13 +443,28 @@ class Dashboard:
                     return self._json(400, {"error": "expected a JSON body"})
                 if length > POLICY_BODY_LIMIT:
                     return self._json(400, {"error": f"body over {POLICY_BODY_LIMIT} bytes"})
-                code, payload = dash.save_policy(self.rfile.read(length))
+                code, payload = todo(self.rfile.read(length))
                 return self._json(code, payload)
 
             def log_message(self, *args):
                 pass
 
         return Handler
+
+
+def _json_body(body: bytes) -> dict | str:
+    """A POSTed JSON object, or the reason it isn't one. Shared by the two card-touching POSTs:
+    both are answering something a person saw on the page, and a body that doesn't parse should
+    say so the same way in each."""
+    try:
+        posted = json.loads(body.decode("utf-8"))
+    except UnicodeDecodeError:
+        return "the body isn't utf-8 text"
+    except json.JSONDecodeError as e:
+        return f"expected a JSON body: {e.msg}"
+    if not isinstance(posted, dict):
+        return "expected an object"
+    return posted
 
 
 def guard(headers, port: int) -> str | None:
@@ -414,14 +489,40 @@ def guard(headers, port: int) -> str | None:
     return None
 
 
+def note_work(arbiter) -> None:
+    """Record which workloads are working right now, so that an ask can be asked with "used 40 s
+    ago" in it rather than "loaded".
+
+    The watchers are what see work - a queue draining, a server answering, an agent mid-task - and
+    the process that has to ask about unloading isn't always the one that saw it, so the answer
+    goes in the shared state file (`note_used`) rather than in memory. Only the resident loops do
+    this, never a status request: it costs a `busy()` per workload per pass, which is an HTTP round
+    trip for a driver that can say, and a page refresh shouldn't pay for a fact only the question
+    needs.
+
+    A driver that raises on the question is skipped: the same driver is reported by the release
+    that trips over it, and a watcher that printed this every 2 s would bury the log.
+    """
+    for name, w in arbiter.workloads.items():
+        try:
+            if w.busy() is not None:
+                arbiter.note_used(name)
+        except Exception:                                        # noqa: BLE001 - a poll, not a decision
+            continue
+
+
 def claim_watcher(arbiter, stop: threading.Event) -> None:
     """Look for claims on `claims_poll_s`, and act on them. This is the loop the dashboard runs
     in the background: on a box where `watch` isn't running, the dashboard is the actor, and it
     has to notice a game whether or not somebody has a tab open. Running it in both processes is
-    safe: the release reads what is already in the event log and takes the GPU lock."""
+    safe: the release reads what is already in the event log and takes the GPU lock.
+
+    It is also one of the two things that know when a workload was last working, which is the other
+    half of what an Ask me says."""
     every = arbiter.claim_poll_s * util.SCALE
     while not stop.wait(every):
         try:
+            note_work(arbiter)
             watch_pass(arbiter, arbiter.claim_hits())
         except Exception as e:                              # a bad poll must not stop the watcher
             util.log(f"claim check failed: {type(e).__name__}: {e}")
@@ -485,6 +586,7 @@ def watch(arbiter, polls: int | None = None) -> int:
         while polls is None or polls > 0:
             polls = None if polls is None else polls - 1
             try:
+                note_work(arbiter)
                 watch_pass(arbiter, arbiter.claim_hits())
             except Exception as e:                              # a bad poll must not stop the watcher
                 util.log(f"check failed: {type(e).__name__}: {e}")
@@ -523,6 +625,14 @@ def claim_transitions(arbiter, hits: list[dict]) -> None:
         events.record("claim-end", source="watch", pid=row.get("pid"), name=key[0], note=key[1],
                       processes=n)
         util.log(f"{key[0]}" + (f" x{n}" if n > 1 else "") + " is gone: the card is open to loads again")
+        # And the questions that claim was asking go with it. A question is asked *about that
+        # process*: once it has exited there is nothing left for an answer to free, and an open
+        # question left behind is a countdown the owner is invited to act on for a game that is
+        # gone. It closes that claim's questions and no others: a second game still playing keeps
+        # its own question and its own toast, and the next claim under the same rule is a different
+        # scope, so it is asked its own.
+        arbiter.end_scope_asks(policy.CLAIMS, arbiter.claim_scope(row.get("pid")),
+                               closed_by="claim-ended", says=arbiter.ended_says(row))
     state = events.claims_open()             # ours are in the record now
     for key, group in now.items():
         if (group[0].get("on_start") or "release") != "release":
@@ -563,8 +673,8 @@ def release_for(arbiter, key: tuple, rec: dict) -> None:
         rec = {**rec, "targets": targets}
         for k in kept:
             why = arbiter.kept_why(policy.CLAIMS, k["workload"], k["held_mib"])
-            events.record("policy-kept", source="watch", name=key[0], note=key[1],
-                          workload=k["workload"], held_mib=k["held_mib"], why=why)
+            events.record("policy-kept", source="watch", reason=policy.CLAIMS, name=key[0],
+                          note=key[1], workload=k["workload"], held_mib=k["held_mib"], why=why)
             util.log(f"{key[0]} ({key[1]}): {why}")
     label = lambda n: arbiter.workloads[n].label if n in arbiter.workloads else n  # noqa: E731
     waiting = rec.get("waiting") or []
@@ -594,7 +704,14 @@ def release_for(arbiter, key: tuple, rec: dict) -> None:
     if not still:
         return
     try:
-        out = arbiter.claim_release({"name": key[0], "note": key[1]}, only=still)
+        out = arbiter.claim_release({"name": key[0], "note": key[1],
+                                     # The claim's own start and the process that opened it, so an
+                                     # answer written for this game is consent for this game and
+                                     # not for the next one to match the same rule - which matters
+                                     # most when the two are a second apart, the resolution a row's
+                                     # timestamp has.
+                                     "pid": (rec.get("claim") or {}).get("pid"),
+                                     "since": (rec.get("claim") or {}).get("time")}, only=still)
     except Exception as e:            # a watcher that lives at logon must not die on one bad poll
         util.log(f"{key[0]} ({key[1]}): couldn't free the card - {type(e).__name__}: {e}")
         return
@@ -690,6 +807,14 @@ def pressure_pass(arbiter, claimed: set = frozenset()) -> None:
     if reason:
         events.record("pressure-end", source="watch", name=ep["episode"].get("name"),
                       reason=reason, freed_mib=ep.get("freed_mib") or 0)
+        # The questions this episode was asking end with it, and only these: `cooldown_s` can be
+        # shorter than `ask.timeout_s`, so the next shortness of the same card can arrive while the
+        # old episode's question is still counting down, and an answer to that one would authorise
+        # an unload for an episode that is already over.
+        arbiter.end_scope_asks(
+            policy.PRESSURE, arbiter.episode_scope(ep["episode"]), closed_by="episode-ended",
+            says=f"{reason}: the question was asked about that episode, and there is nothing left "
+                 "to free for it")
         util.log(f"pressure: {reason}: the card is open to loads again")
         return
 

@@ -366,27 +366,30 @@ def ask_first(rig, **per):
 
 
 def test_an_ask_keeps_its_workload_loaded_for_a_load_nobody_chose(rig, capsys):
-    """The asking isn't built, and that has to be a no-op rather than a surprise: Strata wants
-    to be asked before ComfyUI unloads it, so the guard's request is refused exactly as a keep
-    is - nothing partially unloads, because the card cannot be given to ComfyUI anyway. The
-    sentence says which of the two it is, so the owner isn't left waiting for a notification
-    that will never arrive."""
+    """Strata wants to be asked before ComfyUI unloads it, so the guard's request is not refused on
+    the config's own authority: the question goes out, and when nobody answers, the `ask:` fallback
+    (keep) is what keeps it loaded. Same refusal and same shape - nothing partially unloads,
+    because the card cannot be given to ComfyUI anyway - but the why now says whose answer it was.
+    """
     ask_first(rig, strata=["comfy"])
+    rig.arb.ask["timeout_s"] = 0.05
     rig.strata.loaded = True
     assert rig.cli("switch", "comfy", "--request") == 1
     assert rig.strata.loaded
     assert "POST /unload" not in rig.strata.calls
+    asked = rows(rig, "ask")
+    assert len(asked) == 1 and asked[0]["workload"] == "strata" and asked[0]["requester"] == "comfy"
+    assert [(r["answer"], r["by"]) for r in rows(rig, "ask-answer")] == [("keep", "timeout")]
     got = rows(rig, "policy-refused")
     assert len(got) == 1 and got[0]["workloads"] == ["strata"]
-    assert "its asks_for asks ComfyUI first" in got[0]["why"]
-    assert "asking isn't built yet, so it stays loaded" in got[0]["why"]
+    assert "nobody answered in time, so its ask: fallback (keep) decided" in got[0]["why"]
 
 
 def test_a_workload_that_wants_asking_first_still_holds_for_a_game(rig, monkeypatch):
-    """A claim is never refused, so an ask in a game's row is the same as a keep: the game
-    starts short of whatever stayed put, and `policy-kept` is where that is recorded. Not
-    waiting: nothing is waiting for an answer, and a target list that named it anyway is not
-    asked either."""
+    """A claim is never refused, so an ask in a game's row is not a refusal and not a release
+    either: the game starts short of whatever is still standing, the question is out with the
+    numbers in it, and nothing is unloaded before it is answered. `policy-kept` is for an answer of
+    keep, not for a question that is still open."""
     claim_rule(rig, monkeypatch)
     ask_first(rig, strata=["claims"])
     rig.strata.loaded = True
@@ -394,10 +397,12 @@ def test_a_workload_that_wants_asking_first_still_holds_for_a_game(rig, monkeypa
     web.watch(rig.arb, polls=1)
     assert rig.strata.loaded
     assert [r["workloads"] for r in rows(rig, "claim-release")] == [["comfy"]]
-    assert rows(rig, "claim-release-targets")[0]["kept"] == ["strata"]
-    kept = rows(rig, "policy-kept")
-    assert len(kept) == 1 and kept[0]["workload"] == "strata"
-    assert "its asks_for asks a claim on the card first" in kept[0]["why"]
+    # Not `kept` for its policy: an ask pair is owed to the claim, and what it isn't owed yet is
+    # the answer.
+    assert rows(rig, "claim-release-targets")[0]["kept"] == []
+    assert rows(rig, "policy-kept") == []
+    asked = rows(rig, "ask")
+    assert len(asked) == 1 and asked[0]["workload"] == "strata" and asked[0]["requester"] == "claims"
     assert rig.arb.claim_release({"name": NAME, "note": NOTE}, only=["strata"])["released"] == []
 
 
@@ -413,12 +418,12 @@ def test_a_switch_you_type_moves_a_workload_that_wants_asking_first(rig):
 
 
 def test_no_workload_is_owed_to_a_pressure_episode_it_wants_asked_for(rig):
-    """Same reasoning as a claim: pressure releases what may be released and refuses nothing,
-    so an ask takes that workload out of the eviction set rather than opening a question."""
+    """An ask pair *is* owed to the episode - it just hasn't been released yet, because the answer
+    hasn't come. Listing it is what makes the episode say which workload it is still waiting on."""
     ask_first(rig, strata=["pressure"])
     rig.strata.loaded = True
     rig.comfy.vram = COMFY_MODEL_VRAM
-    assert [n for n, _ in rig.arb.pressure_candidates()] == ["comfy"]
+    assert [n for n, _ in rig.arb.pressure_candidates()] == ["comfy", "strata"]
 
 
 def test_status_and_why_say_which_answer_an_ask_is_today(rig, monkeypatch, capsys):
@@ -431,8 +436,7 @@ def test_status_and_why_say_which_answer_an_ask_is_today(rig, monkeypatch, capsy
     rig.strata.loaded = True
     assert rig.cli("status") == 0
     out = capsys.readouterr().out
-    assert "strata 50 (anything, and asks a claim on the card first " \
-           "(asking isn't built yet, so it stays loaded))" in out
+    assert "strata 50 (anything, and asks a claim on the card first)" in out
     assert rig.cli("why", "comfy") == 0
     out = capsys.readouterr().out
     assert "keeps its model for the claim: its asks_for asks a claim on the card first" in out

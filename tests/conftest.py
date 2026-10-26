@@ -4,9 +4,9 @@ import sys
 from pathlib import Path
 
 import pytest
-from fakes import FakeComfy, FakeGpu, FakeHost, FakeStrata
+from fakes import FakeComfy, FakeGpu, FakeHost, FakeNotifier, FakeStrata
 
-from vhotseat import cli, config, setup, util
+from vhotseat import cli, config, notify, setup, util
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -28,6 +28,16 @@ def fast(monkeypatch):
     # Waits and polls run at a tenth of their real length.
     monkeypatch.setattr(util, "SCALE", 0.1)
     monkeypatch.delenv("VHOTSEAT_HOLD", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def fake_toasts(monkeypatch):
+    """No test in this suite may raise a Windows toast on whoever is running it - and the asking
+    is still exercised in full. The fake records the question in the words it was asked in and
+    hands back the buttons, so a test reads the ask off `arb.notify` and answers it the way the
+    owner does (`notify.click(ask_id, answer)`) rather than by writing a row behind the answer
+    path's back."""
+    monkeypatch.setattr(notify, "build", lambda env=os.environ: FakeNotifier())
 
 
 def example_config(strata_url: str, comfy_url: str) -> dict:

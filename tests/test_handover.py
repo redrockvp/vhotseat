@@ -41,9 +41,16 @@ def test_status_json_shape_is_unchanged(rig, capsys):
     assert rig.cli("status", "--json") == 0
     s = json.loads(capsys.readouterr().out)
     assert set(s) == {"mode", "strata", "comfy", "gpu", "holders", "claims", "policy",
-                      "pressure", "ram", "last_event"}
+                      "pressure", "ram", "last_event", "last_used", "asks", "notifications"}
     assert set(s["strata"]) == {"service", "reachable", "loaded"}
     assert set(s["policy"]["strata"]) == {"priority", "yields_to", "gives_way_for"}
+    # What an Ask me is decided with: when each workload was last seen working (no stamp is said
+    # as no stamp), which questions are open, and whether this box can notify anybody at all.
+    assert set(s["last_used"]) == {"strata", "comfy"}
+    assert s["last_used"]["strata"] == {"epoch": None, "ago_s": None,
+                                        "phrase": "nothing has recorded it working since this started"}
+    assert s["asks"] == []
+    assert set(s["notifications"]) == {"available", "how", "why"}
     # What the pressure trigger is reading, whether or not anything is happening: the thresholds,
     # the same numbers the card tiles show, and the open and last episode (both empty here).
     pr = s["pressure"]

@@ -58,7 +58,11 @@ a way that leaves the rest of the file, comments included, exactly as it was
 **State** is in `~/.local/state/vhotseat/` (`$XDG_STATE_HOME`): the lock
 (`switch.lock`, one per GPU) and the event log (`events.jsonl`, the last 500
 decisions: every switch, hold and gate, with its reason), and the telemetry
-(`telemetry.db`, below).
+(`telemetry.db`, below). Files more than one process writes - the event log, its
+`last-used.json`, and the owner's `config.yaml` - each have a `<name>.lock` sibling: the
+operating system's lock around a read-check-write, so one process's row or stamp is never
+written over by another's. They stay on disk between writes: removing a lock file is the race
+it closes.
 
 ## Gates: how a workload asks for the GPU
 
@@ -139,17 +143,48 @@ be named `claims` or `pressure`, because those are words `yields_to:` already me
 `asks_for:` is the third answer: *ask me before you unload me*. It takes the same entries
 as `yields_to:` without the `"*"` - an ask that means "anyone" is a question nobody can
 answer - and one entry named in both keys is a config error, because it would say two
-things at once. **The asking isn't built yet.** Until it is, a name in `asks_for:` keeps
-that workload loaded exactly as leaving it out of `yields_to:` does - a load nobody chose
-is refused, a claim leaves it holding and records `policy-kept` - and `vhotseat status`
-and `vhotseat why` say it asks first rather than pretending an answer is coming. What is
-not asked for is not unloaded, whichever way the question was meant.
+things at once. A pair set to `ask` is neither unloaded nor refused on the config's own
+authority: vhotseat opens a question, and the answer - yours, or nobody answering in time -
+is what decides. What is not asked for is not unloaded, whichever way the question was
+meant.
 
 Top level, `ask:` is what an unanswered ask will be worth: `timeout_s` (default 120) how
-long to hold the handover for an answer, and `fallback` of `keep` (default, leave it
-loaded) or `release` (unload it anyway). Nothing waits or notifies yet; the two keys are
-read by the dashboard and recorded so the asking has something written to be built
-against.
+long a waiting request holds for an answer, and `fallback` of `keep` (default, leave it
+loaded) or `release` (unload it anyway). Both are copied into the ask when it opens, so a
+question asked under one pair of numbers is answered under those numbers even if the file
+changes while it stands.
+
+The question is one per (workload, reason, scope) at a time - the scope being which thing the
+question is about: a claim's questions belong to the game process that claimed the card, an
+episode's to the episode that opened it, and a load nobody chose has no scope beyond the
+requester it is named for. Two games on one card wanting the same workload off are two
+questions with two countdowns and two buttons, and neither one closes because the other turned
+up. A row in the event log (`ask`, then
+`ask-answer` with `release`/`keep` and `by: owner` or `by: timeout`), visible in
+`vhotseat status` and on the dashboard, and raised as a Windows toast with two buttons when
+this process can show one. `notifications` in `/api/status` says whether it can. What each
+kind of requester does while it waits is what the asking costs somebody:
+
+- a **load nobody chose** (a gate hook, `switch comfy --request`, `Seat.acquire`) waits for
+  the answer, up to `timeout_s`, and then allows or refuses per the answer or the fallback.
+  Nothing is running that an unload would interrupt, and the newcomer was being allowed or
+  refused either way. A gate that runs out of its *own* timeout gives up on that request and
+  leaves the question open for the next one and for the dashboard.
+- a **claim** and a **pressure episode** run meanwhile: they are never refused and never
+  held up, the game or the grower simply keeps the card short of that much memory until the
+  answer arrives, and the release the answer agrees to goes through the normal release path
+  on the next look. An answer belongs to the scope it was asked for - the game that was
+  playing when it was given, the episode that was short when it was given - and a question
+  ends with that scope: a claim that ends retires its unanswered asks with an `ask-end` row
+  (`closed_by: claim-ended`) and an episode that ends retires its own (`episode-ended`), so
+  nobody is left looking at a countdown for a game that has gone, and nothing is closed
+  because a different scope appeared. A retired ask is closed, not answered: it takes no
+  answer (409), releases nothing, and is not recorded as a `keep` nobody gave.
+
+An Ask me says what it is deciding: what the workload holds, and when it was last seen
+working (`used 40 s ago`, `idle for 25 min`, or "nothing has recorded it working" - never
+"idle" just because nobody looked). The watchers record that per workload as they poll, in
+`last-used.json` beside the event log; a proxy or a gate that sees a request stamps it too.
 
 What the policy decides is **who gets unloaded, and who is refused instead**. It is
 enforced wherever vhotseat decides to unload something, and its direction matters:
@@ -163,9 +198,11 @@ enforced wherever vhotseat decides to unload something, and its direction matter
   wouldn't have, and records `policy-override` saying whose policy it overrode, so the log
   answers "why did Strata lose its 20 GB?" later.
 - a **claim starting** (`on_start: release`) never unloads a workload whose `yields_to`
-  doesn't cover `claims`. It isn't refused - freeing the card is not a load - the workload
-  is simply not a target, and the record and the dashboard say so (`policy-kept`), because
-  the game may now be short of the VRAM that stayed put.
+  doesn't cover `claims` and whose `asks_for` doesn't name them. It isn't refused - freeing
+  the card is not a load - the workload is simply not a target, and the record and the
+  dashboard say so (`policy-kept`), because the game may now be short of the VRAM that
+  stayed put. A workload whose pair is `ask` *is* a target, and is asked about instead of
+  released: `policy-kept` for that one waits for an answer of `keep`.
 - a workload at or below its `idle_vram_mib` holds nothing for anyone to be short of, so
   it doesn't refuse a load whatever its `yields_to:` says. The policy reads what the card
   shows; a load that hasn't put weights on the card yet isn't yet a holder.
@@ -342,6 +379,13 @@ One page, refreshed every 5 s, that works on a phone too:
   holding at most - and for every pair of workloads a tile saying whether they fit on the
   card at the same time. Read-only on the page for now; `GET`/`POST /api/policy` (below)
   reads and writes the keys, and the page that edits them is the next part.
+- **An open Ask me**: when a pair's answer is *ask me*, the question itself sits at the top
+  of the page - what the workload holds, when it was last seen working, how long is left
+  before the fallback applies, and the two buttons - in the same words the notification
+  used, so an owner who missed the toast answers the question they were asked. `asks` in
+  `/api/status` is what carries it, and `last_used` per workload is where "used 40 s ago"
+  comes from. `notifications` says whether this process can raise a toast at all, and when
+  it can't, the card and `status` are the question.
 - **Events / Logs**: every switch, hold and gate decision, and every line a
   vhotseat command logged, from any process (the guard's `switch comfy`,
   Strata's `gate strata`, your `hold`).
@@ -365,8 +409,10 @@ running process.
 |---|---|
 | `GET /api/policy` | what the grid needs: the workloads in the order a handover unloads them, the columns a pair can be asked for (each other workload, `claims`, `pressure`), each cell's choice (`yes` / `ask` / `keep`) with the sentence saying what it does and why, the `ask:` and `pressure:` numbers, and a `version` (sha256 of the config file) to send back with a save. Grid and version are read from the file in one go, and those rules are what this process then acts on: rules remembered from an older file beside a version read fresh is how a save would write someone's hand-edit away and report success. A file that stopped being a config keeps the rules that were in force and carries `config_error` in the answer |
 | `POST /api/policy` | `{"version": "..."}` when the file now says what was posted. Body: `version` (required) and any of `priorities` (the unload order), `matrix` (`{workload: {requester: "yes"\|"ask"\|"keep"}}`), `ask`, `pressure` - a key left out is left alone. `409` with the version that's on disk when the file changed since it was read (or without one, when another save is midway through the file and this one should simply try again); `400` with what `doctor` would say, when the result wouldn't load |
+| `POST /api/asks/<id>` | the ask as it now reads: `{ask: {...}}`. Body: `{answer: "release"\|"keep"}`. The id is the row's own, so an answer belongs to the question that was opened - its numbers, its timeout, its fallback - and not to whatever the pair looks like now. `409` for an ask answered or closed already - closed meaning answered, or retired without an answer because the game it was asked about has gone (the first answer wins, whoever wrote it: a notification's button, the page's button and a watcher applying the fallback all go through this call, and the check that the ask is still open plus the row answering it are written in one turn of the log, so which answer won is decided in the file rather than in a reading of it)); `404` for an id the log doesn't hold; `400` for a body that isn't one of the two answers; `503` when the log is held by a writer that wouldn't let go, which says plainly that nothing was written and the question is still open. Nothing is unloaded by this call: it writes the answer, and whoever owes the release - the request that waited, a watcher's next poll, the episode - acts on it through the normal path, which is what keeps a request in flight from being cut off |
+| `POST /api/make-room` | what the switch did: `{ok, done}`. Body: `{for: "workload"}`. The warning's "make room for X": one workload gets the card now whatever the rules say about who would have been refused, recorded as `policy-override` exactly as a `switch` typed at a terminal is, and asking nothing - not even a claim, since a person clicked it. It changes no rule and writes no config: wanting room this once and wanting the rule moved are different answers, and the second one belongs in the grid. `400` for a workload that isn't configured |
 
-The POST is guarded three ways, because a config is not a page-refresh: the
+The POSTs are guarded three ways, because a config and an unload are not page-refreshes: the
 `X-Vhotseat-Edit: 1` header, `Content-Type: application/json` - a page on another origin
 can set neither from a form, and to set both from a script it needs a preflight this server
 never answers - and an `Origin` that is this dashboard's own port when an `Origin` is sent at
@@ -419,8 +465,10 @@ gate, opened once and asked before every request - reloads the same way, on each
 
 **History doesn't need the page open.** Every vhotseat command records into
 `~/.local/state/vhotseat/telemetry.db` (SQLite) as it runs: each status probe
-is a sample, each event and log line a row, and a `hold` or a waiting `switch`
-samples every `interval_s` while it lasts. So a dashboard started later shows
+is a sample, each event and log line a row - an Ask me and the answer to it are
+events, so the history is where you can still see, weeks later, which unload was a
+person's decision - and a `hold` or a waiting `switch` samples every `interval_s`
+while it lasts. So a dashboard started later shows
 what happened before. Between commands nothing samples, which shows as gaps;
 for an unbroken history run the recorder as a service:
 

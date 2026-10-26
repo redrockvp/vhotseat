@@ -106,6 +106,23 @@ tr.hl td { background: var(--wash); }
 .banner ul { margin: 0; padding-left: 18px; color: var(--ink-2); }
 .banner li { margin: 3px 0; overflow-wrap: anywhere; }
 .banner .when { color: var(--muted); }
+.banner .wact { margin-top: 6px; }
+/* An Ask me: a decision the owner has to make, with the numbers it is made on, and the way to
+   make it from here. Warmer than a warning because it is a question rather than news, and it is
+   the only card on the page that acts on the card. */
+.asks { display: grid; gap: 12px; margin-bottom: 14px; }
+.ask { background: var(--surface); border-left: 4px solid var(--serious); border-radius: 10px;
+  box-shadow: 0 0 0 1px var(--ring); padding: 12px 14px; font-size: 13px; }
+.ask .ahead { font-weight: 650; font-size: 15px; }
+.ask .ameta { color: var(--muted); font-size: 12px; margin: 2px 0 6px; }
+.ask .adetail { color: var(--ink-2); overflow-wrap: anywhere; }
+.ask .afallback { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.ask .abuttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.ask button, .banner button { font: inherit; padding: 7px 12px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--axis); background: var(--wash); color: var(--ink); }
+.ask button.release { background: var(--serious); border-color: var(--serious); color: #fff; font-weight: 650; }
+.ask button[disabled] { opacity: .5; cursor: default; }
+.ask .adone { color: var(--ink-2); margin-top: 10px; }
 .workloads { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-bottom: 14px; }
 .holders { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px 18px; margin-top: 4px; }
 .who.claim { color: var(--critical); }
@@ -173,6 +190,7 @@ td.nw { color: var(--ink); }
     <div class="seg" id="ranges"></div>
     <span class="sub" id="rangeNote"></span>
   </div>
+  <div class="asks" id="asks" hidden></div>
   <div class="banner" id="warnings" hidden></div>
   <p class="notice" id="notice" hidden></p>
 
@@ -322,6 +340,18 @@ async function getJSON(url) {
   return body;
 }
 
+// The two POSTs that act on the card, and the policy save: all three send the header and the JSON
+// content type the server checks for, which is what a page on somebody else's origin can't send
+// from a form. A cross-origin fetch that could set both needs a preflight the server never answers.
+async function postJSON(url, body) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json",
+                                                         "X-Vhotseat-Edit": "1" },
+                               body: JSON.stringify(body) });
+  const out = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(out.error || r.statusText);
+  return out;
+}
+
 // --- data -----------------------------------------------------------------------
 
 async function refresh() {
@@ -351,6 +381,7 @@ async function refresh() {
 function render() {
   renderHeader();
   if (!state.status) return;
+  renderAsks();
   renderCharts();
   renderEvents();
   renderLogs();
@@ -797,6 +828,67 @@ function renderWhy() {
   }));
 }
 
+// An Ask me the log says is open: the question, in the words the notification asked it in, with
+// the two answers beside it. This card is the way to answer when there is no notification to click
+// - a watch running over a disconnected session, a Linux box, a box where the toast was missed -
+// and the reason the numbers are in it is that they are the ones the question was opened with:
+// what the workload holds and when it was last seen working, not what the card says this second.
+// A countdown is shown because the ask expires into the config's `ask.fallback`, and an owner who
+// didn't know that is answering a different question than the one they were asked.
+function askCountdown(a) {
+  const left = (a.timeout_s || 0) - (Date.now() / 1000 - new Date(a.time).getTime() / 1000);
+  if (left <= 0) return "answer now: " + (a.fallback === "release" ? "it unloads on its own" : "it stays loaded");
+  const s = Math.round(left);
+  return `answer within ${s >= 60 ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}` : `${s} s`}`;
+}
+
+function renderAsks() {
+  const box = $("asks"), asks = state.status.asks || [];
+  if (!asks.length) { box.hidden = true; box.replaceChildren(); return; }
+  box.hidden = false;
+  box.replaceChildren(...asks.map((a) => {
+    const t = a.text || {};
+    const card = el("div", { class: "ask" });
+    card.append(el("div", { class: "ahead" }, t.headline || `${a.label} is being asked about`));
+    const started = fmtTime(new Date(a.time).getTime() / 1000).slice(0, 5);
+    const who = a.name ? `${a.name} started ${started}`
+      : a.requester === "pressure" ? `${a.requester_label} (${started})`
+      : `${a.requester_label || a.requester} asked ${started}`;
+    card.append(el("div", { class: "ameta" }, `${who} · ${askCountdown(a)}`));
+    card.append(el("div", { class: "adetail" }, t.detail || ""));
+    card.append(el("div", { class: "afallback" }, t.no_answer || ""));
+    const row = el("div", { class: "abuttons" });
+    for (const ans of (t.answers || [])) {
+      const b = el("button", { type: "button", class: ans.answer === "release" ? "release" : "keep" },
+                  ans.label);
+      b.onclick = () => answerAsk(a, ans, row, card);
+      row.append(b);
+    }
+    row.append(el("a", { href: "#policy-card", class: "ameta" }, "change this rule"));
+    card.append(row);
+    return card;
+  }));
+}
+
+// Answering an ask is one POST to the ask's own id, so the answer belongs to the question that was
+// opened - its numbers, its timeout, its fallback - and not to whatever the pair looks like now.
+// Whoever opened the ask does the releasing, in its own path: a claim's next poll, the request that
+// waited, the episode. An ask answered elsewhere in the meantime is refused with a 409 and the card
+// simply goes away on the next refresh, because an answer already given is not a second answer.
+async function answerAsk(a, ans, row, card) {
+  for (const b of row.querySelectorAll("button")) { b.disabled = true; b.setAttribute("aria-disabled", "true"); }
+  const note = el("div", { class: "adone" }, `answering: ${ans.label.toLowerCase()}`);
+  card.append(note);
+  try {
+    await postJSON(`/api/asks/${a.id}`, { answer: ans.answer });
+    note.textContent = ans.answer === "release" ? `you said unload ${a.label}: it comes off now`
+                                                : `you said keep ${a.label} loaded: it stays`;
+  } catch (e) {
+    note.textContent = `that answer didn't go in: ${e.message}`;
+  }
+  refresh();
+}
+
 // A policy refusal, or a claim that wasn't allowed to unload something: somebody may be
 // short of VRAM right now, so it stays up until it stops being recent news. The server trims
 // the list to this window from the event log; the page checks the age again so a tab that
@@ -813,20 +905,32 @@ function renderWarnings() {
     // Current, not recent news: the card is short right now and models are coming off under the
     // page's own feet. It stays up for as long as the episode is open, whatever its start time.
     const ep = pr.open.episode || {};
-    items.push([`the card is short for ${ep.name || "an app vhotseat doesn't manage"}: `, ep.grew_mib != null
+    items.push({ what: `the card is short for ${ep.name || "an app vhotseat doesn't manage"}: `,
+                 when: ep.grew_mib != null
       ? `${gib(ep.grew_mib)} GiB over its ${gib(ep.floor_mib)} GiB usual, card at ${gib(ep.free_mib)} GiB free`
-      : "releases are in progress"]);
+      : "releases are in progress" });
   }
   for (const w of rows) {
-    items.push([w.why || w.event, ` · ${fmtTime(new Date(w.time).getTime() / 1000)} · ${w.event}`]);
+    // A refusal is the one warning with something to do about it from here: the rules stay as they
+    // are, and this workload gets the card once, as if the owner had typed `switch` themselves -
+    // which is exactly what the log will say it was (`policy-override`), so "why did Strata lose
+    // its model?" is still answerable tomorrow. Wanting room this once and wanting the rule moved
+    // are different answers, and the second one belongs in the grid below.
+    items.push({ what: w.why || w.event, when: ` · ${fmtTime(new Date(w.time).getTime() / 1000)} · ${w.event}`,
+                 for: w.event === "policy-refused" ? w.requested : null });
   }
   if (!items.length) { box.hidden = true; return; }
   box.hidden = false;
   const ul = el("ul");
-  for (const [what, when] of items) {
+  for (const item of items) {
     const li = el("li");
-    li.append(what);
-    li.append(el("span", { class: "when" }, when));
+    li.append(item.what);
+    li.append(el("span", { class: "when" }, item.when));
+    if (item.for) {
+      const b = el("button", { type: "button" }, `make room for ${labelOf(item.for)}`);
+      b.onclick = () => makeRoom(item.for, b);
+      li.append(el("div", { class: "wact" }, b));
+    }
     ul.append(li);
   }
   box.replaceChildren(el("div", { class: "whead" },
@@ -834,6 +938,22 @@ function renderWarnings() {
       : pr.open ? "The card is short right now"
       : rows.length === 1 ? "One policy decision worth a look"
       : `${rows.length} policy decisions worth a look`), ul);
+}
+
+// One workload gets the card now, whatever the rules say about who would have been refused. This
+// changes no rule: it is the one-off decision the warning is about, and it goes through the same
+// path as a `switch` typed at a terminal, including the row that says whose policy it overrode.
+async function makeRoom(name, button) {
+  button.disabled = true;
+  button.textContent = `making room for ${labelOf(name)}...`;
+  try {
+    await postJSON("/api/make-room", { for: name });
+    button.textContent = `room made for ${labelOf(name)}`;
+  } catch (e) {
+    button.disabled = false;
+    button.textContent = `couldn't make room: ${e.message}`;
+  }
+  refresh();
 }
 
 // The config's policy, read-only: what each workload gives way for, what it costs at its

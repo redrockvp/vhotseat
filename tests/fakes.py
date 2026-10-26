@@ -415,6 +415,43 @@ class FakeGpu:
         return snap, (rows[:limit] if limit > 0 else rows)
 
 
+class FakeNotifier:
+    """The ask, recorded instead of shown.
+
+    `asks` are the questions in the words they were asked in, which is what a test of the asking
+    wants to read; `click` is the toast's button, i.e. the callback the notifier was handed, so a
+    test that answers this way exercises the real answer path (the arbiter's, with its 409 on a
+    closed ask) rather than a stub of it. Conftest installs one in every arbiter the suite builds,
+    so no test can pop a notification on whoever is running the suite.
+    """
+
+    name = "fake"
+
+    def __init__(self):
+        self.asks: list[dict] = []
+        self._buttons: list[tuple[str, object]] = []
+
+    def status(self) -> dict:
+        return {"available": True, "how": self.name, "why": None}
+
+    def show_ask(self, ask: dict, on_answer) -> bool:
+        self.asks.append(ask)
+        self._buttons.append((ask.get("id"), on_answer))
+        return True
+
+    def click(self, ask_id: str, answer: str) -> bool:
+        """Press the button of this ask. False if there isn't one - a test that clicks a question
+        that was never asked should fail rather than answer something else."""
+        for ask_id_, callback in self._buttons:
+            if ask_id_ == ask_id:
+                callback(ask_id, answer)
+                return True
+        return False
+
+    def texts(self) -> list[dict]:
+        return [a["text"] for a in self.asks]
+
+
 class _FakeService:
     can_start = True
 

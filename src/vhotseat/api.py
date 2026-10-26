@@ -97,9 +97,18 @@ class Seat:
     def acquire(self, name: str, wait: float = 0) -> list[str]:
         """Give the GPU to `name` under the lock, as `vhotseat switch NAME --wait
         WAIT` does, without loading it (the request about to be forwarded does).
-        Returns what was done; raises Busy or SwitchError if it can't."""
+        Returns what was done; raises Busy or SwitchError if it can't - and waits for the
+        owner's answer first if a holder's policy says Ask me for this workload (see
+        `arbiter.ask_before_request`: the answer arrives in the event log, so this needs no
+        channel back to the proxy).
+
+        A proxy is also the only thing on some boxes that knows a request arrived, so it stamps
+        the workload as used here: that is the fact an ask is asked with ("used 40 s ago, so an
+        agent may be mid-task"), and a server whose traffic only goes through a gate has no
+        watcher that would otherwise have seen it."""
         if name not in self.arbiter.workloads:
             raise KeyError(f"no workload named {name!r}")
+        self.arbiter.note_used(name)
         return self._switch(name, wait)
 
     def release_all(self, wait: float = 0) -> list[str]:
