@@ -9,6 +9,9 @@ from . import pressure, util
 # The rows that say a claim is open, and what has been done about it.
 CLAIM_ROWS = ("claim", "claim-end", "claim-release", "claim-release-targets",
               "claim-release-waiting")
+# The rows that make an ask: `ask` opens the question (one per workload and requester at a
+# time) and `ask-answer` closes it, answered by the owner or by nobody answering in time.
+ASK_ROWS = ("ask", "ask-answer")
 
 
 def row_time(e: dict) -> datetime.datetime | None:
@@ -32,7 +35,7 @@ class EventLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         event = {"time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
                  "event": kind, **fields}
-        lines = self.path.read_text(encoding="utf-8").splitlines() if self.path.exists() else []
+        lines = self._read() if self.path.exists() else []
         lines = [*lines[-(self.keep - 1):], json.dumps(event)]
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -40,14 +43,31 @@ class EventLog:
         if self.telemetry is not None:
             self.telemetry.event(event)
 
+    def _read(self) -> list[str]:
+        """The log's lines, retried the way `util.replace` retries the write beside it. On Windows
+        the rename that appends a row leaves the path briefly unopenable by anyone else, and the
+        asking makes that a everyday thing: a request waiting for an answer re-reads the log about
+        twice a second, and so do the watchers, while whoever answers writes to it. Losing one of
+        those reads to the write it crossed isn't information about the world, so it is tried
+        again; the last attempt raises, because a log that can never be read is a real error. The
+        wait is a fraction of the poll it happens in, never a whole one."""
+        for attempt in range(20):
+            try:
+                return self.path.read_text(encoding="utf-8").splitlines()
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                util.sleep(0.05)
+        return []                                            # unreachable: the loop raises or returns
+
     def tail(self, limit: int = 200) -> list[dict]:
         """The last `limit` events, oldest first, skipping anything unreadable. A reader that
-        wants the state of the world as recorded - which claims are still open - reads this
-        instead of keeping its own copy of it."""
+        wants the state of the world as recorded - which claims are still open, which ask is
+        unanswered - reads this instead of keeping its own copy of it."""
         if not self.path.exists():
             return []
         out = []
-        for line in self.path.read_text(encoding="utf-8").splitlines()[-limit:]:
+        for line in self._read()[-limit:]:
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
@@ -110,6 +130,75 @@ class EventLog:
                                            "attempts": e.get("attempts") or 1,
                                            "stuck": bool(e.get("stuck")),
                                            "held_mib": e.get("held_mib") or 0})
+        return out
+
+    def asks(self, limit: int = 500) -> list[dict]:
+        """Every ask the retained log holds, oldest first, each with its `answer` and `by` once it
+        has one. Same shape of answer as `claims_open` and `episode_open`, for the same reason:
+        `watch`, the dashboard, a gate in a fresh process and a toast's button all need the one
+        open ask for a (workload, requester) pair, and whichever of them wrote it doesn't get a
+        private copy of it. An ask older than the retained log is forgotten, and asking again is
+        honest.
+
+        A second `ask-answer` for the same ask - the owner clicking Keep a moment before a
+        watcher gives up and applies the fallback - is ignored rather than argued about: the
+        first answer in the log is the answer."""
+        out: dict[str, dict] = {}
+        order: list[str] = []
+        for e in self.tail(limit):
+            kind = e.get("event")
+            if kind not in ASK_ROWS:
+                continue
+            ask_id = e.get("id")
+            if not ask_id:
+                continue
+            if kind == "ask":
+                if ask_id not in out:
+                    out[ask_id] = dict(e)
+                    order.append(ask_id)
+            elif ask_id in out and not out[ask_id].get("answer"):
+                out[ask_id].update(answer=e.get("answer"), by=e.get("by") or "owner",
+                                   answered_at=e.get("time"))
+        return [out[i] for i in order]
+
+    def open_asks(self, limit: int = 500) -> list[dict]:
+        """The asks the log shows as unanswered. What `/api/status` shows as the open question, and
+        what an actor joins instead of asking the same question twice."""
+        return [a for a in self.asks(limit) if not a.get("answer")]
+
+    def open_ask(self, workload: str, requester: str, limit: int = 500) -> dict | None:
+        """The unanswered ask for this workload and this requester, if the log holds one. The one
+        question per pair is what stops a job queue asking the owner the same thing fifty times."""
+        return next((a for a in self.open_asks(limit)
+                     if a.get("workload") == workload and a.get("requester") == requester), None)
+
+    def ask_by_id(self, ask_id: str, limit: int = 500) -> dict | None:
+        """One ask by its id, answered or not: what `POST /api/asks/<id>` answers, and what says it
+        was answered already (409) or is not in the log at all (404)."""
+        return next((a for a in self.asks(limit) if a.get("id") == ask_id), None)
+
+    def kept_said(self, reason: str, name: str | None = None, note: str | None = None,
+                  since: str | None = None, limit: int = 500) -> set[str]:
+        """Which workloads have already had their `policy-kept` row written for this reason - this
+        claim (by name and note) or this episode (by grower name, at or after `since`).
+
+        The row is what tells the owner a workload is still holding memory someone may be short
+        of, so it has to be said once per reason, not once per poll: a watcher that re-checks an
+        open claim every 2 s would otherwise bury the log in the same warning, and the dashboard
+        banner decides what is news from a row's age."""
+        out = set()
+        for e in self.tail(limit):
+            if e.get("event") != "policy-kept" or e.get("reason") != reason:
+                continue
+            if reason == "claims" and (e.get("name"), e.get("note")) != (name, note):
+                continue
+            if reason == "pressure" and e.get("name") != name:
+                continue
+            when, after = row_time(e), row_time({"time": since}) if since else None
+            if after and (when is None or when < after):
+                continue
+            if e.get("workload"):
+                out.add(e["workload"])
         return out
 
     def recent(self, kinds, within_s: float = 300.0, limit: int = 500) -> list[dict]:
