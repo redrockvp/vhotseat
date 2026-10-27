@@ -81,8 +81,18 @@ def ask_text(ask: dict) -> dict:
     else:
         headline = f"{who} wants the GPU"
         title = headline
-        detail = (f"{label} is holding {held} and {used}. {who} is waiting for your answer rather "
-                  f"than being refused or unloading anything. Unload {label} so it can load?")
+        if ask.get("arrived"):
+            # The newcomer is already on the card: its gate never asks, so nobody is holding a load
+            # up with this question, and saying so is what makes the ask an offer of the room rather
+            # than a permission slip. Nothing here pretends the load can still be stopped.
+            headline = f"{who} loaded while {label} kept the card"
+            title = headline
+            detail = (f"{label} is holding {held} and {used}. {who} is on the card now, having sized "
+                      f"itself to what was free: nothing is waiting for your answer, and unloading "
+                      f"{label} gives it the room its gate would have asked for. Unload {label}?")
+        else:
+            detail = (f"{label} is holding {held} and {used}. {who} is waiting for your answer rather "
+                      f"than being refused or unloading anything. Unload {label} so it can load?")
 
     fallback_line = (f"{label} stays loaded" if ask.get("fallback", "keep") == "keep"
                      else f"{label} unloads")

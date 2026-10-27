@@ -40,6 +40,7 @@ import json
 import signal
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from urllib.parse import parse_qs, urlparse
@@ -169,7 +170,14 @@ class Dashboard:
                     cached["oldest"] = oldest
                 else:
                     oldest_err = None
-                watch_pass(self.arbiter, cached.get("claims", []))
+                # The card the page is about to show is the card this pass acts on: an arrival is a
+                # workload that wasn't on the card last pass and is now, and noticing it from a second
+                # reading - one taken a moment later, one GPU write apart - is how the page ends up
+                # explaining a conflict it isn't showing. `watch` has no such reading, so it lets the
+                # watcher take its own.
+                watch_pass(self.arbiter, cached.get("claims", []),
+                           ([n for n, w in self.arbiter.workloads.items()
+                             if w.active(cached[n], cached["gpu"])], cached["gpu"]))
                 if "claims_state" in cached:
                     # What has been unloaded for an open claim, and what is still holding. The
                     # log rebuilds it keyed by (process name, what claimed it) because that is
@@ -659,9 +667,10 @@ def watch(arbiter, polls: int | None = None) -> int:
 
     Nothing depends on this process to refuse a load: every gate and guard asks who owns the
     card at the moment it decides, so a load is refused whether or not watch runs. What watch
-    adds is the acting half - the release a claim asks for (`on_start: release`) - and the
-    record: `claim`, `claim-end`, `claim-release` and `claim-release-waiting` in the event log,
-    so the dashboard can show when the card was somebody else's, what was unloaded for it and
+    adds is the acting half - the release a claim asks for (`on_start: release`), and the same for
+    a workload that loaded past a gate that never asks - and the record: `claim`, `claim-end`,
+    `claim-release` and `claim-release-waiting` in the event log, with `arrival` and its rows beside
+    them, so the dashboard can show when the card was somebody else's, what was unloaded for it and
     what is still holding. It is also the cheapest always-on sampler, which is what
     `vhotseat autostart install --command watch` starts.
 
@@ -867,14 +876,19 @@ def _groups(hits):
 STUCK_TRIES = 3
 
 
-def watch_pass(arbiter, hits: list[dict]) -> None:
+def watch_pass(arbiter, hits: list[dict], card: tuple | None = None) -> None:
     """One pass of what the watcher does: pick up the owner's policy if the file changed, record
-    the claims and act on them, then look at the pressure the claims don't explain. One call
-    because both halves want the same process scan, and both are safe to run from more than one
-    process on the box."""
+    the claims and act on them, then look at the pressure the claims don't explain, then at any
+    workload that loaded past a gate that never asks. One call because all three want the same
+    process scan, and all three are safe to run from more than one process on the box.
+
+    `card` is the (workloads on the card, gpu sums) pair a caller has already read. The dashboard
+    probes before it passes here, and an arrival noticed on a different reading than the one the
+    page is showing is a disagreement about which workload just loaded."""
     arbiter.reload_policy()
     claim_transitions(arbiter, hits)
     pressure_pass(arbiter, {h["pid"] for h in hits})
+    arrival_pass(arbiter, card)
 
 
 def pressure_pass(arbiter, claimed: set = frozenset()) -> None:
@@ -937,6 +951,178 @@ def pressure_pass(arbiter, claimed: set = frozenset()) -> None:
     for w in out["waiting"]:
         if not w.get("stuck"):
             util.log(f"pressure: {label(w['workload'])} keeps its model for now - {w['why']}")
+
+
+def arrival_note(arbiter, arriving: str, others, freed_mib: int) -> str | None:
+    """What an arrival's release says about itself, on the row and in the log line.
+
+    The memory only came free *after* the model was loaded, so it is holding less of the card than it
+    would have with the room made first, and it will keep holding less until it is loaded again. An
+    owner who sees only "ComfyUI unloaded" has no way to know that, and the release row is where this
+    is recorded, so the sentence goes there: what happened, and the one thing to do about it."""
+    if not freed_mib:
+        return None
+    who = arbiter.label(arriving)
+    rest = [arbiter.label(n) for n in others if n != arriving] or ["the other workload"]
+    were = "were" if len(rest) > 1 else "was"
+    return (f"{who} loaded while {policy.join_and(rest)} {were} on the card, so it sized itself to "
+            f"what was free. Reload the model in {who} to use the {freed_mib} MiB freed.")
+
+
+def arrival_pass(arbiter, card: tuple | None = None) -> None:
+    """One look at the workloads that loaded past a gate that never asks: end the arrivals whose
+    conflict is over, record the new ones, and keep the release going for the ones still on the card.
+
+    A `gate: {kind: hold}` workload has nothing inside it that asks for the GPU - no hook, no plugin,
+    no proxy - so loading a model from its own UI, or from an API call that wakes it, never goes
+    through a gate and never makes room first. What the owner set in the Rules grid is what would have
+    applied had it asked, so the watcher applies that same grid after the fact: for every other
+    workload on the card, its cell for the newcomer's column (docs/how-it-works.md §3.8).
+
+    What it never does is undo the load. Nothing is refused or rolled back: the newcomer is left
+    running with whatever it took, and what happens is the release half of the cell and nothing else -
+    Make room releases, Ask me asks once and releases when the answer says unload, Keep loaded writes
+    a `policy-kept` row and leaves it holding, and anything working is never interrupted and is asked
+    again on a later pass while the conflict lasts. It goes through `claim_release`, which is how a
+    game's release works, so the two cannot drift apart.
+
+    Whether an arrival is open, which workloads it was owed and what has come free are read back from
+    the event log, so `watch` and the dashboard's watcher - which both run this - see one episode and
+    not two releases of the same model. The GPU lock is the mutex, and the release re-reads the card
+    inside it.
+    """
+    events = arbiter.events
+    now, arrivals, gpu = arbiter.arrival_scan(card)
+    for n, rec in events.arrivals_open().items():
+        # An arrival lasts as long as the conflict does. Whichever half of it goes - the newcomer
+        # unloads, or the card is back to one workload - there is nothing left to make room for, and
+        # a question left open would be an invitation to unload something for a card that has already
+        # sorted itself out.
+        if n in now and len(now) > 1:
+            continue
+        why = (f"{arbiter.label(n)} unloaded" if n not in now
+               else "only one workload is left on the card")
+        events.record("arrival-end", source="watch", arriving=n, reason=why,
+                      freed_mib=rec.get("freed_mib") or 0)
+        arbiter.end_scope_asks(n, arbiter.arrival_scope(rec.get("arrival") or {}),
+                               closed_by="arrival-ended",
+                               says=f"{why}: the question was asked about that load, and there is "
+                                    "nothing left to free for it")
+        util.log(f"arrival: {why}: nothing more to free for it")
+    for n in arrivals:
+        if n in events.arrivals_open():
+            continue          # whoever arrived second acts on the row the other one wrote
+        others = sorted(x for x in now if x != n)
+        events.record("arrival", source="watch", id=uuid.uuid4().hex[:12], arriving=n,
+                      others=others, free_mib=gpu.get("free_mib"))
+        util.log(f"arrival: {arbiter.label(n)} loaded past its gate "
+                 f"({gpu.get(f'{n}_mib') or 0} MiB, with "
+                 f"{policy.join_and([arbiter.label(x) for x in others])}): "
+                 "making the room its gate would have asked for")
+    for n, rec in events.arrivals_open().items():
+        arrival_release_for(arbiter, n, rec)
+
+
+def arrival_release_for(arbiter, arriving: str, rec: dict) -> None:
+    """One arrival's share of the release: the workloads that held the card when it arrived, less the
+    ones the card agrees came free, and nobody else. The mirror of `release_for` for a claim, and it
+    calls the same `claim_release`, with the newcomer's name as the requester - which is what makes
+    the Rules grid's cell, not a rule of the watcher's own, the thing that decides.
+
+    The targets are decided once, from what the card held when the arrival was recorded, and read back
+    from the log afterwards for the reason a claim decides them once: a model the owner loads while
+    two are already sharing the card is theirs, and a watcher that re-picked its list every poll would
+    be back for it every 2 s. A target that is working is asked again on every pass; one that says it
+    unloaded and keeps holding is asked `STUCK_TRIES` times and then left - the same patience the
+    claim and pressure releases count, read back from the rows so both watchers count the same three.
+    """
+    events = arbiter.events
+    label = arbiter.label                                # a name that isn't a workload's, said back
+    if rec.get("targets") is None:
+        targets = arbiter.arrival_targets(arriving)
+        # On the card, holding more than its idle weight, and not owed to this arrival because its
+        # `yields_to:` doesn't cover the newcomer: it keeps its model, the load may be short of that
+        # much, and nothing here is waiting for it. Decided once, which is also what stops a long
+        # conflict writing the same warning every poll.
+        kept = arbiter.kept_for_policy(arriving)
+        events.record("arrival-release-targets", source="watch", arriving=arriving,
+                      targets=targets, kept=[k["workload"] for k in kept])
+        rec = {**rec, "targets": targets}
+        for k in kept:
+            why = arbiter.kept_why(arriving, k["workload"], k["held_mib"])
+            events.record("policy-kept", source="watch", reason=arriving, arriving=arriving,
+                          workload=k["workload"], held_mib=k["held_mib"], why=why)
+            util.log(f"arrival: {why}")
+    waiting = rec.get("waiting") or []
+    stuck = {w["workload"]: w.get("attempts") or 1 for w in waiting if w.get("stuck")}
+    held = {w["workload"]: w.get("held_mib") or 0 for w in waiting}
+    given = set(rec.get("released") or [])
+    pending = [n for n in rec["targets"]
+               if n not in given and stuck.get(n, 0) < STUCK_TRIES]
+    if not pending:
+        return
+    # A target that has come clear by itself - the owner closed the program, or unloaded it to make
+    # room themselves - is as done as this arrival cares, and saying so stops the log and `status`
+    # naming it as holding.
+    snap = arbiter.snapshot()
+    clear = [n for n in pending
+             if n not in arbiter.workloads
+             or (snap.get(f"{n}_mib") or 0) <= arbiter.workloads[n].idle_vram_mib]
+    still = [n for n in pending if n not in clear]
+    if clear:
+        freed = sum(held.get(n, 0) for n in clear)
+        row = {"workloads": clear,
+               "freed": [{"workload": n, "freed_mib": held.get(n, 0)} for n in clear if held.get(n, 0)],
+               "freed_mib": freed, "late": True}
+        if note := arrival_note(arbiter, arriving, (rec.get("arrival") or {}).get("others") or [],
+                                freed):
+            row["note"] = note
+        events.record("arrival-release", source="watch", arriving=arriving, **row)
+        util.log(f"arrival: {label(arriving)}: " + ", ".join(label(n) for n in clear) +
+                 " holds nothing on the card now")
+    if not still:
+        return
+    try:
+        out = arbiter.claim_release({"name": label(arriving)}, only=still, reason=arriving,
+                                    tag=arbiter.ARRIVAL_LOCK, source="watch",
+                                    scope=arbiter.arrival_scope(rec.get("arrival") or {}),
+                                    ask_since=(rec.get("arrival") or {}).get("time"))
+    except Exception as e:            # a watcher that lives at logon must not die on one bad poll
+        util.log(f"arrival: {label(arriving)}: couldn't free the card - {type(e).__name__}: {e}")
+        return
+    if out.get("by_actor"):
+        return          # another watcher is mid-release for this arrival: ask again on the next poll
+    if out["released"]:
+        freed = out["freed_mib"]
+        note = arrival_note(arbiter, arriving, (rec.get("arrival") or {}).get("others") or [], freed)
+        events.record("arrival-release", source="watch", arriving=arriving,
+                      workloads=[r["workload"] for r in out["released"]],
+                      # What went, per workload, inside the row rather than spread over its keys: a
+                      # workload called `name` would otherwise overwrite the row's own field.
+                      freed=[{"workload": r["workload"], "freed_mib": r["freed_mib"]}
+                             for r in out["released"]],
+                      freed_mib=freed, **({"note": note} if note else {}))
+        util.log(f"arrival: {label(arriving)}: " +
+                 ", ".join(f"{label(r['workload'])} {r['freed_mib']} MiB" for r in out["released"]) +
+                 " unloaded, nothing closed" + (f". {note}" if note else ""))
+    asked = ([{"workload": n, "why": out["declined"]} for n in out.get("would") or []]
+             if out.get("declined") is not None else out["waiting"])
+    said = {w["workload"] for w in waiting}
+    for w in asked:
+        n = w["workload"]
+        if n not in still:
+            continue
+        if w.get("stuck"):
+            k = stuck.get(n, 0) + 1
+            why = w["why"] + (f" - {k} tries and it still holds, so leaving it while the conflict "
+                              "lasts" if k >= STUCK_TRIES else "")
+            events.record("arrival-release-waiting", source="watch", arriving=arriving, workload=n,
+                          why=why, attempts=k, stuck=True, held_mib=w.get("held_mib") or 0)
+            util.log(f"arrival: {label(arriving)}: {label(n)} keeps its model - {why}")
+        elif n not in said:
+            events.record("arrival-release-waiting", source="watch", arriving=arriving, workload=n,
+                          why=w["why"])
+            util.log(f"arrival: {label(arriving)}: {label(n)} keeps its model for now - {w['why']}")
 
 
 def record(arbiter) -> int:

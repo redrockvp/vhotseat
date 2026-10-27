@@ -71,7 +71,8 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
     sp.add_argument("--port", type=int, default=8765, help="port (default 8765)")
     sub.add_parser("record", help="sample RAM and VRAM into the telemetry until stopped (for a service)")
-    sub.add_parser("watch", help="free the card for a claim (a game) and record it, and sample, until stopped")
+    sub.add_parser("watch", help="free the card for a claim (a game) or a load that skipped its gate, "
+                                 "record it, and sample, until stopped")
     sp = sub.add_parser("claims", help="what owns the card by right, and what matches right now")
     sp.add_argument("--json", action="store_true")
     sp = sub.add_parser("autostart", help="keep the dashboard and sampling up from logon")
