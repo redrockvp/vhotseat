@@ -16,7 +16,9 @@ from .errors import SwitchError
 
 # Windows answers a connect to a closed port by resending the SYN for ~2 s before it gives up.
 # A switch asks the ports of stopped workloads a couple of dozen times, which added ~40 s to
-# every ComfyUI job. On loopback nothing is lost and a refusal is final, so it asks for none:
+# every ComfyUI job. On loopback nothing is lost and a refusal is final, so it asks for none.
+# The one case that changes: a server whose accept backlog is full drops the SYN, and that
+# connect now waits out its timeout instead of retrying.
 # TCP_INITIAL_RTO_PARAMETERS {TCP_INITIAL_RTO_UNSPECIFIED_RTT, TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS}.
 SIO_TCP_INITIAL_RTO = 0x98000011
 NO_SYN_RETRIES = struct.pack("<HBx", 0xFFFF, 0xFE)
