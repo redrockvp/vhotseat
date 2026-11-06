@@ -2,7 +2,6 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-import socket
 from urllib.parse import urlsplit
 
 from .. import policy, util
@@ -139,7 +138,7 @@ class Workload:
         up = urlsplit(self.url)
         port = up.port or (443 if up.scheme == "https" else 80)
         try:
-            with socket.create_connection((up.hostname, port), timeout=0.5):
+            with util.connect(up.hostname, port, timeout=0.5):
                 return True
         except OSError:
             return False
