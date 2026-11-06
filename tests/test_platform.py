@@ -3,6 +3,7 @@ counters, process command lines and machine RAM."""
 
 import ctypes
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -11,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from vhotseat import autostart, gpu, host
+from vhotseat import autostart, gpu, host, util
 from vhotseat.lock import GpuLock
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -190,6 +191,26 @@ def test_windows_machine_ram():
     assert "error" not in ram
     assert 0 < ram["available_mib"] <= ram["total_mib"]
     assert ram["swap_total_mib"] >= 0 and ram["swap_used_mib"] >= 0
+
+
+def _closed_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@windows_only
+def test_windows_refuses_a_closed_local_port_at_once():
+    """Windows retries a refused connect for ~2 s. A switch asks every stopped workload's
+    port several times, so that was ~40 s added to every ComfyUI job: a closed loopback
+    port has to be refused at once, over HTTP and for listening() alike."""
+    port = _closed_port()
+    t = time.monotonic()
+    code, _ = util.http("GET", f"http://127.0.0.1:{port}/health", timeout=5)
+    assert code is None
+    with pytest.raises(OSError):
+        util.connect("127.0.0.1", port, timeout=5)
+    assert time.monotonic() - t < 0.5
 
 
 @windows_only
