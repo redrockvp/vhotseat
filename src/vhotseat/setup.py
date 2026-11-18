@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 
 from . import config as cfgmod
-from . import claims, host
+from . import claims, host, schedule
 from .arbiter import Arbiter
 from .drivers.base import Context
 from .events import EventLog
@@ -40,6 +40,7 @@ def build(cfg: dict, *, env=os.environ, gpu=None, machine_ram=None, config_path=
     arbiter = None
     ctx = Context(gpu=lambda: arbiter.snapshot())
     workloads = cfgmod.workloads(cfg, ctx)
+    sc = schedule.cfg(cfg.get("schedule"))
     arbiter = Arbiter(
         workloads, gpu or open_backend(g.get("backend", "auto"), index),
         # GPU 0 keeps gpu-workload's lock name, so a rollback to gpu-workload
@@ -52,6 +53,7 @@ def build(cfg: dict, *, env=os.environ, gpu=None, machine_ram=None, config_path=
         claim_poll_s=cfg.get("claims_poll_s", 2.0),
         pressure_cfg=cfg.get("pressure"),
         ask_cfg=cfg.get("ask"),
+        schedule=schedule.Schedule(state / "schedule.db", sc) if sc else None,
         # So a long-lived `web` or `watch` can tell when the owner has saved the policy.
         config_path=config_path,
         **arbiter_args,

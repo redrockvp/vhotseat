@@ -13,6 +13,10 @@
   vhotseat why [NAME]                       why a workload can or can't take the GPU right now
   vhotseat claims                           what owns the card by right (a game), and what matches now
   vhotseat watch                            free the card for a claim, record it, and sample, until stopped
+  vhotseat book OWNER FROM TO [options]     reserve a window for new loads
+  vhotseat unbook ID | pause ID | resume ID  remove, pause or resume a booking
+  vhotseat bookings | queue [--json]        show windows or tickets
+  vhotseat when NAME [options]              find when a workload can start
 
 Exit codes: 0 ok · 1 failed / refused · 2 usage or bad config. `hold` exits with
 CMD's own exit code once CMD has started. `autostart status` exits 1 when nothing
@@ -22,12 +26,13 @@ is registered.
 import argparse
 import contextlib
 import json
+import sqlite3
 import sys
 import time
 
 from . import claims
 from . import config as cfgmod
-from . import policy
+from . import policy, schedule
 from . import util
 from .arbiter import NONE, Arbiter
 from .setup import build
@@ -87,6 +92,33 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp = sub.add_parser("why", help="why a workload can or can't take the GPU right now (reads only)")
     sp.add_argument("name", nargs="?", help="one workload; default: every one")
     sp.add_argument("--json", action="store_true")
+    sp = sub.add_parser("book", help="reserve a window for new loads")
+    sp.add_argument("owner")
+    sp.add_argument("start")
+    sp.add_argument("end")
+    sp.add_argument("--workload", action="append", default=[])
+    sp.add_argument("--class", dest="cls", choices=schedule.BOOKING_CLASSES, default="booked")
+    sp.add_argument("--every", choices=schedule.EVERY)
+    sp.add_argument("--mode", choices=schedule.MODES, default="drain")
+    sp.add_argument("--note", default="")
+    sp.add_argument("--json", action="store_true")
+    for cmd, what in (("unbook", "delete a booking"),
+                      ("pause", "switch a booking off until TIME (default: the end of its current or next window)"),
+                      ("resume", "switch a paused booking back on")):
+        sp = sub.add_parser(cmd, help=what)
+        sp.add_argument("id", type=int)
+        if cmd == "pause":
+            sp.add_argument("--until", metavar="TIME", help="HH:MM, or YYYY-MM-DD HH:MM")
+    for cmd, what in (("bookings", "the active and upcoming booked windows (next 7 days)"),
+                      ("queue", "waiting and running tickets, in the order they'd be served")):
+        sp = sub.add_parser(cmd, help=what)
+        sp.add_argument("--json", action="store_true")
+    sp = sub.add_parser("when", help="find when a workload can start")
+    sp.add_argument("name")
+    sp.add_argument("--class", dest="cls")
+    sp.add_argument("--for", dest="duration")
+    sp.add_argument("--as", dest="requester")
+    sp.add_argument("--json", action="store_true")
     argv = sys.argv[1:] if argv is None else list(argv)
     # hold's COMMAND is everything after the first `--`, split off here: a REMAINDER
     # argument would also swallow options before it (`hold comfy --wait 600 -- CMD`).
@@ -131,6 +163,88 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
     def emit(s: dict, extra: dict | None = None) -> None:
         print(json.dumps({**s, **(extra or {})}) if json_out else arbiter.describe(s))
 
+    if args.cmd in ("book", "unbook", "pause", "resume", "bookings", "queue", "when"):
+        sc = arbiter.schedule
+        if sc is None:
+            if args.cmd in ("bookings", "queue", "when"):
+                print("no schedule configured: nothing is booked")
+                return EXIT_OK
+            util.log("add a schedule: block to the config; see docs/reference.md")
+            return EXIT_USAGE
+        try:
+            now = sc.now()
+            if args.cmd == "book":
+                unknown = set(args.workload) - set(arbiter.workloads)
+                if unknown:
+                    util.log(f"unknown workload {', '.join(sorted(unknown))}; configured: "
+                             f"{', '.join(sorted(arbiter.workloads))}")
+                    return EXIT_USAGE
+                start, end = schedule.parse_time(args.start, now), schedule.parse_time(args.end, now)
+                if end <= start and len(args.end.split(":")) == 2 and "-" not in args.end:
+                    end = schedule._shift_days(end, 1)
+                if not args.every and end <= now:
+                    raise ValueError("a one-off booking cannot end in the past")
+                row = sc.add_booking(args.owner, start, end, cls=args.cls, workloads=args.workload or ["*"],
+                                     every=args.every, mode=args.mode, note=args.note)
+                arbiter.events.record("booking", booking=row["id"], owner=row["owner"])
+                print(json.dumps(row) if json_out else f"booking {row['id']} ({row['owner']})")
+            elif args.cmd in ("unbook", "pause", "resume"):
+                if args.cmd == "unbook":
+                    row = sc.remove_booking(args.id)
+                elif args.cmd == "pause":
+                    row = sc.pause(args.id, schedule.parse_time(args.until, now) if args.until else None)
+                else:
+                    row = sc.resume(args.id)
+                event = {"unbook": "unbook", "pause": "booking-pause", "resume": "booking-resume"}[args.cmd]
+                arbiter.events.record(event, booking=row["id"], owner=row["owner"])
+                print(f"{event}: booking {row['id']} ({row['owner']})")
+            elif args.cmd == "bookings":
+                rows = []
+                for b in sc.bookings():
+                    windows = sc.windows(b, now, now + 7 * schedule.DAY)
+                    if windows:
+                        rows.append({**b, "next_window": {"start": windows[0][0], "end": windows[0][1]}})
+                if json_out:
+                    print(json.dumps(rows))
+                elif not rows:
+                    print("nothing booked in the next 7 days")
+                for b in ([] if json_out else rows):
+                    w = b["next_window"]
+                    print(f"{b['id']} {b['owner']} {b['class']} {','.join(b['workloads'])} "
+                          f"{schedule.clock(w['start'])}-{schedule.clock(w['end'])} "
+                          f"every={b['every'] or '-'} mode={b['mode']} "
+                          f"paused-until={schedule.clock(b['paused_until']) if b['paused_until'] else '-'} "
+                          f"{b['note']}")
+            elif args.cmd == "queue":
+                rows = sc.queue_view()
+                if json_out:
+                    print(json.dumps(rows))
+                for t in ([] if json_out else rows):
+                    print(f"{t['state']} {t['class']} {t['requester']} {t['workload']} "
+                          f"age={int(now - t['created'])}s estimate={t['est_s']}")
+            else:
+                if args.cls and args.cls not in sc.classes:
+                    raise ValueError(f"unknown class {args.cls!r}; configured: {', '.join(sc.classes)}")
+                duration = util.window(args.duration) if args.duration else 0
+                result = sc.when(name, args.cls, duration, args.requester)
+                if json_out:
+                    print(json.dumps(result))
+                elif result["now"]:
+                    print(result["reason"])
+                else:
+                    print(f"{schedule.clock(result['start']) if result['start'] else 'no start found'}: "
+                          f"{result['reason']}")
+                return EXIT_OK if result["now"] else EXIT_FAIL
+        except schedule.ScheduleError as e:
+            util.log(str(e))
+            return EXIT_FAIL
+        except (sqlite3.Error, OSError) as e:
+            util.log(f"schedule unreadable ({arbiter.schedule.path}): {e}")
+            return EXIT_FAIL
+        except ValueError as e:
+            util.log(str(e))
+            return EXIT_USAGE
+        return EXIT_OK
     if args.cmd == "status":
         emit(arbiter.probe())
         return EXIT_OK

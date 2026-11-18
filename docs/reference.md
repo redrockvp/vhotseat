@@ -719,3 +719,16 @@ and end, so a box with the dashboard up needs nothing else.
 ~0.8 MiB a day. The file stays at that size: deleted rows' space is reused.
 Several processes sampling at once don't double up. Telemetry never gets in
 a handover's way: a write waits at most 2 s, and any error is ignored.
+
+## Scheduling
+
+Add a `schedule:` block to enable bookings; without one the existing gate and switch rules are unchanged. `classes` lists priorities highest first, defaulting to `peter`, `booked`, `agent` (900 seconds max hold), `batch` (1200), and `background` (600). `default_class` maps workload names to classes and defaults to `agent` for an untagged load. `affinity_s` defaults to 600 seconds. These hold limits and affinity are stored for later queue scheduling.
+
+A `peter` booking reserves the card for the owner; a `booked` window allows its named workloads, and `peter` requests always pass. Bookings only stop new loads: running work keeps what it has. `mode: hard` is stored but does not interrupt work. A typed `switch` or `hold` is an order and overrides a booking, with a `schedule-override` event. `switch none` always frees the card.
+
+- `vhotseat book OWNER FROM TO [--workload NAME]... [--class booked|peter] [--every daily|weekdays] [--mode drain|hard] [--note TEXT] [--json]` creates a booking. Times are local HH:MM or ISO date-times; an earlier HH:MM end rolls into the next day. Omit workloads for all.
+- `vhotseat unbook ID`, `pause ID [--until TIME]`, and `resume ID` remove, pause, and resume bookings.
+- `vhotseat bookings [--json]` shows active and upcoming windows over seven days; `queue [--json]` shows live waiting and running tickets.
+- `vhotseat when NAME [--class C] [--for DURATION] [--as REQUESTER] [--json]` finds the next suitable start. Duration accepts seconds or units such as `90m`. It exits 0 when it can start now, 1 when later, and 2 for bad input.
+
+Schedule commands exit 2 for usage errors or missing configuration; a booking conflict or unknown booking ID exits 1. Without a schedule, `when`, `bookings` and `queue` report nothing is booked and exit 0.
