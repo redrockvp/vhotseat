@@ -47,6 +47,7 @@ BOOKING_CLASSES = ("peter", "booked")
 EVERY = ("daily", "weekdays")
 MODES = ("drain", "hard")
 DAY = 86400.0
+STALE_S = 120.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS booking (
@@ -71,6 +72,7 @@ CREATE TABLE IF NOT EXISTS ticket (
   model TEXT,
   est_s REAL,
   pid INTEGER,
+  pid_started REAL,                   -- the process's creation time, against pid reuse
   state TEXT NOT NULL,                -- waiting | running | yielded | done | expired
   created REAL NOT NULL,
   heartbeat REAL NOT NULL,
@@ -128,15 +130,22 @@ def _shift_days(t: float, days: int) -> float:
     return (datetime.datetime.fromtimestamp(t) + datetime.timedelta(days=days)).timestamp()
 
 
+def _kernel32():
+    import ctypes
+    return ctypes, ctypes.WinDLL("kernel32", use_last_error=True)
+
+
 def _pid_alive(pid: int | None) -> bool:
+    """Is a process with this pid running? A process this user may not inspect (a service,
+    another account's) is running: not being allowed to look is not the process being gone, and
+    calling it gone would let a second ticket start beside it."""
     if not pid:
         return False
     if os.name == "nt":
-        import ctypes
-        k = ctypes.windll.kernel32
+        ctypes, k = _kernel32()
         h = k.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
         if not h:
-            return False
+            return ctypes.get_last_error() != 87       # ERROR_INVALID_PARAMETER: no such process
         try:
             code = ctypes.c_ulong()
             return bool(k.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
@@ -151,16 +160,46 @@ def _pid_alive(pid: int | None) -> bool:
     return True
 
 
+def _pid_identity(pid: int | None) -> float | None:
+    """When the process with this pid started, as a number that only it has: a pid alone is
+    reused (Windows hands a dead process's pid out again), and a ticket of a runner that died
+    must not live on in whatever got its pid. None when it can't be told (no such process, not
+    allowed to look, or a platform without a cheap way)."""
+    if not pid:
+        return None
+    if os.name == "nt":
+        ctypes, k = _kernel32()
+        h = k.OpenProcess(0x1000, False, int(pid))
+        if not h:
+            return None
+        try:
+            ft = [ctypes.c_ulonglong() for _ in range(4)]    # creation, exit, kernel, user
+            if not k.GetProcessTimes(h, *(ctypes.byref(x) for x in ft)):
+                return None
+            return float(ft[0].value)
+        finally:
+            k.CloseHandle(h)
+    try:
+        with open(f"/proc/{int(pid)}/stat", encoding="ascii", errors="replace") as f:
+            stat = f.read()
+        return float(stat.rsplit(")", 1)[1].split()[19])    # field 22: starttime, in clock ticks
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 class ScheduleError(Exception):
     pass
 
 
 class Schedule:
-    def __init__(self, path: Path, conf: dict, *, now=time.time, alive=_pid_alive):
+    def __init__(self, path: Path, conf: dict, *, now=time.time, alive=_pid_alive,
+                 identity=_pid_identity):
         self.path = Path(path)
         self.conf = conf
         self.now = now
         self.alive = alive
+        self.identity = identity
+        self._columns_checked = False
         self.classes = [c["name"] for c in conf["classes"]]
         self.default_class = conf["default_class"]
 
@@ -174,6 +213,14 @@ class Schedule:
         try:
             con.row_factory = sqlite3.Row
             con.executescript(_SCHEMA)
+            if not self._columns_checked:
+                # A schedule.db made before pid_started existed gets the column (additive: no
+                # row changes); once per Schedule, not per call.
+                cols = {r["name"] for r in con.execute("PRAGMA table_info(ticket)")}
+                if "pid_started" not in cols:
+                    con.execute("ALTER TABLE ticket ADD COLUMN pid_started REAL")
+                    con.commit()
+                self._columns_checked = True
             with con:
                 yield con
         finally:
@@ -373,6 +420,56 @@ class Schedule:
                 "reason": "in the way: " + "; ".join(dict.fromkeys(why))}
 
     # --- tickets ----------------------------------------------------------------------------
+    def take(self, requester: str, cls: str, workload: str, *, est_s: float | None = None,
+             pid: int | None = None, model: str | None = None, note: str = "") -> dict:
+        """Queue one request as a ticket: waiting, stamped with the clock."""
+        if cls not in self.classes:
+            raise ScheduleError(f"a ticket's class is one of {', '.join(self.classes)}, not {cls!r}")
+        if not workload:
+            raise ScheduleError("a ticket has to name the workload it runs on")
+        now = self.now()
+        started = self.identity(pid) if pid else None
+        with self._db() as con:
+            cur = con.execute("INSERT INTO ticket (requester, class, workload, model, est_s, pid, pid_started, "
+                              "state, created, heartbeat, note) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                              (requester, cls, workload, model, est_s, pid, started, "waiting", now, now, note))
+            tid = cur.lastrowid
+        return self.ticket(tid)
+
+    def ticket(self, tid: int) -> dict | None:
+        """One ticket as a dict, in whatever state it is; None when there is no such id."""
+        with self._db() as con:
+            r = con.execute("SELECT * FROM ticket WHERE id = ?", (tid,)).fetchone()
+        return dict(r) if r else None
+
+    def beat(self, tid: int) -> dict:
+        """Say a ticket without a pid is still there (its caller lives elsewhere): heartbeat = now."""
+        with self._db() as con:
+            con.execute("UPDATE ticket SET heartbeat = ? WHERE id = ?", (self.now(), tid))
+        return self.ticket(tid)
+
+    def start(self, tid: int) -> dict:
+        """A waiting ticket goes running now."""
+        with self._db() as con:
+            r = con.execute("SELECT * FROM ticket WHERE id = ?", (tid,)).fetchone()
+            if not r:
+                raise ScheduleError(f"no ticket {tid}")
+            if r["state"] != "waiting":
+                raise ScheduleError(f"ticket {tid} is {r['state']}, not waiting: only a waiting ticket starts")
+            con.execute("UPDATE ticket SET state = 'running', started = ? WHERE id = ?", (self.now(), tid))
+        return self.ticket(tid)
+
+    def finish(self, tid: int, state: str = "done") -> dict:
+        """Close a ticket: done, yielded (it gave the card up), or expired."""
+        if state not in ("done", "yielded", "expired"):
+            raise ScheduleError(f"a ticket finishes as done, yielded, or expired, not {state!r}")
+        with self._db() as con:
+            r = con.execute("SELECT * FROM ticket WHERE id = ?", (tid,)).fetchone()
+            if not r:
+                raise ScheduleError(f"no ticket {tid}")
+            con.execute("UPDATE ticket SET state = ?, ended = ? WHERE id = ?", (state, self.now(), tid))
+        return self.ticket(tid)
+
     def tickets(self, include_done: bool = False) -> list[dict]:
         """Waiting and running tickets, oldest first; a ticket whose process has gone is expired
         on the way (and not returned)."""
@@ -383,17 +480,116 @@ class Schedule:
             return [dict(r) for r in con.execute(q)]
 
     def expire_dead(self) -> int:
+        """Expire tickets that stopped living: a pid that has gone, or a heartbeat past `STALE_S`."""
         now = self.now()
         with self._db() as con:
-            rows = list(con.execute("SELECT id, pid FROM ticket WHERE state IN ('waiting','running')"))
-            dead = [r["id"] for r in rows if not self.alive(r["pid"])]
+            rows = list(con.execute("SELECT id, pid, pid_started, heartbeat FROM ticket WHERE state IN ('waiting','running')"))
+            dead = [r["id"] for r in rows if not self._living(r, now)]
             for tid in dead:
                 con.execute("UPDATE ticket SET state = 'expired', ended = ? WHERE id = ?", (now, tid))
         return len(dead)
 
-    def queue_view(self) -> list[dict]:
-        """The waiting tickets in the order they'd be served (class, then age), and the running ones."""
+    def _living(self, r, now: float) -> bool:
+        """A ticket with a pid lives while its process does; one without lives on its heartbeat."""
+        if r["pid"] is not None:
+            if not self.alive(r["pid"]):
+                return False
+            if r["pid_started"] is not None:
+                # The pid runs, but is it still the process that took the ticket?
+                now_started = self.identity(r["pid"])
+                return now_started is None or now_started == r["pid_started"]
+            return True
+        return now - r["heartbeat"] < STALE_S
+
+    def order(self, on_card: str | None = None, now: float | None = None) -> list[dict]:
+        """The waiting tickets in the order they would be served.
+
+        Class first, then affinity (a ticket for the workload already on the card goes first, and one
+        that has waited past `affinity_s` stops paying for a handover), then round-robin: the ticket's
+        place among its own requester's waiting tickets of that class, so one busy caller cannot keep
+        another waiting behind all of its tickets. Age breaks the rest.
+        """
+        now = self.now() if now is None else now
+        waiting = [t for t in self.tickets() if t["state"] == "waiting"]
+        seen: dict[tuple[str, str], int] = {}
+        k = {}
+        for t in sorted(waiting, key=lambda t: (t["created"], t["id"])):
+            g = (t["requester"], t["class"])
+            k[t["id"]] = seen.get(g, 0)
+            seen[g] = k[t["id"]] + 1
+        affinity = self.conf["affinity_s"]
+        return sorted(waiting, key=lambda t: (
+            self.rank(t["class"]),
+            0 if on_card is None or t["workload"] == on_card or now - t["created"] >= affinity else 1,
+            k[t["id"]], t["created"], t["id"]))
+
+    def head(self, on_card: str | None = None) -> dict | None:
+        """The next ticket that can actually start now, or None when none of them can.
+
+        A ticket without an estimate is judged on its class's `max_hold_s`, so a run nobody sized
+        waits for a booking the way its class would be cut off anyway.
+        """
+        for t in self.order(on_card):
+            est = t["est_s"]
+            if est is None:
+                est = self.max_hold_s(t["class"])
+                if est is None:
+                    est = 0
+            if (self.admit(t["workload"], t["class"], t["requester"])["ok"]
+                    and self.when(t["workload"], t["class"], est, t["requester"])["now"]):
+                return t
+        return None
+
+    def my_turn(self, tid: int, on_card: str | None = None) -> bool:
+        """Is this ticket the one that takes the card now? Nobody else may be running."""
+        h = self.head(on_card)
+        if h is None or h["id"] != tid:
+            return False
+        return not any(t["state"] == "running" and t["id"] != tid for t in self.tickets())
+
+    def claim(self, tid: int, on_card: str | None = None) -> bool:
+        """Start this ticket when it is its turn: the update itself checks, so two claimers
+        that race over the same queue still leave only one ticket running."""
+        if not self.my_turn(tid, on_card):
+            return False
+        with self._db() as con:
+            cur = con.execute("UPDATE ticket SET state = 'running', started = ? WHERE id = ? AND state = 'waiting'"
+                              " AND NOT EXISTS (SELECT 1 FROM ticket WHERE state = 'running' AND id != ?)",
+                              (self.now(), tid, tid))
+            return cur.rowcount == 1
+
+    def overdue(self, tid: int) -> dict | None:
+        """A running ticket held past its class's max hold, with a class at its own rank or higher
+        waiting: {held_s, limit_s, waiting}. None when it is not overdue.
+        """
+        t = self.ticket(tid)
+        if t is None or t["state"] != "running":
+            return None
+        limit = self.max_hold_s(t["class"])
+        if limit is None:
+            return None
+        held = self.now() - t["started"]
+        if held <= limit:
+            return None
+        # Only waiters that could take the card now: yielding for one a booking keeps off frees
+        # the card for nobody.
+        waiting = sum(1 for w in self.tickets()
+                      if w["state"] == "waiting" and self.rank(w["class"]) <= self.rank(t["class"])
+                      and self.admit(w["workload"], w["class"], w["requester"])["ok"])
+        return {"held_s": held, "limit_s": limit, "waiting": waiting} if waiting else None
+
+    def stamp_started(self, tid: int) -> None:
+        """The run now has the card: its max-hold clock starts here, not at the claim (it may have
+        waited on the GPU lock behind a typed hold in between)."""
+        with self._db() as con:
+            con.execute("UPDATE ticket SET started = ? WHERE id = ? AND state = 'running'", (self.now(), tid))
+
+    def should_yield(self, tid: int) -> bool:
+        """Has this running ticket held the card long enough that a waiting peer wants it back?"""
+        return self.overdue(tid) is not None
+
+    def queue_view(self, on_card: str | None = None) -> list[dict]:
+        """The running tickets, then the waiting ones in the order they'd be served."""
         ts = self.tickets()
         running = [t for t in ts if t["state"] == "running"]
-        waiting = sorted((t for t in ts if t["state"] == "waiting"), key=lambda t: (self.rank(t["class"]), t["created"]))
-        return running + waiting
+        return running + self.order(on_card)

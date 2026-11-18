@@ -3,6 +3,11 @@
   vhotseat status [--json]                  who owns the GPU, what each workload holds, last event
   vhotseat switch NAME|none [--wait S] [--json]   give the GPU to NAME, or free it; idempotent
   vhotseat hold NAME [--wait S] -- CMD...   give it to NAME and keep it until CMD exits
+  vhotseat hold NAME [--class C] [--for D] [--as R] [--queue-timeout S] [--wait S] -- CMD...
+                                 the same, but --class makes it a ticket that waits for its turn
+  vhotseat run NAME [--class C] [--for D] [--as R] [--wait S] [--queue-timeout S] -- CMD...
+                                 run CMD once the queue serves its ticket (a request, not an order)
+  vhotseat should-yield [--ticket ID] [--json]  has a run held the card past its class's max hold?
   vhotseat gate NAME                        for hook gates (a server's pre-load hook): may NAME load?
   vhotseat doctor [--json]                  check the config, the GPU and every workload and gate
   vhotseat doctor --exercise NAME [--wait S]   run a real cycle on NAME (take, load, release), timed
@@ -26,13 +31,14 @@ is registered.
 import argparse
 import contextlib
 import json
+import os
 import sqlite3
 import sys
 import time
 
 from . import claims, policy, schedule, util
 from . import config as cfgmod
-from .arbiter import NONE, Arbiter
+from .arbiter import NONE, TICKET_ENV, Arbiter
 from .setup import build
 from .telemetry import Sampler
 
@@ -59,6 +65,13 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp.add_argument("name")
     sp.add_argument("--wait", type=float, default=0, metavar="SECONDS",
                     help="wait this long for running work to finish instead of failing")
+    sp.add_argument("--class", dest="cls",
+                    help="queue a ticket of this class and wait for its turn, as `run` does "
+                         "(without it a hold is an order, as always)")
+    sp.add_argument("--for", dest="duration", help="the run's expected length (90m, 2h): the ticket's estimate")
+    sp.add_argument("--as", dest="requester", help="who is asking, recorded on the ticket")
+    sp.add_argument("--queue-timeout", type=float, default=0, metavar="SECONDS",
+                    help="how long the ticket waits for its turn before giving up (default: no limit)")
     # Not REMAINDER: that swallows `--wait 600` after NAME even once the command is
     # split off below, and the wait silently becomes 0.
     sp.add_argument("command", nargs="*", metavar="-- COMMAND...")
@@ -116,6 +129,21 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp.add_argument("--class", dest="cls")
     sp.add_argument("--for", dest="duration")
     sp.add_argument("--as", dest="requester")
+    sp.add_argument("--json", action="store_true")
+    sp = sub.add_parser("run", help="run a command once the queue serves its ticket")
+    sp.add_argument("name")
+    sp.add_argument("--class", dest="cls", default="batch", help="the ticket's class (default batch)")
+    sp.add_argument("--for", dest="duration", help="the run's expected length (90m, 2h): the ticket's estimate")
+    sp.add_argument("--as", dest="requester", help="who is asking, recorded on the ticket")
+    sp.add_argument("--wait", type=float, default=0, metavar="SECONDS",
+                    help="wait this long for running work to finish once it is your turn")
+    sp.add_argument("--queue-timeout", type=float, default=0, metavar="SECONDS",
+                    help="how long to wait for your turn before giving up (default: no limit)")
+    sp.add_argument("command", nargs="*", metavar="-- COMMAND...")
+    sp = sub.add_parser("should-yield",
+                        help="has this run held the card past its class's max hold, with someone waiting?")
+    sp.add_argument("--ticket", type=int, metavar="ID",
+                    help="the ticket to ask about (default: $VHOTSEAT_TICKET, set by `run`)")
     sp.add_argument("--json", action="store_true")
     argv = sys.argv[1:] if argv is None else list(argv)
     # hold's COMMAND is everything after the first `--`, split off here: a REMAINDER
@@ -261,13 +289,45 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
         return EXIT_OK
     if args.cmd == "gate":
         return EXIT_OK if arbiter.gate(name) else EXIT_FAIL
-    if args.cmd == "hold":
+    if args.cmd in ("hold", "run"):
         command = args.command
         if not command:
-            p.error("hold needs a command after --")
-        # A hold can last hours: keep sampling while it runs.
+            p.error(f"{args.cmd} needs a command after --")
+        cls = getattr(args, "cls", None)
+        if cls and arbiter.schedule is not None and cls not in arbiter.schedule.classes:
+            util.log(f"unknown class {cls!r}; configured: {', '.join(arbiter.schedule.classes)}")
+            return EXIT_USAGE
+        try:
+            est_s = util.window(args.duration) if args.duration else None
+        except ValueError as e:
+            util.log(str(e))
+            return EXIT_USAGE
+        # A hold can last hours, and a ticket can wait for hours before it runs: sample either way.
         with Sampler(arbiter):
+            if args.cmd == "run" or cls:
+                # --class on a hold makes it a ticket: a typed `hold` without one is still an order.
+                return arbiter.run(name, command, args.wait, cls=cls or "batch", est_s=est_s,
+                                   requester=args.requester, queue_timeout=args.queue_timeout)
             return arbiter.hold(name, command, args.wait)
+    if args.cmd == "should-yield":
+        tid = args.ticket if args.ticket is not None else os.environ.get(TICKET_ENV)
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            util.log("no ticket to ask about: pass --ticket ID, or run inside `vhotseat run`")
+            return EXIT_USAGE
+        if arbiter.schedule is None:
+            util.log("no schedule configured: a run never yields the card")
+            return EXIT_FAIL
+        o = arbiter._schedule_read(lambda sc: sc.overdue(tid))
+        if json_out:
+            print(json.dumps({"yield": True, **o} if o else {"yield": False}))
+        elif o:
+            print(f"yield: held {int(o['held_s'] // 60)} min, past the class's "
+                  f"{int(o['limit_s'] // 60)} min; {o['waiting']} waiting")
+        else:
+            print("carry on")
+        return EXIT_OK if o else EXIT_FAIL
     if args.cmd == "doctor":
         from .doctor import exercise, run
         if args.exercise:
