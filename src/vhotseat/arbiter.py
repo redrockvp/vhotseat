@@ -25,11 +25,11 @@ import time
 import uuid
 from pathlib import Path
 
-from . import claims, host, notify, policy, pressure, util
+from . import claims, host, notify, policy, pressure, schedule, util
 from . import config as cfgmod
 from .config_edit import version_of
 from .drivers.base import Workload
-from .errors import Busy, PolicyRefused, ReleaseFailed, SwitchError
+from .errors import Busy, PolicyRefused, ReleaseFailed, ScheduleRefused, SwitchError
 from .events import EventLog, row_time
 from .lock import GpuLock, Held, Locked, write_turn
 from .telemetry import READ_ERRORS
@@ -52,6 +52,9 @@ def _stamp(path: Path) -> tuple:
 # Set in a hold's command's environment, so a nested switch to the held workload
 # is a no-op instead of waiting on the lock the hold owns.
 HOLD_ENV = "VHOTSEAT_HOLD"
+# Set in a `run`'s command's environment: which ticket is on the card, so the command can ask
+# `vhotseat should-yield` about its own hold (see schedule.py's max hold).
+TICKET_ENV = "VHOTSEAT_TICKET"
 
 
 class Arbiter:
@@ -60,11 +63,16 @@ class Arbiter:
                  machine_ram=host.machine_ram, telemetry=None, power: dict | None = None,
                  claim_rules: list | None = None, claim_ignore=(), claim_poll_s: float = 2.0,
                  pressure_cfg: dict | None = None, ask_cfg: dict | None = None,
-                 config_path=None, notifier=None):
+                 config_path=None, notifier=None, schedule=None):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
         self.lock = lock
         self.events = events
+        # The bookings (schedule.py): windows that keep new loads nobody typed off the card. None
+        # when the config has no `schedule:` block, and then every gate behaves as it always has. A
+        # schedule that can't be read is treated the same way (`_schedule_read`): it must never be
+        # the reason a load is refused, or a status report fails.
+        self.schedule = schedule
         # A gate runs inside the workload's own load, which has a time limit
         # (Strata's before_load_timeout_s), so its releases get less time.
         self.gate_release_timeout_s = gate_release_timeout_s
@@ -131,6 +139,25 @@ class Arbiter:
         # (see `arrival_scan`). Process memory on purpose: the watcher thread and the page's status
         # read share one arbiter, so they compare against the same "last time".
         self._was_active: set[str] | None = None
+
+    def _schedule_read(self, fn, default=None):
+        """A broken schedule must never prevent a load or a status report."""
+        if self.schedule is None:
+            return default
+        try:
+            return fn(self.schedule)
+        except Exception as e:
+            util.log(f"schedule unreadable: {e}")
+            return default
+
+    def _admit(self, name, cls=None, requester=None):
+        result = self._schedule_read(lambda sc: sc.admit(name, cls, requester))
+        return result if result and not result["ok"] else None
+
+    def _schedule_override(self, name):
+        if r := self._admit(name):
+            self.events.record("schedule-override", requested=name, booking=r["booking"]["id"], why=r["reason"])
+            util.log(f"schedule override for {name}: {r['reason']}")
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
@@ -1439,10 +1466,34 @@ class Arbiter:
                 if card and sized["bytes"] // 2**20 > card:
                     note += f", more than the card's {card} MiB: only part of it can be resident"
                 notes.append(note)
+            if self.schedule is not None:
+                def schedule_notes(sc, name=name):
+                    cls = sc.class_of(name)
+                    refusal = sc.admit(name, cls)
+                    upcoming = [(b, start) for b, start, _end in sc.upcoming(7200)
+                                if sc.excludes(b, cls, name)]
+                    count = sum(t["workload"] == name for t in sc.queue_view())
+                    return cls, refusal, upcoming, count
+
+                details = self._schedule_read(schedule_notes)
+                if details:
+                    cls, refusal, upcoming, count = details
+                    if not refusal["ok"]:
+                        if resident:
+                            notes.insert(0, f"it keeps what it has, but a new load would wait until "
+                                         f"{schedule.clock(refusal['until'])}")
+                        else:
+                            would = "blocked"
+                            notes.insert(0, refusal["reason"])
+                    for b, start in upcoming:
+                        notes.append(f"booking {b['id']} ({b['owner']}) starts at {schedule.clock(start)}: "
+                                     f"new loads of class {cls} stop then")
+                    if count:
+                        notes.append(f"{count} waiting or running ticket(s) for this workload")
             out[name] = {"target": name, "label": x.label, "would": would, "holder": s["mode"],
                          "free_mib": gpu.get("free_mib"), "resident": resident,
                          "priority": x.priority, "yields_to": list(x.yields_to),
-                         "asks_for": list(x.asks_for), "notes": notes}
+                         "asks_for": list(x.asks_for), "notes": notes, "schedule": self.schedule is not None}
         return out
 
     def gate(self, name: str) -> bool:
@@ -1469,6 +1520,17 @@ class Arbiter:
         # next Ask me will be asked with. Whether the load is allowed or refused is a separate
         # question: an agent turned away is still an agent that will ask again in a moment.
         self.note_used(name)
+        # A booking that excludes this load refuses it before anything else is asked: the owner
+        # isn't put a question the booking would refuse anyway. Not while a switch or hold holds the
+        # lock (that path below answers from the note, and a typed one is an order), and not for a
+        # workload already on the card: a booking is about new loads only.
+        if self.schedule is not None and not self.lock.holder() and (r := self._admit(name)):
+            gpu = self.snapshot()
+            if not x.active(x.probe(gpu), gpu):
+                self.events.record(kind, source="request", allowed=False, reason=r["reason"],
+                                   booking=r["booking"]["id"])
+                util.log(f"refusing {x.label} load: {r['reason']}")
+                return False
         # The asking first, and before the lock: while the owner decides, the card has to stay
         # free for whatever else is running, and a hook that held the GPU lock for two minutes
         # waiting for a person would stop every other handover on the box with it. Nothing is
@@ -2130,6 +2192,20 @@ class Arbiter:
                 self.events.record("switch", to=name, ok=False, error=claim)
                 util.log(f"switch to {name} refused: {claim}")
                 return {"ok": False, "error": claim}
+        # A booking keeps a new load nobody typed off the card (see schedule.py). Asked before the
+        # owner is: there is no point putting a question to them that the booking refuses anyway. A
+        # request that changes nothing (the workload already holds the card) carries on, as above,
+        # and so does one made while a `hold name` or `switch name` holds the lock: a person ordered
+        # the card given to this workload, and a held script's jobs get past their guard (a lazy
+        # workload still reads "none" under its hold, so the mode alone doesn't show it).
+        if request and name != NONE and self.schedule is not None \
+                and self.lock.holder() not in (f"hold {name}", f"switch {name}"):
+            if (r := self._admit(name)) and self.probe()["mode"] != name:
+                why, bid, until = r["reason"], r["booking"]["id"], r["until"]
+                self.events.record("switch", to=name, ok=False, error=why, booking=bid)
+                util.log(f"switch to {name} refused: {why}")
+                return {"ok": False, "error": why, "until": until,
+                        "exception": ScheduleRefused(why, until=until, booking=bid)}
         consent: set[str] = set()
         if request:
             claim = self.claim_refusal()
@@ -2181,6 +2257,8 @@ class Arbiter:
                     continue
                 left = max(0.0, (deadline - time.monotonic()) / util.SCALE)
                 before = self.probe()["mode"]
+                if not request and name != NONE and before != name:
+                    self._schedule_override(name)
                 try:
                     done = self.acquire(name, left, load=load, requested=request,
                                         consent=consent)
@@ -2202,16 +2280,24 @@ class Arbiter:
             self.events.record("switch", to=name, ok=True, previous=before, **({"done": done} if done else {}))
         return {"ok": True, **({"done": done} if done else {})}
 
-    def hold(self, name: str, command: list[str], wait: float) -> int:
+    def hold(self, name: str, command: list[str], wait: float, env: dict | None = None, *,
+             ordered: bool = True, on_hold=None) -> int:
         """Switch to `name` and keep the GPU there until `command` exits; returns
         its exit code. The lock is marked "hold name" once the switch is done, so
         every other workload's gate refuses, and a script may leave the queue
-        empty between its jobs."""
+        empty between its jobs.
+
+        `env` is merged into the command's environment on top of `VHOTSEAT_HOLD`. `ordered` is a
+        hold someone typed, an order that overrides a booking (recorded as `schedule-override`);
+        a ticket's hold (`run`) was admitted by its own class and passes False. `on_hold` is
+        called once the card is this hold's, before the command starts."""
         if os.environ.get(HOLD_ENV) == name:
             # Already inside a hold: our parent owns the lock, so taking it would deadlock.
             return subprocess.call(command)
         with self._take(name, skip_if_held=False) as lock:
             before = self.probe()["mode"]
+            if ordered and before != name:
+                self._schedule_override(name)
             try:
                 self.acquire(name, wait, load=False)
             except SwitchError as e:
@@ -2222,8 +2308,10 @@ class Arbiter:
             # for it rather than run a job on a GPU that isn't free yet.
             lock.mark(f"hold {name}")
             self.events.record("hold", mode=name, ok=True, previous=before, command=" ".join(command)[:200])
+            if on_hold is not None:
+                on_hold()
             try:
-                proc = subprocess.Popen(command, env={**os.environ, HOLD_ENV: name})
+                proc = subprocess.Popen(command, env={**os.environ, HOLD_ENV: name, **(env or {})})
             except OSError as e:
                 self.events.record("hold-end", mode=name, ok=False, error=str(e))
                 util.log(f"could not run {command[0]}: {e}")
@@ -2241,3 +2329,102 @@ class Arbiter:
             code = proc.wait()
             self.events.record("hold-end", mode=name, exit=code)
             return code
+
+    def run(self, name: str, command: list[str], wait: float, *, cls: str = "batch",
+            est_s: float | None = None, requester: str | None = None,
+            queue_timeout: float = 0.0, poll_s: float = 1.0) -> int:
+        """Take a ticket, wait until the queue serves it, hold the card for COMMAND, close the ticket.
+
+        This is how an agent's batch comes to the card: a ticket is a request, so a booking that
+        excludes it keeps it waiting and the serving order (class, affinity, round-robin per
+        requester) decides who goes next - where a plain `hold` is an order that goes through.
+        `queue_timeout` is how long the request waits for its turn before giving up (0: as long as
+        it takes). The requester is `requester`, else $VHOTSEAT_AS, else the user and this pid.
+
+        The schedule fails safe at every step: one that can't be read when the ticket is taken,
+        or while it waits, makes this a plain `hold` (a broken schedule never keeps a load off the
+        card), and once the command has run its exit code is the answer whatever the bookkeeping
+        does. Every ticket ends with a `ticket-end` row, and none is left waiting or running.
+        """
+        if os.environ.get(HOLD_ENV) == name:
+            # Already inside a hold of this workload: our parent owns the lock and its ticket.
+            return subprocess.call(command)
+        if self.schedule is None:
+            return self.hold(name, command, wait)
+        sc = self.schedule
+        requester = (requester or os.environ.get("VHOTSEAT_AS")
+                     or f"{os.environ.get('USERNAME') or os.environ.get('USER') or 'someone'} pid {os.getpid()}")
+        # The state dir has to exist before the schedule file is opened in it: sqlite would make a
+        # FILE where the directory belongs, and every write after that fails.
+        with contextlib.suppress(Exception):
+            self.events.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            t = sc.take(requester, cls, name, est_s=est_s, pid=os.getpid())
+        except Exception as e:
+            util.log(f"schedule unreadable: {e}; running as a plain hold")
+            return self.hold(name, command, wait)
+        tid = t["id"]
+        self._record_quietly("ticket", ticket=tid, requester=requester, cls=cls, workload=name, est_s=est_s)
+        state = {"ended": False}
+
+        def end(how: str, **fields) -> None:
+            """Close the ticket once, whatever else fails: the queue must never keep it."""
+            if state["ended"]:
+                return
+            state["ended"] = True
+            try:
+                sc.finish(tid, how)
+            except Exception as e:
+                util.log(f"ticket {tid}: closing it failed ({how}): {e}")
+                if how != "expired":
+                    with contextlib.suppress(Exception):
+                        sc.finish(tid, "expired")
+            self._record_quietly("ticket-end", ticket=tid, state=how, **fields)
+
+        try:
+            deadline = time.monotonic() + queue_timeout * util.SCALE if queue_timeout > 0 else None
+            said = False
+            while True:
+                try:
+                    on_card = self.probe()["mode"]
+                    if sc.claim(tid, on_card):
+                        break
+                    if not said:
+                        said = True
+                        if sc.head(on_card) is None:
+                            util.log(f"waiting for the card: ticket {tid}, behind a booking")
+                        else:
+                            row = sc.queue_view(on_card)
+                            pos = next((i + 1 for i, x in enumerate(row) if x["id"] == tid), len(row) + 1)
+                            util.log(f"waiting for the card: ticket {tid}, {pos} in the queue")
+                except Exception as e:
+                    # The schedule broke while this ticket waited (a file that stopped reading, a
+                    # writer that won't let go): it fails safe the same way it does at the start.
+                    util.log(f"schedule unreadable: {e}; running as a plain hold")
+                    end("expired", why="schedule unreadable")
+                    return self.hold(name, command, wait)
+                if deadline is not None and time.monotonic() >= deadline:
+                    end("expired", why="queue timeout")
+                    util.log(f"gave up on ticket {tid}: its turn did not come within {int(queue_timeout)} s")
+                    return 1
+                util.sleep(poll_s)
+
+            def started() -> None:
+                # The card is this ticket's now: its max-hold clock starts here, not at the claim
+                # (it may have waited on the lock behind a typed hold in between).
+                with contextlib.suppress(Exception):
+                    sc.stamp_started(tid)
+                self._record_quietly("ticket-start", ticket=tid, workload=name)
+
+            code = self.hold(name, command, wait, env={TICKET_ENV: str(tid)}, ordered=False, on_hold=started)
+            end("done", exit=code)
+            return code
+        finally:
+            end("expired")
+
+    def _record_quietly(self, kind: str, **fields) -> None:
+        """An event row that must not turn bookkeeping into a failed run."""
+        try:
+            self.events.record(kind, **fields)
+        except Exception as e:
+            util.log(f"event log: {kind} row not written: {e}")

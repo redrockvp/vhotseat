@@ -12,9 +12,9 @@ import json
 from pathlib import Path
 
 import pytest
-
 from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, STRATA_VRAM
-from vhotseat import api, claims, config, host, policy, setup, web
+
+from vhotseat import claims, config, host, policy, setup, web
 
 ROOT = Path(__file__).resolve().parents[1]
 

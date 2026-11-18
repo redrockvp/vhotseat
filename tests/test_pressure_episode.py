@@ -16,6 +16,7 @@ import sqlite3
 import time
 
 from fakes import COMFY_MODEL_VRAM, STRATA_VRAM, FakeStrata
+
 from vhotseat import host, pressure, util, web
 
 GROWER = "blender.exe"
@@ -457,7 +458,7 @@ def test_the_status_text_says_what_took_the_card_and_what_came_off(rig, monkeypa
     scene(rig, monkeypatch, grower="blender.exe", grower_mib=9000)
     web.pressure_pass(rig.arb)
     out = rig.arb.describe(rig.arb.probe())
-    line = [l for l in out.splitlines() if l.startswith("pressure:")][0]
+    line = [ln for ln in out.splitlines() if ln.startswith("pressure:")][0]
     assert "blender.exe holds 9000 MiB vhotseat doesn't manage" in line
     assert "8000 MiB over its usual 1000" in line
     assert "card at 1176 MiB free for" in line

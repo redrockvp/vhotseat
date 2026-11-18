@@ -485,7 +485,7 @@ def code(text: str, prefix: str) -> list[str]:
 def changed(before: str, after: str) -> list[tuple[str, str]]:
     """(old, new) for every line that differs, position by position: what a save touched. Pairing
     them by position is what proves every other line is byte for byte what it was."""
-    return [(a, b) for a, b in zip(before.splitlines(), after.splitlines()) if a != b]
+    return [(a, b) for a, b in zip(before.splitlines(), after.splitlines(), strict=False) if a != b]
 
 
 def test_a_key_inside_an_inline_block_is_edited_in_the_line_it_shares(cfg_file):
@@ -536,8 +536,9 @@ def unchanged_apart_from(before: str, after: str, *starts: str) -> list[str]:
     """The lines that differ once every line whose stripped form begins with one of `starts` is set
     aside. Empty means the save left everything else in the file byte for byte as it was, and in the
     same number of copies - which a line-by-line pairing can't say when the save also added a line."""
-    keep = lambda text: Counter(ln for ln in text.splitlines()
-                                if not ln.strip().startswith(starts))
+    def keep(text):
+        return Counter(ln for ln in text.splitlines() if not ln.strip().startswith(starts))
+
     diff = (keep(before) - keep(after)) + (keep(after) - keep(before))
     return sorted(diff.elements())
 

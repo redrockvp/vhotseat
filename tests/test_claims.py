@@ -4,11 +4,11 @@ The rules are matched against a process table, so they're testable without a gam
 `{pid: {pid, ppid, name, exe}}`, the shape host.processes() returns."""
 
 import sys
+from pathlib import Path
 
 import pytest
 
 from vhotseat import claims, config, host
-from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 

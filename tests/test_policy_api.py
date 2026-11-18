@@ -15,7 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from vhotseat import api, config, config_edit, lock as lockmod, policy, web
+from vhotseat import api, config, config_edit, policy, web
+from vhotseat import lock as lockmod
 
 ROOT = Path(__file__).resolve().parents[1]
 

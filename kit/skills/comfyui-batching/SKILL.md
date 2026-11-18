@@ -44,7 +44,13 @@ the turn fails with "GPU busy".
 for the whole batch, even between jobs. Use it when someone else may talk to
 the same LLM while you render (the user in another chat, another agent): their
 request is refused until the batch is done, instead of costing two handovers
-in the middle of it.
+in the middle of it. With a vhotseat schedule, `--hold` is also a ticket in
+its queue (`--class batch` by default, `--as <your name>` to say who asks):
+the batch waits its turn instead of racing, runs in steps of `--yield-every`
+jobs (default 4), and if it has held the GPU past its class's limit while
+someone waits, it hands the card over between steps and queues the rest of
+the batch behind them, by itself. Nothing for you to do but wait for the
+summary; exit codes are the same as without it.
 
 You still design the workflows yourself: any nodes, models, LoRAs, prompts,
 seeds and sizes. Write them as ComfyUI **API-format** JSON, the same graph you
