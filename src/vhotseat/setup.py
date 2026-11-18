@@ -40,7 +40,8 @@ def build(cfg: dict, *, env=os.environ, gpu=None, machine_ram=None, config_path=
     arbiter = None
     ctx = Context(gpu=lambda: arbiter.snapshot())
     workloads = cfgmod.workloads(cfg, ctx)
-    sc = schedule.cfg(cfg.get("schedule"))
+    sc = schedule.cfg(cfg.get("schedule"), owners=[n for n, w in (cfg.get("workloads") or {}).items()
+                                                    if w.get("driver") == "comfyui"])
     arbiter = Arbiter(
         workloads, gpu or open_backend(g.get("backend", "auto"), index),
         # GPU 0 keeps gpu-workload's lock name, so a rollback to gpu-workload

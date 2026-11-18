@@ -81,12 +81,18 @@ CREATE TABLE IF NOT EXISTS ticket (
 """
 
 
-def cfg(raw: dict | None) -> dict | None:
-    """The `schedule:` block with its defaults, or None when the config has none."""
+def cfg(raw: dict | None, owners=()) -> dict | None:
+    """The `schedule:` block with its defaults, or None when the config has none.
+
+    `owners` are the workloads whose untagged requests are the owner's own (class `peter`) unless
+    `default_class` says otherwise: the ComfyUI workloads, whose untagged jobs come from its web page
+    (the owner's decision 4). An agent's batch takes a ticket instead (`comfy-render --hold`)."""
     if raw is None:
         return None
     classes = [dict(c) for c in (raw.get("classes") or DEFAULT_CLASSES)]
-    return {"classes": classes, "default_class": dict(raw.get("default_class") or {}),
+    default_class = {w: "peter" for w in owners}
+    default_class.update(raw.get("default_class") or {})
+    return {"classes": classes, "default_class": default_class,
             "affinity_s": float(raw.get("affinity_s", 600))}
 
 
@@ -162,7 +168,9 @@ class Schedule:
     @contextlib.contextmanager
     def _db(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        con = sqlite3.connect(self.path, timeout=10)
+        # Every gate reads this, inside a workload's own load limit and sometimes under the GPU
+        # lock: a writer that won't let go costs at most 2 s, then the read fails open (Arbiter).
+        con = sqlite3.connect(self.path, timeout=2)
         try:
             con.row_factory = sqlite3.Row
             con.executescript(_SCHEMA)
@@ -206,7 +214,9 @@ class Schedule:
             for b in self.bookings():
                 if b["class"] != "peter":
                     continue
-                for s, e in self.windows(b, start, end if not every else start + 14 * DAY):
+                # Two series repeat within a week; a one-off of the owner's may be further out.
+                to = end if not every else max(start + 14 * DAY, b["end"] if not b["every"] else 0)
+                for s, e in self.windows(b, start, to):
                     if self._overlaps_series(start, end, every, s, e):
                         raise ScheduleError(f"it overlaps booking {b['id']} ({b['owner']}, {clock(s)}-{clock(e)}), "
                                             "which is the owner's time")
@@ -226,7 +236,7 @@ class Schedule:
             if (every != "weekdays" or datetime.datetime.fromtimestamp(a).weekday() < 5) and a < e and s < b:
                 return True
             k += 1
-            if k > 15:
+            if k > 3660:
                 break
         return False
 
@@ -265,6 +275,8 @@ class Schedule:
             if nxt is None:
                 raise ScheduleError(f"booking {bid} has no window left to pause")
             until = nxt[1]
+        if until <= now:
+            raise ScheduleError(f"{clock(until)} has already passed: pausing until then changes nothing")
         with self._db() as con:
             con.execute("UPDATE booking SET paused_until = ? WHERE id = ?", (until, bid))
         return self.booking(bid)

@@ -167,7 +167,11 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
         sc = arbiter.schedule
         if sc is None:
             if args.cmd in ("bookings", "queue", "when"):
-                print("no schedule configured: nothing is booked")
+                if json_out:
+                    print(json.dumps({"now": True, "start": None, "bookings": [],
+                                      "reason": "no schedule configured"} if args.cmd == "when" else []))
+                else:
+                    print("no schedule configured: nothing is booked")
                 return EXIT_OK
             util.log("add a schedule: block to the config; see docs/reference.md")
             return EXIT_USAGE
@@ -180,8 +184,14 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
                              f"{', '.join(sorted(arbiter.workloads))}")
                     return EXIT_USAGE
                 start, end = schedule.parse_time(args.start, now), schedule.parse_time(args.end, now)
-                if end <= start and len(args.end.split(":")) == 2 and "-" not in args.end:
-                    end = schedule._shift_days(end, 1)
+
+                def hhmm(text):
+                    return len(text.split(":")) == 2 and "-" not in text
+                if end <= start and hhmm(args.end):
+                    end = schedule._shift_days(end, 1)       # 22:00 01:00: the next morning
+                if not args.every and end <= now and hhmm(args.start) and hhmm(args.end):
+                    # Today's window has gone: at 23:00, `01:00 03:00` means tonight.
+                    start, end = schedule._shift_days(start, 1), schedule._shift_days(end, 1)
                 if not args.every and end <= now:
                     raise ValueError("a one-off booking cannot end in the past")
                 row = sc.add_booking(args.owner, start, end, cls=args.cls, workloads=args.workload or ["*"],
@@ -192,7 +202,10 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
                 if args.cmd == "unbook":
                     row = sc.remove_booking(args.id)
                 elif args.cmd == "pause":
-                    row = sc.pause(args.id, schedule.parse_time(args.until, now) if args.until else None)
+                    until = schedule.parse_time(args.until, now) if args.until else None
+                    if until is not None and until <= now:
+                        raise ValueError(f"--until {args.until} has already passed")
+                    row = sc.pause(args.id, until)
                 else:
                     row = sc.resume(args.id)
                 event = {"unbook": "unbook", "pause": "booking-pause", "resume": "booking-resume"}[args.cmd]
@@ -238,7 +251,7 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
         except schedule.ScheduleError as e:
             util.log(str(e))
             return EXIT_FAIL
-        except (sqlite3.Error, OSError) as e:
+        except (sqlite3.Error, OSError, json.JSONDecodeError) as e:
             util.log(f"schedule unreadable ({arbiter.schedule.path}): {e}")
             return EXIT_FAIL
         except ValueError as e:

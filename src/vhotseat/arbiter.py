@@ -1521,9 +1521,9 @@ class Arbiter:
         # isn't put a question the booking would refuse anyway. Not while a switch or hold holds the
         # lock (that path below answers from the note, and a typed one is an order), and not for a
         # workload already on the card: a booking is about new loads only.
-        if self.schedule is not None and not self.lock.holder():
+        if self.schedule is not None and not self.lock.holder() and (r := self._admit(name)):
             gpu = self.snapshot()
-            if not x.active(x.probe(gpu), gpu) and (r := self._admit(name)):
+            if not x.active(x.probe(gpu), gpu):
                 self.events.record(kind, source="request", allowed=False, reason=r["reason"],
                                    booking=r["booking"]["id"])
                 util.log(f"refusing {x.label} load: {r['reason']}")
@@ -2191,8 +2191,12 @@ class Arbiter:
                 return {"ok": False, "error": claim}
         # A booking keeps a new load nobody typed off the card (see schedule.py). Asked before the
         # owner is: there is no point putting a question to them that the booking refuses anyway. A
-        # request that changes nothing (the workload already holds the card) carries on, as above.
-        if request and name != NONE and self.schedule is not None:
+        # request that changes nothing (the workload already holds the card) carries on, as above,
+        # and so does one made while a `hold name` or `switch name` holds the lock: a person ordered
+        # the card given to this workload, and a held script's jobs get past their guard (a lazy
+        # workload still reads "none" under its hold, so the mode alone doesn't show it).
+        if request and name != NONE and self.schedule is not None \
+                and self.lock.holder() not in (f"hold {name}", f"switch {name}"):
             if (r := self._admit(name)) and self.probe()["mode"] != name:
                 why, bid, until = r["reason"], r["booking"]["id"], r["until"]
                 self.events.record("switch", to=name, ok=False, error=why, booking=bid)
