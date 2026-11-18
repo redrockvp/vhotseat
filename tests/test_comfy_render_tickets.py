@@ -141,7 +141,8 @@ def test_hold_takes_a_ticket_and_requeues_the_rest(cr, tmp_path, monkeypatch):
     def call(argv, env=None, **kw):
         seen.append(argv)
         inner = argv[argv.index("--") + 1:]               # python -m vhotseat.kit.comfy_render JOBS ...
-        ran.append(json.loads(open(inner[3]).read()))      # what this round runs, read while it runs
+        jobs_now = env.get("COMFY_RENDER_JOBS") or inner[3]   # a later round gets the rest by env
+        ran.append(json.loads(open(jobs_now).read()))      # what this round runs, read while it runs
         rest = env["COMFY_RENDER_REST"]
         if len(seen) == 1:                                # round 1 yields with one job left
             open(rest, "w").write(json.dumps([save(9)]))
@@ -157,7 +158,6 @@ def test_hold_takes_a_ticket_and_requeues_the_rest(cr, tmp_path, monkeypatch):
     assert "--class" in first and first[first.index("--class") + 1] == "batch"
     assert "--as" in first and first[first.index("--as") + 1] == "lead-38"
     assert jobs in first                                  # round 1 runs the caller's file
-    assert jobs not in second                             # round 2 runs the rest
     assert ran == [[save(i) for i in range(3)], [save(9)]]
 
 
@@ -184,7 +184,7 @@ def _yielding_rounds(cr, tmp_path, monkeypatch, rounds):
 
     def call(argv, env=None, **kw):
         inner = argv[argv.index("--") + 1:]
-        jobs = next(a for a in inner[3:] if a.endswith(".json"))
+        jobs = env.get("COMFY_RENDER_JOBS") or next(a for a in inner[3:] if a.endswith(".json"))
         seen.append(json.loads(open(jobs).read()))
         if len(seen) < rounds:
             rest = env["COMFY_RENDER_REST"]

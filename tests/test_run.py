@@ -82,7 +82,7 @@ def test_run_takes_a_ticket_holds_and_finishes(q, tmp_path):
     assert t["state"] == "done" and t["requester"] == "lead-38" and t["class"] == "batch"
     assert t["workload"] == "comfy" and t["est_s"] == 600 and t["pid"] == ME
     kinds = [e["event"] for e in q.events() if e["event"].startswith(("ticket", "hold"))]
-    assert kinds == ["ticket", "ticket-start", "hold", "hold-end", "ticket-end"]
+    assert kinds == ["ticket", "hold", "ticket-start", "hold-end", "ticket-end"]   # started once the card is its
     end = events(q, "ticket-end")[-1]
     assert end["ticket"] == int(tid) and end["exit"] == 3 and end["state"] == "done"
 

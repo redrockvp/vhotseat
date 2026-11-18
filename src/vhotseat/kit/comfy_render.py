@@ -40,13 +40,15 @@ paths relative to ComfyUI's folder (output/...).
 Exit codes: 0 every job produced output · 1 at least one job was rejected or
 failed · 2 bad input file or ComfyUI unreachable · 3 timed out · 4 the user
 cancelled at least one job (it outranks 1 and 3: ask them why before re-running).
-On a timeout the unfinished jobs are left in ComfyUI. 5 only comes from --hold, and only between
+On a timeout the unfinished jobs are left in ComfyUI; with --hold's steps, the jobs of steps not
+yet submitted are reported as "not submitted" (they never reached ComfyUI). 5 only comes from --hold, and only between
 its two comfy-render processes: the run inside handed the rest of the batch back, and the outer
 one re-queued it before answering.
 """
 
 import argparse
 import base64
+import contextlib
 import copy
 import json
 import os
@@ -89,6 +91,15 @@ REST_ENV = "COMFY_RENDER_REST"
 # The inner half's code for "here is the rest, queue a ticket for it". Only comfy-render's outer
 # half reads it; it never reaches a caller.
 EXIT_YIELDED = 5
+# Set by the outer half on each round after the first: the jobs file this round runs (the rest
+# the previous round left), whatever form the caller gave the original in (`--hold=FILE`).
+JOBS_ENV = "COMFY_RENDER_JOBS"
+# Set by the outer half: this round's first job number and the whole batch's size, so every round
+# numbers its jobs as jobs of the batch.
+FIRST_ENV, TOTAL_ENV = "COMFY_RENDER_FIRST", "COMFY_RENDER_TOTAL"
+# Set by the outer half with --json: where a round leaves its results, so the caller gets ONE
+# document for the whole batch, printed by the outer half at the end.
+RESULTS_ENV = "COMFY_RENDER_RESULTS"
 
 # Nothing interrupts or dequeues a job except a person: ComfyUI's own page, a
 # dashboard, `comfy jobs cancel`. The vhotseat guard fails a job with an error instead.
@@ -674,28 +685,52 @@ def run_in_steps(args, jobs: list[dict]) -> int:
     out stops the stepping: ComfyUI still holds those jobs, and yielding would drop them.
     """
     rest = Path(os.environ[REST_ENV])
+    first = _env_int(FIRST_ENV, 1)
+    total = _env_int(TOTAL_ENV, first - 1 + len(jobs))
     groups = steps(jobs, args.yield_every)
     done: list[dict] = []
     timed_out = False
     for group in groups:
-        results, timed_out = run(group, args.timeout, args.verbose, first=len(done) + 1,
-                                 total=len(jobs))
+        results, timed_out = run(group, args.timeout, args.verbose, first=first + len(done), total=total)
         done += results
         left = jobs[len(done):]
         yielding = not timed_out and left and should_yield()
         if not args.json:
-            print(summarize(results, len(jobs)), flush=True)    # each step as it ends
+            print(summarize(results, total), flush=True)        # each step as it ends
         if yielding:
             _write_rest(rest, left, done)
-            if args.json:
-                _report(True, done)
+            _json_out(args, done)
             print(f"yielding the card: {len(left)} job(s) left")
             return EXIT_YIELDED
         if timed_out:
+            # The steps after this one never reached ComfyUI: say so, job by job.
+            skipped = [{"job": first + len(done) + i, "status": "not submitted",
+                        "errors": ["not submitted: the batch timed out before its step"]}
+                       for i in range(len(left))]
+            if skipped and not args.json:
+                print(summarize(skipped, total), flush=True)
+            done += skipped
             break
-    if args.json:
-        _report(True, done)                                     # one document for the whole batch
+    _json_out(args, done)
     return _exit_code(done, timed_out)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def _json_out(args, results: list[dict]) -> None:
+    """With --json: one document. A round under the outer half leaves its results for it (the
+    outer prints the whole batch at the end); on its own it prints them."""
+    if not args.json:
+        return
+    if os.environ.get(RESULTS_ENV):
+        Path(os.environ[RESULTS_ENV]).write_text(json.dumps(results))
+    else:
+        _report(True, results)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -751,9 +786,10 @@ def main(argv: list[str] | None = None) -> int:
         COMFY_DIR = args.comfy_dir.expanduser()
 
     try:
-        jobs = load_jobs(args.jobs)
+        stepping = bool(os.environ.get(TICKET_ENV) and os.environ.get(REST_ENV))
+        jobs = load_jobs((stepping and os.environ.get(JOBS_ENV)) or args.jobs)
         comfy_dir()
-        if os.environ.get(TICKET_ENV) and os.environ.get(REST_ENV):
+        if stepping:
             # Inside a ticket that can hand the rest of the batch back: steps, and ask between
             # them. No ticket, or no place to leave the rest: the batch runs as one, as today.
             return run_in_steps(args, jobs)
@@ -790,29 +826,39 @@ def rerun_under_hold(name: str, wait: float, argv: list[str]) -> int:
         filter(None, [str(Path(__file__).resolve().parents[2]), os.environ.get("PYTHONPATH")]))}
     # A fresh rest file for every round, in one folder this cleans up when it ends.
     tmp = Path(tempfile.mkdtemp(prefix="comfy-render-rest-"))
+    jobs_path = args.jobs or args.hold          # `--hold jobs/x.json`: --hold's NAME took the file
     try:
-        round_argv, worst, rnd = list(argv), EXIT_OK, 0
-        # The jobs file as it stands in argv: positional, or the path `--hold` took (`--hold
-        # jobs/x.json`, as the skill writes it). Each round swaps it for the rest it was left.
-        current = args.jobs or args.hold
+        total = len(load_jobs(jobs_path))
+    except (UsageError, OSError, TypeError):
+        total = None                            # the round reports a bad file itself
+    try:
+        worst, rnd, round_env, results = EXIT_OK, 0, {}, []
         while True:
             rnd += 1
-            rest = tmp / f"rest-{rnd}.json"
+            rest, res = tmp / f"rest-{rnd}.json", tmp / f"results-{rnd}.json"
+            env_round = {**env, **round_env, REST_ENV: str(rest),
+                         **({RESULTS_ENV: str(res)} if args.json else {}),
+                         **({TOTAL_ENV: str(total)} if total is not None else {})}
             code = subprocess.call([vhotseat, "hold", name, "--class", args.cls,
                                     *(["--as", args.requester] if args.requester else []),
-                                    "--wait", str(wait), "--", *me, *round_argv],
-                                   env={**env, REST_ENV: str(rest)})
+                                    "--wait", str(wait), "--", *me, *argv], env=env_round)
+            if res.is_file():
+                with contextlib.suppress(OSError, ValueError):
+                    results += json.loads(res.read_text())
             if code == EXIT_YIELDED and rest.is_file():
                 # The run inside held the card too long and left the rest here: queue a new
                 # ticket for that file, and remember how the part that ran went.
                 worst = max(worst, _rest_code(rest))
-                round_argv = [str(rest) if a == current else a for a in round_argv]
-                current = str(rest)
+                round_env = {JOBS_ENV: str(rest)}
+                if total is not None:
+                    with contextlib.suppress(OSError, ValueError):
+                        round_env[FIRST_ENV] = str(total - len(json.loads(rest.read_text())) + 1)
                 continue
+            if args.json:
+                print(json.dumps(sorted(results, key=lambda r: r.get("job", 0)), indent=1))
             return max(worst, code)
     finally:
         _clean_rest(tmp)
-
 
 if __name__ == "__main__":
     sys.exit(main())

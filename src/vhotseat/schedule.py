@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS ticket (
   model TEXT,
   est_s REAL,
   pid INTEGER,
+  pid_started REAL,                   -- the process's creation time, against pid reuse
   state TEXT NOT NULL,                -- waiting | running | yielded | done | expired
   created REAL NOT NULL,
   heartbeat REAL NOT NULL,
@@ -129,15 +130,22 @@ def _shift_days(t: float, days: int) -> float:
     return (datetime.datetime.fromtimestamp(t) + datetime.timedelta(days=days)).timestamp()
 
 
+def _kernel32():
+    import ctypes
+    return ctypes, ctypes.WinDLL("kernel32", use_last_error=True)
+
+
 def _pid_alive(pid: int | None) -> bool:
+    """Is a process with this pid running? A process this user may not inspect (a service,
+    another account's) is running: not being allowed to look is not the process being gone, and
+    calling it gone would let a second ticket start beside it."""
     if not pid:
         return False
     if os.name == "nt":
-        import ctypes
-        k = ctypes.windll.kernel32
+        ctypes, k = _kernel32()
         h = k.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
         if not h:
-            return False
+            return ctypes.get_last_error() != 87       # ERROR_INVALID_PARAMETER: no such process
         try:
             code = ctypes.c_ulong()
             return bool(k.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
@@ -152,16 +160,46 @@ def _pid_alive(pid: int | None) -> bool:
     return True
 
 
+def _pid_identity(pid: int | None) -> float | None:
+    """When the process with this pid started, as a number that only it has: a pid alone is
+    reused (Windows hands a dead process's pid out again), and a ticket of a runner that died
+    must not live on in whatever got its pid. None when it can't be told (no such process, not
+    allowed to look, or a platform without a cheap way)."""
+    if not pid:
+        return None
+    if os.name == "nt":
+        ctypes, k = _kernel32()
+        h = k.OpenProcess(0x1000, False, int(pid))
+        if not h:
+            return None
+        try:
+            ft = [ctypes.c_ulonglong() for _ in range(4)]    # creation, exit, kernel, user
+            if not k.GetProcessTimes(h, *(ctypes.byref(x) for x in ft)):
+                return None
+            return float(ft[0].value)
+        finally:
+            k.CloseHandle(h)
+    try:
+        with open(f"/proc/{int(pid)}/stat", encoding="ascii", errors="replace") as f:
+            stat = f.read()
+        return float(stat.rsplit(")", 1)[1].split()[19])    # field 22: starttime, in clock ticks
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 class ScheduleError(Exception):
     pass
 
 
 class Schedule:
-    def __init__(self, path: Path, conf: dict, *, now=time.time, alive=_pid_alive):
+    def __init__(self, path: Path, conf: dict, *, now=time.time, alive=_pid_alive,
+                 identity=_pid_identity):
         self.path = Path(path)
         self.conf = conf
         self.now = now
         self.alive = alive
+        self.identity = identity
+        self._columns_checked = False
         self.classes = [c["name"] for c in conf["classes"]]
         self.default_class = conf["default_class"]
 
@@ -175,6 +213,14 @@ class Schedule:
         try:
             con.row_factory = sqlite3.Row
             con.executescript(_SCHEMA)
+            if not self._columns_checked:
+                # A schedule.db made before pid_started existed gets the column (additive: no
+                # row changes); once per Schedule, not per call.
+                cols = {r["name"] for r in con.execute("PRAGMA table_info(ticket)")}
+                if "pid_started" not in cols:
+                    con.execute("ALTER TABLE ticket ADD COLUMN pid_started REAL")
+                    con.commit()
+                self._columns_checked = True
             with con:
                 yield con
         finally:
@@ -382,10 +428,11 @@ class Schedule:
         if not workload:
             raise ScheduleError("a ticket has to name the workload it runs on")
         now = self.now()
+        started = self.identity(pid) if pid else None
         with self._db() as con:
-            cur = con.execute("INSERT INTO ticket (requester, class, workload, model, est_s, pid, "
-                              "state, created, heartbeat, note) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                              (requester, cls, workload, model, est_s, pid, "waiting", now, now, note))
+            cur = con.execute("INSERT INTO ticket (requester, class, workload, model, est_s, pid, pid_started, "
+                              "state, created, heartbeat, note) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                              (requester, cls, workload, model, est_s, pid, started, "waiting", now, now, note))
             tid = cur.lastrowid
         return self.ticket(tid)
 
@@ -436,7 +483,7 @@ class Schedule:
         """Expire tickets that stopped living: a pid that has gone, or a heartbeat past `STALE_S`."""
         now = self.now()
         with self._db() as con:
-            rows = list(con.execute("SELECT id, pid, heartbeat FROM ticket WHERE state IN ('waiting','running')"))
+            rows = list(con.execute("SELECT id, pid, pid_started, heartbeat FROM ticket WHERE state IN ('waiting','running')"))
             dead = [r["id"] for r in rows if not self._living(r, now)]
             for tid in dead:
                 con.execute("UPDATE ticket SET state = 'expired', ended = ? WHERE id = ?", (now, tid))
@@ -445,7 +492,13 @@ class Schedule:
     def _living(self, r, now: float) -> bool:
         """A ticket with a pid lives while its process does; one without lives on its heartbeat."""
         if r["pid"] is not None:
-            return bool(self.alive(r["pid"]))
+            if not self.alive(r["pid"]):
+                return False
+            if r["pid_started"] is not None:
+                # The pid runs, but is it still the process that took the ticket?
+                now_started = self.identity(r["pid"])
+                return now_started is None or now_started == r["pid_started"]
+            return True
         return now - r["heartbeat"] < STALE_S
 
     def order(self, on_card: str | None = None, now: float | None = None) -> list[dict]:
@@ -518,9 +571,18 @@ class Schedule:
         held = self.now() - t["started"]
         if held <= limit:
             return None
+        # Only waiters that could take the card now: yielding for one a booking keeps off frees
+        # the card for nobody.
         waiting = sum(1 for w in self.tickets()
-                      if w["state"] == "waiting" and self.rank(w["class"]) <= self.rank(t["class"]))
+                      if w["state"] == "waiting" and self.rank(w["class"]) <= self.rank(t["class"])
+                      and self.admit(w["workload"], w["class"], w["requester"])["ok"])
         return {"held_s": held, "limit_s": limit, "waiting": waiting} if waiting else None
+
+    def stamp_started(self, tid: int) -> None:
+        """The run now has the card: its max-hold clock starts here, not at the claim (it may have
+        waited on the GPU lock behind a typed hold in between)."""
+        with self._db() as con:
+            con.execute("UPDATE ticket SET started = ? WHERE id = ? AND state = 'running'", (self.now(), tid))
 
     def should_yield(self, tid: int) -> bool:
         """Has this running ticket held the card long enough that a waiting peer wants it back?"""
