@@ -10,12 +10,13 @@ import sys
 import threading
 import time
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from conftest import cli_bin
 from fakes import COMFY_CONTEXT_VRAM
 
-from vhotseat import claims, host
+from vhotseat import arbiter, claims, host, util
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -509,28 +510,36 @@ def test_hold_exit_code_is_the_commands(rig):
     assert rig.cli("hold", "comfy", "--", sys.executable, "-c", "raise SystemExit(7)") == 7
 
 
-def test_guard_inside_hold_does_not_wait_for_it(rig, tmp_path):
+def test_guard_inside_hold_does_not_wait_for_it(rig, tmp_path, monkeypatch):
     """The bug in Appendix A.6 #1: a script under `hold comfy` queues a ComfyUI
     job; the job's guard runs `switch comfy` from ComfyUI's process (no
     VHOTSEAT_HOLD in its env). It used to wait for the hold's lock, while
     the script waited for the job: stuck until the guard's 420 s timeout."""
     ready = tmp_path / "ready"
+    done = tmp_path / "done"
     result = {}
 
     def guard():
         while not ready.exists():
             time.sleep(0.01)
-        t0 = time.monotonic()
-        result["code"] = rig.arb.switch("comfy", 300)
-        result["s"] = time.monotonic() - t0
+        # If the guard polls the held lock, let the child exit and record the regression.
+        with monkeypatch.context() as patch:
+            poll = Mock(side_effect=lambda _: done.touch())
+            patch.setattr(util, "sleep", poll)
+            try:
+                result["code"] = rig.arb.switch("comfy", 300)
+                result["polls"] = poll.call_count
+            finally:
+                done.touch()
 
     t = threading.Thread(target=guard, daemon=True)
     t.start()
-    rig.cli("hold", "comfy", "--", sys.executable, "-c",
-            f"import pathlib,time; pathlib.Path({str(ready)!r}).touch(); time.sleep(1)")
-    t.join(5)
+    command = (f"import pathlib,time; pathlib.Path({str(ready)!r}).touch()\n"
+               f"while not pathlib.Path({str(done)!r}).exists(): time.sleep(0.01)")
+    assert rig.cli("hold", "comfy", "--", sys.executable, "-c", command) == 0
+    t.join()
     assert result["code"] == {"ok": True, "held": "comfy"}
-    assert result["s"] < 0.9                           # didn't wait for the hold to end
+    assert result["polls"] == 0
 
 
 def test_switch_waits_for_another_switch(rig):
@@ -672,18 +681,40 @@ def test_the_guard_falls_back_when_vhotseat_doesnt_know_request(rig, monkeypatch
     assert guard.REQUEST_OK is False
 
 
-def test_switch_with_wait_lets_a_comfy_batch_finish(rig):
+def test_switch_with_wait_lets_a_comfy_batch_finish(rig, monkeypatch):
     """`switch strata --wait` while ComfyUI has a batch queued, each job running
     the guard (`switch comfy`). It used to hold the lock while waiting for the
     queue, so every guard blocked on it: the batch stalled for the whole wait and
     the switch then failed. Found by the llama-server trial, 2026-10-17."""
     rig.comfy.slow_s = 0.3
-    rig.comfy.guard = lambda pid: (lambda r: None if r["ok"] else r["error"])(rig.arb.switch("comfy", 30))
+    # Advance the switch clock by the simulated render time of each completed job.
+    clock = Mock(wraps=time)
+    clock.monotonic.side_effect = lambda: len(rig.comfy.history) * rig.comfy.slow_s
+    monkeypatch.setattr(arbiter, "time", clock)
+    waiting = threading.Event()
+    comfy = rig.arb.workloads["comfy"]
+    busy = comfy.busy
+
+    def probe_batch():
+        reason = busy()
+        if reason:
+            assert rig.arb.lock.holder() != "switch strata", "Strata held the GPU lock while waiting"
+            waiting.set()
+        return reason
+
+    def guard(pid):
+        waiting.wait()
+        result = rig.arb.switch("comfy", 30)
+        return None if result["ok"] else result["error"]
+
+    monkeypatch.setattr(comfy, "busy", probe_batch)
+    rig.comfy.guard = guard
     pids = [rig.comfy.queue_job({"1": {"class_type": "Slow", "inputs": {}}}) for _ in range(4)]
-    time.sleep(0.05)
-    t0 = time.monotonic()
-    res = rig.arb.switch("strata", 20)
-    assert res["ok"] and time.monotonic() - t0 < 5
+    try:
+        res = rig.arb.switch("strata", 20)
+        assert waiting.is_set() and res["ok"], res
+    finally:
+        waiting.set()
     assert all(rig.comfy.history[p]["status"]["status_str"] == "success" for p in pids)
     assert rig.strata.loaded
 
@@ -700,4 +731,4 @@ def test_switch_with_wait_lets_a_comfy_batch_finish_with_a_slow_probe(rig, monke
         return reason
 
     monkeypatch.setattr(comfy, "busy", slow_busy)
-    test_switch_with_wait_lets_a_comfy_batch_finish(rig)
+    test_switch_with_wait_lets_a_comfy_batch_finish(rig, monkeypatch)
