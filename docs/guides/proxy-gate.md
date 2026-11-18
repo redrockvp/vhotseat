@@ -54,6 +54,8 @@ yet.
 
 ## 3. Build the proxy
 
+In front of Strata, the proxy also guards `POST /unload`: it closes admission, waits for answers to finish, then unloads, so pi must reach Strata only through the proxy.
+
 A small HTTP server in Python (stdlib `http.server` with threads is enough for
 one user; `aiohttp`/`httpx` if you want async), using `vhotseat.api`:
 

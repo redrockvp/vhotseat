@@ -10,8 +10,10 @@ import importlib.util
 import json
 import pathlib
 import socket
+import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
 import pytest
@@ -145,6 +147,67 @@ def test_a_completion_request_is_a_load_request():
     for path in no:
         assert not proxy.loads_a_model("POST", path), path
     assert not proxy.loads_a_model("GET", "/v1/chat/completions")
+
+
+@pytest.fixture
+def strata_gate(rig):
+    """Both pi and the configured HTTP release use the same public Strata address."""
+    rig.strata.loaded = True
+    p = proxy.Proxy(StubSeat(owner="strata"), rig.strata.url, workload="strata", hold=0).start()
+    rig.arb.workloads["strata"].url = p.url
+    try:
+        yield p
+    finally:
+        p.stop()
+
+
+def test_comfy_hold_preserves_an_admitted_strata_answer(rig, strata_gate, monkeypatch):
+    preparing, resume = threading.Event(), threading.Event()
+    route = rig.strata.route
+
+    def pause_preparation(h, method, url, body):
+        if url[0] == "/v1/chat/completions":
+            preparing.set()  # body read, still outside the engine's queued / busy accounting
+            resume.wait()
+        return route(h, method, url, body)
+
+    monkeypatch.setattr(rig.strata, "route", pause_preparation)
+    with ThreadPoolExecutor(1) as pool:
+        reply = pool.submit(call, strata_gate.url, "POST", "/v1/chat/completions", {"stream": True})
+        try:
+            assert preparing.wait(10)
+            rc = rig.cli("hold", "comfy", "--wait", "0", "--", sys.executable, "-c", "pass")
+            assert "POST /unload" not in rig.strata.calls
+            assert rc != 0 and rig.strata.loaded
+        finally:
+            resume.set()
+        code, _, stream = reply.result()
+        assert code == 200 and "data: a token" in stream
+
+
+def test_pi_gets_retryable_503_while_strata_unloads(rig, strata_gate, monkeypatch):
+    unloading, resume = threading.Event(), threading.Event()
+    route = rig.strata.route
+
+    def pause_unload(h, method, url, body):
+        if url[0] == "/unload":
+            unloading.set()  # the release has passed its last idle check
+            resume.wait()
+        return route(h, method, url, body)
+
+    monkeypatch.setattr(rig.strata, "route", pause_unload)
+    with ThreadPoolExecutor(1) as pool:
+        release = pool.submit(rig.arb.workloads["strata"].release, 0, 30)
+        try:
+            assert unloading.wait(10)
+            code, headers, raw = call(strata_gate.url, "POST", "/v1/chat/completions", {"stream": True})
+            assert code == 503
+            assert int(headers["retry-after"]) > 0 and json.loads(raw)["error"]
+            assert "POST /v1/chat/completions" not in rig.strata.calls
+        finally:
+            resume.set()
+        release.result()
+        assert not rig.strata.loaded
 
 
 def test_reading_studio_is_passed_through_untouched(gate, studio):
