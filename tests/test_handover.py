@@ -686,3 +686,18 @@ def test_switch_with_wait_lets_a_comfy_batch_finish(rig):
     assert res["ok"] and time.monotonic() - t0 < 5
     assert all(rig.comfy.history[p]["status"]["status_str"] == "success" for p in pids)
     assert rig.strata.loaded
+
+
+def test_switch_with_wait_lets_a_comfy_batch_finish_with_a_slow_probe(rig, monkeypatch):
+    """A delayed busy probe can consume the batch test's entire two-second budget."""
+    comfy = rig.arb.workloads["comfy"]
+    busy = comfy.busy
+
+    def slow_busy():
+        reason = busy()
+        if reason:
+            time.sleep(2.1)
+        return reason
+
+    monkeypatch.setattr(comfy, "busy", slow_busy)
+    test_switch_with_wait_lets_a_comfy_batch_finish(rig)
