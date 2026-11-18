@@ -1,6 +1,6 @@
 ---
 name: comfyui-batching
-description: Use whenever you run ComfyUI workflows (anything that would POST to ComfyUI's /prompt) and the GPU is shared with the LLM you run on, through vhotseat. Run them with the `comfy-render` command, in as few large batches as possible.
+description: Use whenever you run ComfyUI workflows (anything that would POST to ComfyUI's /prompt) and the GPU is shared with the LLM you run on, through vhotseat. Run them with the `comfy-render` command, in batches of at most four jobs.
 ---
 
 # Running ComfyUI work on a shared GPU
@@ -15,27 +15,26 @@ loaded, so vhotseat hands the GPU over automatically:
 - While ComfyUI has jobs queued or running, your LLM refuses to load (HTTP
   503). A render is never interrupted for you.
 
-You don't manage any of this yourself. But two things matter.
+You don't manage any of this yourself. Follow the sibling [vhotseat-gpu](../vhotseat-gpu/SKILL.md) skill as well.
 
 ## 1. Use `comfy-render`, not your own polling script
 
 ```sh
-comfy-render jobs/<name>.json
+comfy-render --hold comfy --hold-wait 900 --timeout 1800 --json jobs/<name>.json
 ```
 
 Keep job files and other scratch files in your own working folder, never
-inside ComfyUI's folder. Run it exactly like that:
+inside ComfyUI's folder. Run it in the foreground and wait:
 
 - **Don't pipe its output** (no `| tail`, `| head`, `| grep`). Its progress
   lines are how the user follows a long render live; a pipe holds them back
   until the end.
-- **Don't set a timeout** on the shell command. A batch of videos can take
-  hours, and comfy-render already gives up on its own if nothing progresses
-  for 30 minutes. If you cut it off while jobs are still queued, ComfyUI keeps
-  the GPU and your next request fails with "GPU busy".
+- Run in the foreground and wait. If your harness sets a shell command timeout,
+  make it long enough for the whole batch (hours for video). `comfy-render`'s
+  own `--timeout` is a no-progress limit and gives up by itself.
 
-It queues every job, **waits until all of them have finished**, and prints one
-line per job: the files it saved, or ComfyUI's own error. A hand-written
+It queues the jobs and waits for results. With `--json`, stdout is one array
+and progress goes to stderr; each result includes saved files or errors. A hand-written
 polling loop is easy to get subtly wrong. If it crashes while jobs are still
 queued, your next request to the LLM arrives while ComfyUI holds the GPU, and
 the turn fails with "GPU busy".
@@ -71,7 +70,7 @@ would POST to `/prompt`, in one of three shapes:
 Use a `Save*` output node (e.g. `SaveImage`) for files you want to keep;
 `PreviewImage` writes to ComfyUI's temp folder.
 
-Reading the result:
+Reading the result (the examples below show human-readable output without `--json`):
 
 - While it runs you'll see progress such as `job 1/2 running: node 5 KSampler
   step 57/150 (38%)` or `job 1/2 waiting to start …`. Just let it finish; don't
@@ -80,33 +79,28 @@ Reading the result:
 - `job 3/4 rejected: node 7 PreviewImage: …`: ComfyUI refused the workflow
   before running it (a wrong link type, a missing input, an unknown node, a
   model file that isn't installed, which also lists the valid names). Fix that
-  node and re-run **only** the jobs that failed. ComfyUI reports the first
-  problem it meets, so a second error may appear after you fix the first.
+  node and report the failure; do not retry the command.
 - `job 1/4 failed: node 5 KSampler: …`: it ran but errored partway (e.g. out of
-  memory). Add `--verbose` to see where in ComfyUI's code.
+  memory). Report the failure without retrying.
 - `job 2/4 cancelled: cancelled by the user …`: someone stopped that job. It is
   not an error to fix. **Don't re-run it; ask the user why they cancelled** and
   go on from their answer. The exit code is 4 whenever any job was cancelled.
-- `job 4/9 timeout: no progress for 1800s; …`: nothing happened for 30
-  minutes, so ComfyUI is probably stuck. Those jobs are **still in ComfyUI's
-  queue**. Tell the user rather than re-running them, since your next request
-  may fail with "GPU busy" until the queue is cleared. The exit code is 3.
-- The last line is the total; the exit code is 0 only if every job saved files.
+- `job 4/4 timeout: no progress for 1800s; …`: no progress occurred for
+  the timeout period. Its pending jobs were removed; report it and do not
+  retry. The exit code is 3.
+- Without `--json`, the last line is the total; the exit code is 0 only if every job saved files.
 
-Writing your own script is still fine for something `comfy-render` can't do.
-If you do, wait until the queue is empty (`GET /queue`) before finishing, even
-if your script hits an error.
+Never POST directly to ComfyUI `/prompt`, including from your own script.
 
 ## 2. Batch, as a best effort
 
 Every round of "render, look, render again" pays the GPU handover twice. Batch
 when it's natural; don't bend the task out of shape for it.
 
-- **Queue everything for a round in one `comfy-render` call.** Write every
-  prompt for the whole job (all panels, all shots) before rendering anything.
-- **Over-generate instead of re-rolling.** If a panel or shot is risky, render
-  more seeds (e.g. 6–8 instead of 3) and a few prompt variants in the same
-  batch. Picking from extras is cheaper than a second round.
+- **Prepare a round before rendering.** Write the prompts for the whole job
+  and submit batches of at most four jobs.
+- **Consider variants up front.** Include useful seeds or prompt variants
+  within the four-job limit rather than retrying a failed command.
 - **Put review material in one image.** After a batch, build one contact sheet
   per round (a labelled grid of thumbnails) and look at that, instead of opening
   every output.
@@ -127,7 +121,7 @@ image. Say so in your reply if you expect several rounds.
 
 - A **job** failing with `GPU busy, job not run: …` means your LLM was busy
   when ComfyUI tried to take the GPU, for instance because another conversation
-  was using it. Re-run that job a little later.
+  was using it. Report the failure; do not retry.
 - **Your own reply** failing because the GPU is busy with ComfyUI jobs means
   ComfyUI was still rendering when you were asked to continue. It clears when
   the queue empties.
