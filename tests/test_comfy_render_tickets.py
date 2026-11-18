@@ -236,7 +236,7 @@ def test_hold_takes_a_ticket_and_requeues_the_rest(cr, tmp_path, monkeypatch):
             open(rest + ".code", "w").write("1")          # and one of its jobs had failed
             return 5
         return 0
-    monkeypatch.setattr(cr.subprocess, "call", call)
+    monkeypatch.setattr(cr, "run_with_signals", call)
     code = cr.main([jobs, "--hold", "--class", "batch", "--as", "lead-38"])
     assert code == cr.EXIT_FAILED                         # the worst round decides
     assert len(seen) == 2
@@ -251,7 +251,7 @@ def test_hold_takes_a_ticket_and_requeues_the_rest(cr, tmp_path, monkeypatch):
 def test_hold_defaults_to_class_batch(cr, tmp_path, monkeypatch):
     monkeypatch.setenv("VHOTSEAT_BIN", "vhotseat-test")
     seen = []
-    monkeypatch.setattr(cr.subprocess, "call", lambda argv, **kw: seen.append(argv) or 0)
+    monkeypatch.setattr(cr, "run_with_signals", lambda argv, **kw: seen.append(argv) or 0)
     assert cr.main([write(tmp_path / "jobs.json", save()), "--hold"]) == 0
     assert seen[0][seen[0].index("--class") + 1] == "batch"
 
@@ -259,7 +259,7 @@ def test_hold_defaults_to_class_batch(cr, tmp_path, monkeypatch):
 def test_a_round_that_ends_without_yielding_ends_the_loop(cr, tmp_path, monkeypatch):
     monkeypatch.setenv("VHOTSEAT_BIN", "vhotseat-test")
     seen = []
-    monkeypatch.setattr(cr.subprocess, "call", lambda argv, **kw: seen.append(argv) or 3)
+    monkeypatch.setattr(cr, "run_with_signals", lambda argv, **kw: seen.append(argv) or 3)
     assert cr.main([write(tmp_path / "jobs.json", save()), "--hold"]) == 3   # a timeout, passed on
     assert len(seen) == 1
 
@@ -279,7 +279,7 @@ def _yielding_rounds(cr, tmp_path, monkeypatch, rounds):
             open(rest + ".code", "w").write("0")
             return 5
         return 0
-    monkeypatch.setattr(cr.subprocess, "call", call)
+    monkeypatch.setattr(cr, "run_with_signals", call)
     return seen
 
 

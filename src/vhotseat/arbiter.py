@@ -17,7 +17,6 @@ import contextlib
 import datetime
 import json
 import os
-import signal
 import subprocess
 import tempfile
 import threading
@@ -27,6 +26,7 @@ from pathlib import Path
 
 from . import claims, host, notify, policy, pressure, schedule, util
 from . import config as cfgmod
+from .child_process import STOP_GRACE_S, run_with_signals
 from .config_edit import version_of
 from .drivers.base import Workload
 from .errors import Busy, PolicyRefused, ReleaseFailed, ScheduleRefused, SwitchError
@@ -2311,22 +2311,12 @@ class Arbiter:
             if on_hold is not None:
                 on_hold()
             try:
-                proc = subprocess.Popen(command, env={**os.environ, HOLD_ENV: name, **(env or {})})
+                code = run_with_signals(command, env={**os.environ, HOLD_ENV: name, **(env or {})},
+                                        grace_s=STOP_GRACE_S)
             except OSError as e:
                 self.events.record("hold-end", mode=name, ok=False, error=str(e))
                 util.log(f"could not run {command[0]}: {e}")
                 return 1
-            # Pass termination on, so the lock is never released under a running render.
-            if os.name == "nt":
-                # The console sends Ctrl+C / Ctrl+Break to the command too: just wait for it.
-                # A SIGTERM can only be passed on as TerminateProcess.
-                for sig in (signal.SIGINT, signal.SIGBREAK):
-                    signal.signal(sig, lambda _signum, _frame: None)
-                signal.signal(signal.SIGTERM, lambda _signum, _frame: proc.terminate())
-            else:
-                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-                    signal.signal(sig, lambda signum, _frame: proc.send_signal(signum))
-            code = proc.wait()
             self.events.record("hold-end", mode=name, exit=code)
             return code
 

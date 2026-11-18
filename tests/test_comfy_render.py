@@ -254,6 +254,29 @@ def test_hold_before_the_jobs_file(cr, tmp_path, monkeypatch):
     assert seen == {"name": "comfy", "argv": ["--hold", path]}
 
 
+@pytest.mark.parametrize("mode", ["direct", "plain hold", "ticketed hold"])
+def test_json_stdout_is_one_result_array(rig, tmp_path, monkeypatch, mode):
+    monkeypatch.setenv("VHOTSEAT_BIN", cli_bin(tmp_path))
+    monkeypatch.setenv("STRATA_URL", rig.strata.url)
+    monkeypatch.setenv("COMFY_URL", rig.comfy.url)
+    # The rig has no schedule. Supply a ticket to exercise the inner stepping path.
+    monkeypatch.delenv("VHOTSEAT_TICKET", raising=False)
+    if mode == "ticketed hold":
+        monkeypatch.setenv("VHOTSEAT_TICKET", "7")
+    hold = [] if mode == "direct" else ["--hold", "comfy"]
+    run = subprocess.run(
+        [sys.executable, "-m", "vhotseat.kit.comfy_render", *hold, "--json",
+         write(tmp_path, save())], capture_output=True, text=True, timeout=30,
+    )
+    assert run.returncode == 0, run.stderr
+    results = json.loads(run.stdout)
+    assert len(results) == 1
+    job = results[0]
+    assert (job["job"], job["status"]) == (1, "done")
+    assert job["prompt_id"] in rig.comfy.history
+    assert job["files"]
+
+
 def test_missing_jobs_is_a_usage_error(cr, capsys):
     with pytest.raises(SystemExit) as e:
         cr.main(["--hold"])
