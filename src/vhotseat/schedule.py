@@ -494,6 +494,17 @@ class Schedule:
             return False
         return not any(t["state"] == "running" and t["id"] != tid for t in self.tickets())
 
+    def claim(self, tid: int, on_card: str | None = None) -> bool:
+        """Start this ticket when it is its turn: the update itself checks, so two claimers
+        that race over the same queue still leave only one ticket running."""
+        if not self.my_turn(tid, on_card):
+            return False
+        with self._db() as con:
+            cur = con.execute("UPDATE ticket SET state = 'running', started = ? WHERE id = ? AND state = 'waiting'"
+                              " AND NOT EXISTS (SELECT 1 FROM ticket WHERE state = 'running' AND id != ?)",
+                              (self.now(), tid, tid))
+            return cur.rowcount == 1
+
     def overdue(self, tid: int) -> dict | None:
         """A running ticket held past its class's max hold, with a class at its own rank or higher
         waiting: {held_s, limit_s, waiting}. None when it is not overdue.

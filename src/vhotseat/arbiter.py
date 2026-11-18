@@ -52,6 +52,9 @@ def _stamp(path: Path) -> tuple:
 # Set in a hold's command's environment, so a nested switch to the held workload
 # is a no-op instead of waiting on the lock the hold owns.
 HOLD_ENV = "VHOTSEAT_HOLD"
+# Set in a `run`'s command's environment: which ticket is on the card, so the command can ask
+# `vhotseat should-yield` about its own hold (see schedule.py's max hold).
+TICKET_ENV = "VHOTSEAT_TICKET"
 
 
 class Arbiter:
@@ -2277,11 +2280,13 @@ class Arbiter:
             self.events.record("switch", to=name, ok=True, previous=before, **({"done": done} if done else {}))
         return {"ok": True, **({"done": done} if done else {})}
 
-    def hold(self, name: str, command: list[str], wait: float) -> int:
+    def hold(self, name: str, command: list[str], wait: float, env: dict | None = None) -> int:
         """Switch to `name` and keep the GPU there until `command` exits; returns
         its exit code. The lock is marked "hold name" once the switch is done, so
         every other workload's gate refuses, and a script may leave the queue
-        empty between its jobs."""
+        empty between its jobs.
+
+        `env` is merged into the command's environment on top of `VHOTSEAT_HOLD`."""
         if os.environ.get(HOLD_ENV) == name:
             # Already inside a hold: our parent owns the lock, so taking it would deadlock.
             return subprocess.call(command)
@@ -2300,7 +2305,7 @@ class Arbiter:
             lock.mark(f"hold {name}")
             self.events.record("hold", mode=name, ok=True, previous=before, command=" ".join(command)[:200])
             try:
-                proc = subprocess.Popen(command, env={**os.environ, HOLD_ENV: name})
+                proc = subprocess.Popen(command, env={**os.environ, HOLD_ENV: name, **(env or {})})
             except OSError as e:
                 self.events.record("hold-end", mode=name, ok=False, error=str(e))
                 util.log(f"could not run {command[0]}: {e}")
@@ -2318,3 +2323,74 @@ class Arbiter:
             code = proc.wait()
             self.events.record("hold-end", mode=name, exit=code)
             return code
+
+
+    def run(self, name: str, command: list[str], wait: float, *, cls: str = "batch",
+            est_s: float | None = None, requester: str | None = None,
+            queue_timeout: float = 0.0, poll_s: float = 1.0) -> int:
+        """Take a ticket, wait until the queue serves it, hold the card for COMMAND, close the ticket.
+
+        This is how an agent's batch comes to the card: a ticket is a request, so a booking that
+        excludes it keeps it waiting and the serving order (class, affinity, round-robin per
+        requester) decides who goes next - where a plain `hold` is an order that goes through.
+        `queue_timeout` is how long the request waits for its turn before giving up (0: as long as
+        it takes). A schedule that can't be read is a plain `hold`: a broken schedule never keeps
+        a load off the card, and a ticket that never finished normally (Ctrl+C, an error) is left
+        expired rather than as a runner nobody can account for.
+        """
+        if os.environ.get(HOLD_ENV) == name:
+            # Already inside a hold of this workload: our parent owns the lock and its ticket.
+            return subprocess.call(command)
+        if self.schedule is None:
+            return self.hold(name, command, wait)
+        requester = requester or f"{os.environ.get('USERNAME') or os.environ.get('USER') or 'someone'} pid {os.getpid()}"
+        # The ticket bookkeeping writes into the state dir, and that dir has to exist before the
+        # schedule is opened: sqlite would make a FILE at a path meant to be the directory, and
+        # every write into it after that fails - which would turn an unreadable schedule into a
+        # crash instead of a fallback hold. One idempotent mkdir costs nothing.
+        with contextlib.suppress(Exception):
+            self.events.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # Take the ticket and say so. Either half can fail - a schedule that can't be read,
+            # an event log that won't open - and then the request becomes a plain hold: a broken
+            # schedule never keeps a load off the card.
+            t = self.schedule.take(requester, cls, name, est_s=est_s, pid=os.getpid())
+            self.events.record("ticket", ticket=t["id"], requester=requester, cls=cls,
+                               workload=name, est_s=est_s)
+        except Exception as e:
+            util.log(f"schedule unreadable: {e}")
+            return self.hold(name, command, wait)
+        finished = False
+        try:
+            deadline = time.monotonic() + queue_timeout * util.SCALE if queue_timeout > 0 else None
+            said = False
+            while True:
+                on_card = self.probe()["mode"]
+                if self.schedule.claim(t["id"], on_card):
+                    break
+                if not said:
+                    said = True
+                    row = self.schedule.queue_view(on_card)
+                    pos = next((i + 1 for i, x in enumerate(row) if x["id"] == t["id"]), len(row) + 1)
+                    if self.schedule.head(on_card) is None:
+                        util.log(f"waiting for the card: ticket {t['id']}, behind a booking")
+                    else:
+                        util.log(f"waiting for the card: ticket {t['id']}, {pos} in the queue")
+                if deadline is not None and time.monotonic() >= deadline:
+                    self.schedule.finish(t["id"], "expired")
+                    finished = True
+                    self.events.record("ticket-end", ticket=t["id"], state="expired")
+                    util.log(f"gave up on ticket {t['id']}: its turn did not come within "
+                             f"{int(queue_timeout)} s")
+                    return 1
+                util.sleep(poll_s)
+            self.events.record("ticket-start", ticket=t["id"], workload=name)
+            code = self.hold(name, command, wait, env={TICKET_ENV: str(t["id"])})
+            self.schedule.finish(t["id"], "done")
+            finished = True
+            self.events.record("ticket-end", ticket=t["id"], state="done", exit=code)
+            return code
+        finally:
+            if not finished:
+                with contextlib.suppress(Exception):
+                    self.schedule.finish(t["id"], "expired")
