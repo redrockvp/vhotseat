@@ -1,8 +1,8 @@
 """The contract between the arbiter and a workload driver."""
 
+import socket
 from collections.abc import Callable
 from dataclasses import dataclass, field
-import socket
 from urllib.parse import urlsplit
 
 from .. import policy, util

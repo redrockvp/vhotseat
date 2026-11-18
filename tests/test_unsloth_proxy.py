@@ -15,9 +15,9 @@ import time
 from urllib.parse import urlsplit
 
 import pytest
-
 from fakes import _Server
-from test_vhotseat import vh          # the same fake box, for one test against a real arbiter
+from test_vhotseat import vh  # noqa: F401 - a fixture: the same fake box, for one test against a real arbiter
+
 from vhotseat import api
 
 PROXY_FILE = pathlib.Path(__file__).resolve().parents[1] / "integrations" / "unsloth" \
@@ -295,7 +295,7 @@ def test_a_drain_that_find_requests_running_says_busy_and_clears(studio):
         p.stop()
 
 
-def test_ten_requests_at_once_cause_one_handover(vh):
+def test_ten_requests_at_once_cause_one_handover(vh):  # noqa: F811 - the imported fixture
     """Once one gated request has taken the card, a stampede behind it changes hands again
     no times: the seat knows who it just handed the card to, so the rest take the fast path
     while the first request's weights are still landing."""

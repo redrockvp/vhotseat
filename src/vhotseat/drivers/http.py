@@ -36,10 +36,10 @@ starting with http:// goes to that address instead of `url` (a proxy in front
 of the server, say).
 """
 
-from dataclasses import dataclass, field
 import os
 import re
 import time
+from dataclasses import dataclass, field
 
 from .. import util
 from ..errors import Busy, SwitchError
