@@ -204,7 +204,7 @@ def _rounds(cr, monkeypatch, rounds):
             open(rest + ".code", "w").write("0")
             return 5
         return 0
-    monkeypatch.setattr(cr.subprocess, "call", call)
+    monkeypatch.setattr(cr, "run_with_signals", call)
     return seen
 
 
@@ -240,7 +240,7 @@ def test_json_rounds_add_up_to_one_document(cr, tmp_path, monkeypatch, capsys):
             open(env["COMFY_RENDER_REST"] + ".code", "w").write("0")
             return 5
         return 0
-    monkeypatch.setattr(cr.subprocess, "call", call)
+    monkeypatch.setattr(cr, "run_with_signals", call)
     assert cr.main([write(tmp_path / "jobs.json", [save(1), save(2)]), "--hold", "--json"]) == 0
     assert calls[1]["COMFY_RENDER_FIRST"] == "2" and calls[1]["COMFY_RENDER_TOTAL"] == "2"
     out = capsys.readouterr().out

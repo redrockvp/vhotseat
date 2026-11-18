@@ -69,6 +69,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from vhotseat.child_process import STOP_GRACE_S, run_with_signals
+
 COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188")
 COMFY_DIR: Path | None = Path(os.environ["COMFY_DIR"]) if os.environ.get("COMFY_DIR") else None
 POLL_S = 2.0
@@ -896,9 +898,11 @@ def rerun_under_hold(name: str, wait: float, argv: list[str]) -> int:
             env_round = {**env, **round_env, REST_ENV: str(rest),
                          **({RESULTS_ENV: str(res)} if args.json else {}),
                          **({TOTAL_ENV: str(total)} if total is not None else {})}
-            code = subprocess.call([vhotseat, "hold", name, "--class", args.cls,
-                                    *(["--as", args.requester] if args.requester else []),
-                                    "--wait", str(wait), "--", *me, *argv], env=env_round)
+            # The hold needs its full grace to stop and reap the inner renderer first.
+            code = run_with_signals([vhotseat, "hold", name, "--class", args.cls,
+                                     *(["--as", args.requester] if args.requester else []),
+                                     "--wait", str(wait), "--", *me, *argv],
+                                    env=env_round, grace_s=STOP_GRACE_S + 3, report_cancellation=True)
             if res.is_file():
                 with contextlib.suppress(OSError, ValueError):
                     results += json.loads(res.read_text())
