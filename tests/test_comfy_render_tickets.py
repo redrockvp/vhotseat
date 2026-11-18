@@ -6,6 +6,11 @@ vhotseat's side is stubbed at the subprocess boundary."""
 
 import importlib
 import json
+import os
+import subprocess
+import sys
+import threading
+from pathlib import Path
 
 import pytest
 from fakes import FakeComfy
@@ -43,6 +48,88 @@ def inside_ticket(monkeypatch, cr, tmp_path, ticket="7"):
     rest = tmp_path / "rest.json"
     monkeypatch.setenv("COMFY_RENDER_REST", str(rest))
     return rest
+
+
+# Run signals in a child so the default SIGTERM action cannot kill pytest.
+# The first three submissions are real HTTP requests to FakeComfy. Crash on the
+# fourth submission, or signal the renderer during history polling.
+_ABORT_BATCH = """
+import signal, sys
+from vhotseat.kit import comfy_render as cr
+reason = sys.argv.pop(1)
+request = cr._request
+submitted = 0
+def inject(method, path, *args, **kwargs):
+    global submitted
+    if method == 'POST' and path == '/prompt':
+        if reason == 'exception' and submitted == 3:
+            raise RuntimeError('simulated submission failure')
+        submitted += 1
+    if reason.startswith('SIG') and path.startswith('/history/'):
+        signum = getattr(signal, reason)
+        # Deliver once, even if cleanup itself reads history.
+        cr._request = request
+        signal.raise_signal(signum)
+    return request(method, path, *args, **kwargs)
+cr._request = inject
+cr.POLL_S = 0.02
+sys.exit(cr.main())
+"""
+
+
+@pytest.mark.parametrize("reason", ["exception", "SIGINT", "SIGTERM", "timeout"]
+                         + (["SIGBREAK"] if sys.platform == "win32" else []))
+def test_abort_inside_hold_cleans_only_owned_pending(cr, tmp_path, monkeypatch, reason):
+    inside_ticket(monkeypatch, cr, tmp_path)
+    fake = cr.fake
+    release = threading.Event()
+    foreign = []
+
+    def guard(pid):
+        if not foreign:
+            foreign.append(fake.queue_job())   # Peter submits while our first job runs
+            if reason != "timeout":
+                fake.queue_posted.wait(50)     # finish shortly after the pending jobs are removed
+                return
+        release.wait(50)                       # stuck render, or Peter's job after ours
+
+    fake.guard = guard
+    n = 4 if reason == "exception" else 3
+    jobs = write(tmp_path / "jobs.json", [save(i) for i in range(n)])
+    try:
+        child = subprocess.run(
+            [sys.executable, "-c", _ABORT_BATCH, reason, jobs, "--url", fake.url,
+             "--hold", "comfy", "--timeout", "0.2" if reason == "timeout" else "30"],
+            capture_output=True, timeout=45,
+        )
+        assert len(fake.clients) == 3, child.stderr
+        running, *pending = fake.clients  # insertion order of accepted submissions
+        if reason == "timeout":
+            assert child.returncode == cr.EXIT_TIMEOUT
+            assert fake.running == [running]   # the bounded wait expired with it still running
+        else:
+            assert child.returncode != 0
+        assert {pid for post in fake.queue_posts for pid in post["delete"]} == set(pending)
+        assert set(pending).isdisjoint(fake.pending + fake.running + list(fake.history))
+        assert foreign and foreign[0] in fake.pending + fake.running
+        assert "POST /interrupt" not in fake.calls
+        if reason != "timeout":
+            assert fake.history[running]["status"]["completed"]  # finished before leaving the hold
+    finally:
+        release.set()
+        fake.queue_posted.set()
+
+
+def test_stdout_preserves_utf8_path_on_cp1252(cr, tmp_path):
+    jobs = write(tmp_path / "jobs.json", save())
+    entry = Path(__file__).resolve().parents[1] / "comfy-render"
+    child = subprocess.run(
+        [sys.executable, str(entry), jobs, "--url", cr.fake.url, "--comfy-dir", "東京"],
+        env={**os.environ, "PYTHONIOENCODING": "cp1252:strict"},
+        capture_output=True, timeout=30,
+    )
+    assert child.returncode == 0, child.stderr
+    assert "東京".encode("utf-8") in child.stdout
 
 
 # --- steps ----------------------------------------------------------------------------------------

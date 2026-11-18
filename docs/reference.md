@@ -349,8 +349,9 @@ watchdog doesn't kill a long render.
 Exit codes: `0` every job saved files · `1` some job was rejected or failed ·
 `2` bad input file or ComfyUI unreachable · `3` no progress for `--timeout`
 seconds (default 1800; the batch as a whole may take hours) · `4` the user
-cancelled some job (wins over `1` and `3`: ask them why before re-running). On
-a timeout the unfinished jobs are left in ComfyUI's queue.
+cancelled some job (wins over `1` and `3`: ask them why before re-running).
+On timeout, error, or a handled termination signal, the renderer removes its own
+pending prompts and gives its running prompt up to five seconds to finish before exiting.
 
 - `--url`, else `$COMFY_URL`, else `http://127.0.0.1:8188`.
 - `--comfy-dir`, else `$COMFY_DIR`, else ComfyUI's own folder, read from its
