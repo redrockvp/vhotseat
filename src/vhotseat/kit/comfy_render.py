@@ -682,14 +682,19 @@ def run_in_steps(args, jobs: list[dict]) -> int:
                                  total=len(jobs))
         done += results
         left = jobs[len(done):]
-        if not timed_out and left and should_yield():
+        yielding = not timed_out and left and should_yield()
+        if not args.json:
+            print(summarize(results, len(jobs)), flush=True)    # each step as it ends
+        if yielding:
             _write_rest(rest, left, done)
-            _report(args.json, results, len(jobs))
+            if args.json:
+                _report(True, done)
             print(f"yielding the card: {len(left)} job(s) left")
             return EXIT_YIELDED
-        _report(args.json, results, len(jobs))
         if timed_out:
             break
+    if args.json:
+        _report(True, done)                                     # one document for the whole batch
     return _exit_code(done, timed_out)
 
 
@@ -761,22 +766,9 @@ def main(argv: list[str] | None = None) -> int:
     return _exit_code(results, timed_out)
 
 
-def _clean_rest(tmp: Path, used: list[Path]) -> None:
-    """Every round's rest file goes except the one the LAST round ran from: that is the batch the
-    caller ended with, and it may still want to see it. The folder goes when nothing is left."""
-    keep = used[-2] if len(used) > 1 else None
-    for old in used:
-        if old == keep:
-            continue
-        for gone in (old, Path(f"{old}.code")):
-            try:
-                gone.unlink()
-            except OSError:
-                pass  # never written, or already gone
-    try:
-        tmp.rmdir()
-    except OSError:
-        pass  # not empty: a file the caller may want is in it
+def _clean_rest(tmp: Path) -> None:
+    """The rounds' rest files are comfy-render's own hand-overs: they all go with their folder."""
+    shutil.rmtree(tmp, ignore_errors=True)
 
 
 def rerun_under_hold(name: str, wait: float, argv: list[str]) -> int:
@@ -798,13 +790,14 @@ def rerun_under_hold(name: str, wait: float, argv: list[str]) -> int:
         filter(None, [str(Path(__file__).resolve().parents[2]), os.environ.get("PYTHONPATH")]))}
     # A fresh rest file for every round, in one folder this cleans up when it ends.
     tmp = Path(tempfile.mkdtemp(prefix="comfy-render-rest-"))
-    used: list[Path] = []
     try:
         round_argv, worst, rnd = list(argv), EXIT_OK, 0
+        # The jobs file as it stands in argv: positional, or the path `--hold` took (`--hold
+        # jobs/x.json`, as the skill writes it). Each round swaps it for the rest it was left.
+        current = args.jobs or args.hold
         while True:
             rnd += 1
             rest = tmp / f"rest-{rnd}.json"
-            used.append(rest)
             code = subprocess.call([vhotseat, "hold", name, "--class", args.cls,
                                     *(["--as", args.requester] if args.requester else []),
                                     "--wait", str(wait), "--", *me, *round_argv],
@@ -813,11 +806,12 @@ def rerun_under_hold(name: str, wait: float, argv: list[str]) -> int:
                 # The run inside held the card too long and left the rest here: queue a new
                 # ticket for that file, and remember how the part that ran went.
                 worst = max(worst, _rest_code(rest))
-                round_argv = [str(rest) if a == args.jobs else a for a in round_argv]
+                round_argv = [str(rest) if a == current else a for a in round_argv]
+                current = str(rest)
                 continue
             return max(worst, code)
     finally:
-        _clean_rest(tmp, used)
+        _clean_rest(tmp)
 
 
 if __name__ == "__main__":

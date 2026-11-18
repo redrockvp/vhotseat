@@ -136,10 +136,12 @@ def test_should_yield_asks_vhotseat_and_fails_safe(cr, monkeypatch):
 def test_hold_takes_a_ticket_and_requeues_the_rest(cr, tmp_path, monkeypatch):
     monkeypatch.setenv("VHOTSEAT_BIN", "vhotseat-test")
     jobs = write(tmp_path / "jobs.json", [save(i) for i in range(3)])
-    seen = []
+    seen, ran = [], []
 
     def call(argv, env=None, **kw):
         seen.append(argv)
+        inner = argv[argv.index("--") + 1:]               # python -m vhotseat.kit.comfy_render JOBS ...
+        ran.append(json.loads(open(inner[3]).read()))      # what this round runs, read while it runs
         rest = env["COMFY_RENDER_REST"]
         if len(seen) == 1:                                # round 1 yields with one job left
             open(rest, "w").write(json.dumps([save(9)]))
@@ -156,8 +158,7 @@ def test_hold_takes_a_ticket_and_requeues_the_rest(cr, tmp_path, monkeypatch):
     assert "--as" in first and first[first.index("--as") + 1] == "lead-38"
     assert jobs in first                                  # round 1 runs the caller's file
     assert jobs not in second                             # round 2 runs the rest
-    inner = second[second.index("--") + 1:]               # python -m vhotseat.kit.comfy_render JOBS ...
-    assert json.loads(open(inner[3]).read()) == [save(9)]
+    assert ran == [[save(i) for i in range(3)], [save(9)]]
 
 
 def test_hold_defaults_to_class_batch(cr, tmp_path, monkeypatch):
