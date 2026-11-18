@@ -48,6 +48,8 @@ environment), and SIGINT, SIGTERM and SIGHUP are passed on to COMMAND. Use it
 for a batch that must not be split, or as the gate for a program with no
 server.
 
+In PowerShell, select Git Bash explicitly, e.g. `vhotseat hold comfy --wait 900 -- "C:\Program Files\Git\usr\bin\bash.exe" ./drain.sh`; bare `bash` may select WSL and exit 127.
+
 **Config** is `~/.config/vhotseat/config.yaml`, or `$VHOTSEAT_CONFIG`. It's
 validated on load and every error names the key. A broken config makes every
 gate refuse rather than letting a load through unchecked. The dashboard's policy

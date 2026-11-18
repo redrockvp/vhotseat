@@ -65,6 +65,7 @@ class State:
 
     def __init__(self):
         self.lock = threading.Lock()
+        self.drain_lock = threading.Lock()
         self.in_flight = 0
         self.draining = False
 
@@ -126,21 +127,32 @@ class Handler(BaseHTTPRequestHandler):
             n, draining = self.state.snapshot()
             self._reply(200, {"in_flight": n, "draining": draining})
             return True
-        if path == "/_vhotseat/drain" and method == "POST":
+        if method == "POST" and (path == "/_vhotseat/drain" or
+                                 (self.workload == "strata" and path == "/unload")):
+            body = self._read_body() if path == "/unload" else b""
             wait = float((parse_qs(urlsplit(self.path).query).get("wait") or ["30"])[0])
-            self.state.set_draining(True)
-            deadline = time.monotonic() + wait
-            while self.state.snapshot()[0] and time.monotonic() < deadline:
-                time.sleep(0.05)
-            still, _ = self.state.snapshot()
-            if still:
-                self.state.set_draining(False)      # a drain that never clears is a stuck proxy
-                self._reply(409, {"status": "busy", "in_flight": still})
-                return True
-            if self.unload:
-                self.unload()
-            self.state.set_draining(False)          # what waited now goes through acquire()
-            self._reply(200, {"in_flight": 0, "drained": True})
+            with self.state.drain_lock:
+                self.state.set_draining(True)
+                try:
+                    deadline = time.monotonic() + wait
+                    while self.state.snapshot()[0] and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    still, _ = self.state.snapshot()
+                    if still:
+                        self._reply(409, {"status": "busy", "in_flight": still})
+                    elif path == "/unload":
+                        self.sent = False
+                        try:
+                            self._forward(method, self.path, body)
+                        except (OSError, http.client.HTTPException) as exc:
+                            if not self.sent:
+                                self._reply(502, {"error": f"{self.upstream} unreachable: {exc}"})
+                    else:
+                        if self.unload:
+                            self.unload()
+                        self._reply(200, {"in_flight": 0, "drained": True})
+                finally:
+                    self.state.set_draining(False)
             return True
         return False
 
