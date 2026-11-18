@@ -71,11 +71,46 @@ def _rules(rules, where: str):
                "a rule needs `status:` and/or `path:`")
 
 
+def _schedule(sc, workload_names: set) -> None:
+    """The `schedule:` block (see schedule.py): classes high to low, each with an optional
+    max_hold_s; default_class per workload; affinity_s."""
+    from . import schedule
+    _check(isinstance(sc, dict), "schedule", "expected a mapping (see the schedule: keys in the docs)")
+    unknown = set(sc) - set(schedule.KEYS)
+    _check(not unknown, "schedule", f"unknown key(s): {', '.join(sorted(unknown))}")
+    classes = sc.get("classes", schedule.DEFAULT_CLASSES)
+    _check(isinstance(classes, list) and classes, "schedule.classes", "expected a non-empty list of {name, max_hold_s}")
+    names = []
+    for i, c in enumerate(classes):
+        where = f"schedule.classes[{i}]"
+        _check(isinstance(c, dict) and isinstance(c.get("name"), str) and c["name"].strip(), where,
+               "expected {name: <class>, max_hold_s: <seconds>}")
+        _check(not (set(c) - {"name", "max_hold_s"}), where, "keys are name and max_hold_s")
+        if "max_hold_s" in c:
+            v = c["max_hold_s"]
+            _check(isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0, f"{where}.max_hold_s",
+                   f"expected a number of seconds > 0, got {v!r}")
+        _check(c["name"] not in names, where, f"class {c['name']!r} is listed twice")
+        names.append(c["name"])
+    for must in schedule.BOOKING_CLASSES:
+        _check(must in names, "schedule.classes", f"needs the class {must!r} (bookings are made for it)")
+    _check(names[0] == "peter", "schedule.classes", "'peter' is the highest class: the owner's own use always wins")
+    dc = sc.get("default_class") or {}
+    _check(isinstance(dc, dict), "schedule.default_class", "expected {workload: class}")
+    for w, c in dc.items():
+        _check(w in workload_names, f"schedule.default_class.{w}", "no such workload")
+        _check(c in names, f"schedule.default_class.{w}", f"no class {c!r} (classes: {', '.join(names)})")
+    if "affinity_s" in sc:
+        v = sc["affinity_s"]
+        _check(isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0, "schedule.affinity_s",
+               f"expected a number of seconds ≥ 0, got {v!r}")
+
+
 def validate(raw) -> dict:
     _check(isinstance(raw, dict), "config", "expected a mapping at the top level")
     unknown = set(raw) - {"gpu", "workloads", "events", "telemetry", "power", "claims",
                           "claims_builtin", "claims_ignore", "claims_poll_s", "pressure", "ask",
-                          "patches"}
+                          "patches", "schedule"}
     _check(not unknown, "config", f"unknown key(s): {', '.join(sorted(unknown))}")
     gpu = raw.get("gpu") or {}
     _check(isinstance(gpu, dict), "gpu", "expected a mapping")
@@ -150,6 +185,9 @@ def validate(raw) -> dict:
         _check(ask["fallback"] in policy.FALLBACKS, "ask.fallback",
                f"expected {' or '.join(policy.FALLBACKS)}: what happens when nobody answers "
                "(keep it loaded, or unload it anyway)")
+    if raw.get("schedule") is not None:
+        _schedule(raw["schedule"], set((raw.get("workloads") or {}).keys())
+                  if isinstance(raw.get("workloads"), dict) else set())
 
     cl = raw.get("claims") or []
     _check(isinstance(cl, list), "claims", "expected a list of {name, path, parent, note} rules")

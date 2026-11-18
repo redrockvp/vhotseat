@@ -228,3 +228,16 @@ power:
 # ask:
 #   timeout_s: 120                   # how long to wait for your answer
 #   fallback: keep                   # keep (leave it loaded) or release (unload it anyway)
+
+# Optional reservations for new loads. Without this block nothing is scheduled.
+# schedule:
+#   classes:                 # highest priority first
+#     - name: peter
+#     - name: booked
+#     - {name: agent, max_hold_s: 900}
+#     - {name: batch, max_hold_s: 1200}
+#     - {name: background, max_hold_s: 600}
+#   default_class:           # the class of a load nobody tagged (a gate's, a guard's); default agent
+#     strata: agent
+#     comfy: peter           # a ComfyUI job with no ticket is the owner's (the web page)
+#   affinity_s: 600

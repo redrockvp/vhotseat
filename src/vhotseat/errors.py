@@ -31,3 +31,11 @@ class PolicyRefused(SwitchError):
     def __init__(self, msg: str, *, workloads: list[str]):
         super().__init__(msg)
         self.workloads = workloads
+
+
+class ScheduleRefused(SwitchError):
+    """A booking excludes this new load until its window ends."""
+
+    def __init__(self, msg: str, *, until: float, booking: int):
+        super().__init__(msg)
+        self.until, self.booking = until, booking
