@@ -174,3 +174,55 @@ def test_a_round_that_ends_without_yielding_ends_the_loop(cr, tmp_path, monkeypa
     monkeypatch.setattr(cr.subprocess, "call", lambda argv, **kw: seen.append(argv) or 3)
     assert cr.main([write(tmp_path / "jobs.json", save()), "--hold"]) == 3   # a timeout, passed on
     assert len(seen) == 1
+
+
+def _yielding_rounds(cr, tmp_path, monkeypatch, rounds):
+    """Stub vhotseat: rounds 1..rounds-1 yield, each leaving one more job; the last ends."""
+    monkeypatch.setenv("VHOTSEAT_BIN", "vhotseat-test")
+    seen = []
+
+    def call(argv, env=None, **kw):
+        inner = argv[argv.index("--") + 1:]
+        jobs = next(a for a in inner[3:] if a.endswith(".json"))
+        seen.append(json.loads(open(jobs).read()))
+        if len(seen) < rounds:
+            rest = env["COMFY_RENDER_REST"]
+            open(rest, "w").write(json.dumps([save(100 + len(seen))]))
+            open(rest + ".code", "w").write("0")
+            return 5
+        return 0
+    monkeypatch.setattr(cr.subprocess, "call", call)
+    return seen
+
+
+def test_every_round_runs_the_previous_rounds_rest(cr, tmp_path, monkeypatch):
+    seen = _yielding_rounds(cr, tmp_path, monkeypatch, rounds=3)
+    assert cr.main([write(tmp_path / "jobs.json", [save(1), save(2)]), "--hold"]) == 0
+    assert seen == [[save(1), save(2)], [save(101)], [save(102)]]      # never a batch twice
+
+
+def test_the_skills_hold_before_the_file_form_requeues_too(cr, tmp_path, monkeypatch):
+    """`comfy-render --hold jobs/x.json`, as the comfyui-batching skill writes it."""
+    seen = _yielding_rounds(cr, tmp_path, monkeypatch, rounds=3)
+    assert cr.main(["--hold", write(tmp_path / "jobs.json", [save(1)])]) == 0
+    assert seen == [[save(1)], [save(101)], [save(102)]]
+
+
+def test_rest_files_are_cleaned_up(cr, tmp_path, monkeypatch):
+    made = []
+    real = cr.tempfile.mkdtemp
+    monkeypatch.setattr(cr.tempfile, "mkdtemp", lambda **kw: made.append(real(**kw)) or made[-1])
+    _yielding_rounds(cr, tmp_path, monkeypatch, rounds=3)
+    assert cr.main([write(tmp_path / "jobs.json", [save(1)]), "--hold"]) == 0
+    import os
+    assert made and not os.path.exists(made[0])
+
+
+def test_json_output_is_one_document_when_stepping(cr, tmp_path, monkeypatch, capsys):
+    inside_ticket(monkeypatch, cr, tmp_path)
+    monkeypatch.setattr(cr, "should_yield", lambda: False)
+    jobs = write(tmp_path / "jobs.json", [save(i) for i in range(5)])
+    assert cr.main([jobs, "--hold", "--yield-every", "2", "--json"]) == 0
+    out = capsys.readouterr().out
+    doc = json.loads(out[out.index("["):])                 # progress lines first, then one array
+    assert [r["job"] for r in doc] == [1, 2, 3, 4, 5]
