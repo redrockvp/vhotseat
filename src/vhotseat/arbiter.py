@@ -25,11 +25,11 @@ import time
 import uuid
 from pathlib import Path
 
-from . import claims, host, notify, policy, pressure, util
+from . import claims, host, notify, policy, pressure, schedule, util
 from . import config as cfgmod
 from .config_edit import version_of
 from .drivers.base import Workload
-from .errors import Busy, PolicyRefused, ReleaseFailed, SwitchError
+from .errors import Busy, PolicyRefused, ReleaseFailed, ScheduleRefused, SwitchError
 from .events import EventLog, row_time
 from .lock import GpuLock, Held, Locked, write_turn
 from .telemetry import READ_ERRORS
@@ -60,11 +60,16 @@ class Arbiter:
                  machine_ram=host.machine_ram, telemetry=None, power: dict | None = None,
                  claim_rules: list | None = None, claim_ignore=(), claim_poll_s: float = 2.0,
                  pressure_cfg: dict | None = None, ask_cfg: dict | None = None,
-                 config_path=None, notifier=None):
+                 config_path=None, notifier=None, schedule=None):
         self.workloads = {w.name: w for w in workloads}
         self.gpu = gpu
         self.lock = lock
         self.events = events
+        # The bookings (schedule.py): windows that keep new loads nobody typed off the card. None
+        # when the config has no `schedule:` block, and then every gate behaves as it always has. A
+        # schedule that can't be read is treated the same way (`_schedule_read`): it must never be
+        # the reason a load is refused, or a status report fails.
+        self.schedule = schedule
         # A gate runs inside the workload's own load, which has a time limit
         # (Strata's before_load_timeout_s), so its releases get less time.
         self.gate_release_timeout_s = gate_release_timeout_s
@@ -131,6 +136,25 @@ class Arbiter:
         # (see `arrival_scan`). Process memory on purpose: the watcher thread and the page's status
         # read share one arbiter, so they compare against the same "last time".
         self._was_active: set[str] | None = None
+
+    def _schedule_read(self, fn, default=None):
+        """A broken schedule must never prevent a load or a status report."""
+        if self.schedule is None:
+            return default
+        try:
+            return fn(self.schedule)
+        except Exception as e:
+            util.log(f"schedule unreadable: {e}")
+            return default
+
+    def _admit(self, name, cls=None, requester=None):
+        result = self._schedule_read(lambda sc: sc.admit(name, cls, requester))
+        return result if result and not result["ok"] else None
+
+    def _schedule_override(self, name):
+        if r := self._admit(name):
+            self.events.record("schedule-override", requested=name, booking=r["booking"]["id"], why=r["reason"])
+            util.log(f"schedule override for {name}: {r['reason']}")
 
     def snapshot(self) -> dict:
         return self.gpu.snapshot({n: w.vram_selector for n, w in self.workloads.items()})
@@ -1439,10 +1463,34 @@ class Arbiter:
                 if card and sized["bytes"] // 2**20 > card:
                     note += f", more than the card's {card} MiB: only part of it can be resident"
                 notes.append(note)
+            if self.schedule is not None:
+                def schedule_notes(sc, name=name):
+                    cls = sc.class_of(name)
+                    refusal = sc.admit(name, cls)
+                    upcoming = [(b, start) for b, start, _end in sc.upcoming(7200)
+                                if sc.excludes(b, cls, name)]
+                    count = sum(t["workload"] == name for t in sc.queue_view())
+                    return cls, refusal, upcoming, count
+
+                details = self._schedule_read(schedule_notes)
+                if details:
+                    cls, refusal, upcoming, count = details
+                    if not refusal["ok"]:
+                        if resident:
+                            notes.insert(0, f"it keeps what it has, but a new load would wait until "
+                                         f"{schedule.clock(refusal['until'])}")
+                        else:
+                            would = "blocked"
+                            notes.insert(0, refusal["reason"])
+                    for b, start in upcoming:
+                        notes.append(f"booking {b['id']} ({b['owner']}) starts at {schedule.clock(start)}: "
+                                     f"new loads of class {cls} stop then")
+                    if count:
+                        notes.append(f"{count} waiting or running ticket(s) for this workload")
             out[name] = {"target": name, "label": x.label, "would": would, "holder": s["mode"],
                          "free_mib": gpu.get("free_mib"), "resident": resident,
                          "priority": x.priority, "yields_to": list(x.yields_to),
-                         "asks_for": list(x.asks_for), "notes": notes}
+                         "asks_for": list(x.asks_for), "notes": notes, "schedule": self.schedule is not None}
         return out
 
     def gate(self, name: str) -> bool:
@@ -1469,6 +1517,17 @@ class Arbiter:
         # next Ask me will be asked with. Whether the load is allowed or refused is a separate
         # question: an agent turned away is still an agent that will ask again in a moment.
         self.note_used(name)
+        # A booking that excludes this load refuses it before anything else is asked: the owner
+        # isn't put a question the booking would refuse anyway. Not while a switch or hold holds the
+        # lock (that path below answers from the note, and a typed one is an order), and not for a
+        # workload already on the card: a booking is about new loads only.
+        if self.schedule is not None and not self.lock.holder() and (r := self._admit(name)):
+            gpu = self.snapshot()
+            if not x.active(x.probe(gpu), gpu):
+                self.events.record(kind, source="request", allowed=False, reason=r["reason"],
+                                   booking=r["booking"]["id"])
+                util.log(f"refusing {x.label} load: {r['reason']}")
+                return False
         # The asking first, and before the lock: while the owner decides, the card has to stay
         # free for whatever else is running, and a hook that held the GPU lock for two minutes
         # waiting for a person would stop every other handover on the box with it. Nothing is
@@ -2130,6 +2189,20 @@ class Arbiter:
                 self.events.record("switch", to=name, ok=False, error=claim)
                 util.log(f"switch to {name} refused: {claim}")
                 return {"ok": False, "error": claim}
+        # A booking keeps a new load nobody typed off the card (see schedule.py). Asked before the
+        # owner is: there is no point putting a question to them that the booking refuses anyway. A
+        # request that changes nothing (the workload already holds the card) carries on, as above,
+        # and so does one made while a `hold name` or `switch name` holds the lock: a person ordered
+        # the card given to this workload, and a held script's jobs get past their guard (a lazy
+        # workload still reads "none" under its hold, so the mode alone doesn't show it).
+        if request and name != NONE and self.schedule is not None \
+                and self.lock.holder() not in (f"hold {name}", f"switch {name}"):
+            if (r := self._admit(name)) and self.probe()["mode"] != name:
+                why, bid, until = r["reason"], r["booking"]["id"], r["until"]
+                self.events.record("switch", to=name, ok=False, error=why, booking=bid)
+                util.log(f"switch to {name} refused: {why}")
+                return {"ok": False, "error": why, "until": until,
+                        "exception": ScheduleRefused(why, until=until, booking=bid)}
         consent: set[str] = set()
         if request:
             claim = self.claim_refusal()
@@ -2181,6 +2254,8 @@ class Arbiter:
                     continue
                 left = max(0.0, (deadline - time.monotonic()) / util.SCALE)
                 before = self.probe()["mode"]
+                if not request and name != NONE and before != name:
+                    self._schedule_override(name)
                 try:
                     done = self.acquire(name, left, load=load, requested=request,
                                         consent=consent)
@@ -2212,6 +2287,8 @@ class Arbiter:
             return subprocess.call(command)
         with self._take(name, skip_if_held=False) as lock:
             before = self.probe()["mode"]
+            if before != name:
+                self._schedule_override(name)
             try:
                 self.acquire(name, wait, load=False)
             except SwitchError as e:
