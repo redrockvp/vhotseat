@@ -492,6 +492,8 @@ vhotseat autostart status           # registered? running? (exit 1 when nothing 
 vhotseat autostart remove
 ```
 
+`vhotseat proxy strata --upstream http://127.0.0.1:8081 --port 8080` runs the packaged gate in front of a configured workload; `--host` and `--hold` adjust its listen address and wait time. To start it at logon alongside the dashboard, use `vhotseat autostart install --name strata-gate proxy strata --upstream http://127.0.0.1:8081 --port 8080`; use the same `--name` with `status` or `remove` to manage that entry independently.
+
 `--command record` installs the sampler without the page. It registers one thing
 only, named `vhotseat`; everything else in vhotseat stays per-command on purpose.
 The unit it writes elsewhere, if you'd rather keep it by hand:

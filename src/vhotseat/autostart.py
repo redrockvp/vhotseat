@@ -55,8 +55,12 @@ def _run(run, argv: list[str]) -> tuple[int, str]:
     return p.returncode, out
 
 
-def launcher_path() -> Path:
-    return state_dir() / f"{NAME}-autostart.vbs"
+def entry_name(name: str) -> str:
+    return NAME if name == NAME else f"{NAME}-{name}"
+
+
+def launcher_path(name: str = NAME) -> Path:
+    return state_dir() / f"{entry_name(name)}-autostart.vbs"
 
 
 def _exec_path(path: str) -> str:
@@ -72,11 +76,12 @@ def _exec_path(path: str) -> str:
 
 
 def install(command: str = "web", exe: str | None = None, at: str | None = None,
-            run=subprocess.run, units: Path | None = None, vbs: Path | None = None) -> int:
+            run=subprocess.run, units: Path | None = None, vbs: Path | None = None,
+            name: str = NAME) -> int:
     """Register `vhotseat <command>` to run at logon, replacing any earlier one."""
     exe, at = exe or executable(), at or kind()
     if at == "schtasks":
-        rc, out = _run(run, ["schtasks", "/Create", "/F", "/SC", "ONLOGON", "/TN", NAME,
+        rc, out = _run(run, ["schtasks", "/Create", "/F", "/SC", "ONLOGON", "/TN", entry_name(name),
                              "/TR", f'"{exe}" {command}'])
         where = "Task Scheduler (at logon)"
         if rc:
@@ -84,68 +89,69 @@ def install(command: str = "web", exe: str | None = None, at: str | None = None,
             # per-user Run key needs none and does the same thing for one user - through a
             # one-line script host launcher, because a console app started from the Run key
             # would keep a terminal window on the desktop all session.
-            path = vbs or launcher_path()
+            path = vbs or launcher_path(name)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(VBS.format(exe=exe, command=command), encoding="utf-8")
-            rc, out = _run(run, ["reg", "add", RUN_KEY, "/v", NAME, "/t", "REG_SZ",
+            path.write_text(VBS.format(exe=exe.replace('"', '""'),
+                                       command=command.replace('"', '""')), encoding="utf-8")
+            rc, out = _run(run, ["reg", "add", RUN_KEY, "/v", entry_name(name), "/t", "REG_SZ",
                                  "/d", f'wscript.exe //B "{path}"', "/f"])
-            where = (f"{RUN_KEY}\\{NAME} -> {path} (Task Scheduler refused a logon trigger "
+            where = (f"{RUN_KEY}\\{entry_name(name)} -> {path} (Task Scheduler refused a logon trigger "
                      "without elevation)")
     else:
-        path = (units or unit_dir()) / f"{NAME}.service"
+        path = (units or unit_dir()) / f"{entry_name(name)}.service"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(UNIT.format(exe=_exec_path(exe), command=command), encoding="utf-8")
         rc, out = _run(run, ["systemctl", "--user", "daemon-reload"])
         if rc == 0:
-            rc, out = _run(run, ["systemctl", "--user", "enable", "--now", f"{NAME}.service"])
+            rc, out = _run(run, ["systemctl", "--user", "enable", "--now", f"{entry_name(name)}.service"])
         where = str(path)
     if rc:
         util.log(f"couldn't install it: {out or 'command failed'}")
         return 1
-    print(f"vhotseat {command} now starts at logon: {NAME} in {where}")
+    print(f"vhotseat {command} now starts at logon: {entry_name(name)} in {where}")
     print("undo with: vhotseat autostart remove")
     return 0
 
 
 def status(exe: str | None = None, at: str | None = None, run=subprocess.run,
-           units: Path | None = None) -> int:
+           units: Path | None = None, name: str = NAME) -> int:
     """Is it registered, and is it running? Exit 0 when it is, 1 when it isn't."""
     at = at or kind()
     if at == "schtasks":
-        rc, out = _run(run, ["schtasks", "/Query", "/TN", NAME, "/FO", "LIST"])
-        reg, body = _run(run, ["reg", "query", RUN_KEY, "/v", NAME])
+        rc, out = _run(run, ["schtasks", "/Query", "/TN", entry_name(name), "/FO", "LIST"])
+        reg, body = _run(run, ["reg", "query", RUN_KEY, "/v", entry_name(name)])
         if rc == 0:
-            print(f"registered: {NAME} in Task Scheduler")
+            print(f"registered: {entry_name(name)} in Task Scheduler")
             for line in out.splitlines():
                 if line.lower().startswith(("status", "next run time", "task to run")):
                     print(f"  {line.strip()}")
         elif reg == 0:
-            print(f"registered: {NAME} in {RUN_KEY}")
+            print(f"registered: {entry_name(name)} in {RUN_KEY}")
             print("  " + " ".join(body.split()[-2:]))
         else:
-            print(f"not registered: {NAME} in Task Scheduler or {RUN_KEY}")
+            print(f"not registered: {entry_name(name)} in Task Scheduler or {RUN_KEY}")
             return 1
         return 0
-    path = (units or unit_dir()) / f"{NAME}.service"
+    path = (units or unit_dir()) / f"{entry_name(name)}.service"
     if not path.exists():
         print(f"not registered: no {path}")
         return 1
-    rc, out = _run(run, ["systemctl", "--user", "is-active", f"{NAME}.service"])
+    rc, out = _run(run, ["systemctl", "--user", "is-active", f"{entry_name(name)}.service"])
     print(f"registered: {path}\n  {out or 'installed, not running'}")
     return 0 if rc == 0 else 1
 
 
 def remove(at: str | None = None, run=subprocess.run, units: Path | None = None,
-           vbs: Path | None = None) -> int:
+           vbs: Path | None = None, name: str = NAME) -> int:
     at = at or kind()
     if at == "schtasks":
-        _run(run, ["schtasks", "/Delete", "/F", "/TN", NAME])
-        _run(run, ["reg", "delete", RUN_KEY, "/v", NAME, "/f"])
-        (vbs or launcher_path()).unlink(missing_ok=True)
+        _run(run, ["schtasks", "/Delete", "/F", "/TN", entry_name(name)])
+        _run(run, ["reg", "delete", RUN_KEY, "/v", entry_name(name), "/f"])
+        (vbs or launcher_path(name)).unlink(missing_ok=True)
     else:
-        path = (units or unit_dir()) / f"{NAME}.service"
-        _run(run, ["systemctl", "--user", "disable", "--now", f"{NAME}.service"])
+        path = (units or unit_dir()) / f"{entry_name(name)}.service"
+        _run(run, ["systemctl", "--user", "disable", "--now", f"{entry_name(name)}.service"])
         path.unlink(missing_ok=True)
         _run(run, ["systemctl", "--user", "daemon-reload"])
-    print(f"removed: {NAME} no longer starts at logon")
+    print(f"removed: {entry_name(name)} no longer starts at logon")
     return 0

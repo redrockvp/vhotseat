@@ -1,9 +1,9 @@
 import inspect
 
 import pytest
-
-from vhotseat import autostart, cli
 from test_platform import _spy
+
+from vhotseat import autostart
 
 
 def supports_names():
@@ -74,7 +74,8 @@ def test_named_systemd_entries_are_independent(tmp_path):
 
 
 @pytest.mark.parametrize('name', ['', '../evil', 'Upper', 'a' * 33])
-def test_invalid_name_is_refused_by_cli(rig, name, capsys):
+def test_invalid_name_is_refused_by_cli(rig, name, capsys, monkeypatch):
+    monkeypatch.setattr(autostart, 'install', lambda *a, **kw: 1)
     try:
         rc = rig.cli('autostart', 'install', '--name', name)
     except SystemExit as exc:

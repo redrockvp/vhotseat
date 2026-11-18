@@ -32,7 +32,10 @@ import argparse
 import contextlib
 import json
 import os
+import re
+import shlex
 import sqlite3
+import subprocess
 import sys
 import time
 
@@ -43,6 +46,12 @@ from .setup import build
 from .telemetry import Sampler
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE = 0, 1, 2
+
+
+def _autostart_name(value: str) -> str:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", value):
+        raise argparse.ArgumentTypeError("name must be 1-32 lowercase letters, digits or hyphens, starting with a letter or digit")
+    return value
 
 
 def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dict | None = None) -> int:
@@ -86,6 +95,12 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp = sub.add_parser("web", help="serve the dashboard: RAM and VRAM over time, handovers, events, logs")
     sp.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
     sp.add_argument("--port", type=int, default=8765, help="port (default 8765)")
+    sp = sub.add_parser("proxy", help="gate a workload's HTTP server")
+    sp.add_argument("name")
+    sp.add_argument("--upstream", required=True)
+    sp.add_argument("--port", type=int, required=True)
+    sp.add_argument("--host", default="127.0.0.1")
+    sp.add_argument("--hold", type=float, default=120.0)
     sub.add_parser("record", help="sample RAM and VRAM into the telemetry until stopped (for a service)")
     sub.add_parser("watch", help="free the card for a claim (a game) or a load that skipped its gate, "
                                  "record it, and sample, until stopped")
@@ -93,6 +108,7 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp.add_argument("--json", action="store_true")
     sp = sub.add_parser("autostart", help="keep the dashboard and sampling up from logon")
     sp.add_argument("action", choices=("install", "status", "remove"))
+    sp.add_argument("--name", dest="autostart_name", type=_autostart_name, default="vhotseat")
     sp.add_argument("--command", choices=("web", "record", "watch"), default="web",
                     help="what starts at logon: web (the dashboard, which also samples), "
                          "record (sampling only) or watch (sampling plus claim events)")
@@ -146,10 +162,23 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
                     help="the ticket to ask about (default: $VHOTSEAT_TICKET, set by `run`)")
     sp.add_argument("--json", action="store_true")
     argv = sys.argv[1:] if argv is None else list(argv)
+    startup_command = []
+    if len(argv) >= 2 and argv[0] == "autostart":
+        i = 2
+        while i < len(argv):
+            if argv[i] in ("--name", "--command"):
+                i += 2
+            elif argv[i].startswith("--name=") or argv[i].startswith("--command="):
+                i += 1
+            else:
+                startup_command, argv = argv[i:], argv[:i]
+                break
     # hold's COMMAND is everything after the first `--`, split off here: a REMAINDER
     # argument would also swallow options before it (`hold comfy --wait 600 -- CMD`).
     command = argv[argv.index("--") + 1:] if "--" in argv else None
     args = p.parse_args(argv[:argv.index("--")] if command is not None else argv)
+    if args.cmd == "autostart":
+        args.startup_command = startup_command
     if command is not None:
         args.command = command
 
@@ -341,10 +370,15 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
     if args.cmd == "autostart":
         from . import autostart
         if args.action == "install":
-            return autostart.install(args.command)
+            command = (subprocess.list2cmdline(args.startup_command) if os.name == "nt"
+                       else shlex.join(args.startup_command)) if args.startup_command else args.command
+            return autostart.install(command, name=args.autostart_name)
         if args.action == "remove":
-            return autostart.remove()
-        return autostart.status()
+            return autostart.remove(name=args.autostart_name)
+        return autostart.status(name=args.autostart_name)
+    if args.cmd == "proxy":
+        from . import proxy
+        return proxy.serve(arbiter, name, args.upstream, args.port, args.hold, args.host)
     if args.cmd == "claims":
         hits = arbiter.claim_hits()
         if json_out:
