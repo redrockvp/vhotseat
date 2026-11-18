@@ -192,6 +192,8 @@ class FakeComfy(_Server):
         self.vram = COMFY_CONTEXT_VRAM
         self.running: list[str] = []
         self.pending: list[str] = []
+        self.queue_posts: list[dict] = []
+        self.queue_posted = threading.Event()
         self.history: dict[str, dict] = {}
         self.workflows: dict[str, dict] = {}
         self.clients: dict[str, dict] = {}       # prompt_id -> client_id
@@ -305,6 +307,12 @@ class FakeComfy(_Server):
         if path == "/queue":
             if self.down:
                 return h.send_json(500, {"error": "down"})
+            if method == "POST":
+                self.queue_posts.append(body)
+                self.pending[:] = [pid for pid in self.pending
+                                   if not body.get("clear") and pid not in body.get("delete", [])]
+                self.queue_posted.set()
+                return h.send_json(200, {})
             return h.send_json(200, {"queue_running": [[0, p] for p in self.running],
                                      "queue_pending": [[1, p] for p in self.pending]})
         if path == "/free" and method == "POST":
