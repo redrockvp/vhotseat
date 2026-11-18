@@ -80,12 +80,12 @@ def cost(samples: list[dict], price_per_kwh: float, step_s: float | None = None)
     the number - so treat it as a floor, not the line on your bill."""
     out: dict[str, dict] = {}
     total = 0.0
-    gaps = sorted(g for g in (b["t"] - a["t"] for a, b in zip(samples, samples[1:])) if g > 0)
+    gaps = sorted(g for g in (b["t"] - a["t"] for a, b in zip(samples, samples[1:], strict=False)) if g > 0)
     # Six steps of the cadence the history is kept at, whoever read it last saying what that is:
     # the median spacing is the fallback, and on a window with three samples in it the fallback is
     # the outage itself.
     limit = 6 * max(step_s or (gaps[len(gaps) // 2] if gaps else 1.0), 1.0)
-    for a, b in zip(samples, samples[1:]):
+    for a, b in zip(samples, samples[1:], strict=False):
         w1, w2, dt = a.get("gpu_power_w"), b.get("gpu_power_w"), b["t"] - a["t"]
         if w1 is None or w2 is None or dt <= 0 or dt > limit:
             continue

@@ -163,7 +163,7 @@ def test_switch_no_service_and_dead_api_fails_fast(rig, capsys):
 
 def test_doctor_treats_a_switched_off_workload_as_stopped(rig):
     """doctor: off the card and not answering is a warn with the reason, not a fail."""
-    from vhotseat import doctor, host
+    from vhotseat import doctor
     rig.strata.close()
     found = [c for c in doctor.checks(rig.arb, rig.cfg) if c[1] == "strata: api"]
     assert found and found[0][0] == "warn" and "treated as stopped" in found[0][2]

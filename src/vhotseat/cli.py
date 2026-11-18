@@ -25,10 +25,8 @@ import json
 import sys
 import time
 
-from . import claims
+from . import claims, policy, util
 from . import config as cfgmod
-from . import policy
-from . import util
 from .arbiter import NONE, Arbiter
 from .setup import build
 from .telemetry import Sampler
@@ -207,7 +205,7 @@ def _run(p, args, arbiter: Arbiter, cfg: dict | None, name: str | None) -> int:
         else:
             word = {"ready": "could take the card now", "waiting": "would have to wait",
                     "blocked": "is blocked"}
-            for name, w in why.items():
+            for w in why.values():
                 print(f"{w['label'] + ':':<12}{word[w['would']]} - priority {w['priority']}, "
                       f"gives way for {policy.describe(w['yields_to'], w.get('asks_for', ()))}")
                 for note in w["notes"]:
