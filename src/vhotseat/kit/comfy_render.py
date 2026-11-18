@@ -40,7 +40,8 @@ paths relative to ComfyUI's folder (output/...).
 Exit codes: 0 every job produced output · 1 at least one job was rejected or
 failed · 2 bad input file or ComfyUI unreachable · 3 timed out · 4 the user
 cancelled at least one job (it outranks 1 and 3: ask them why before re-running).
-On a timeout the unfinished jobs are left in ComfyUI; with --hold's steps, the jobs of steps not
+On exit, pending jobs from this run are removed and a running job gets a short grace period.
+With --hold's steps, the jobs of steps not
 yet submitted are reported as "not submitted" (they never reached ComfyUI). 5 only comes from --hold, and only between
 its two comfy-render processes: the run inside handed the rest of the batch back, and the outer
 one re-queued it before answering.
@@ -53,6 +54,7 @@ import copy
 import json
 import os
 import shutil
+import signal
 import socket
 import stat
 import struct
@@ -70,6 +72,7 @@ from pathlib import Path
 COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188")
 COMFY_DIR: Path | None = Path(os.environ["COMFY_DIR"]) if os.environ.get("COMFY_DIR") else None
 POLL_S = 2.0
+CLEANUP_GRACE_S = 5.0
 # Live progress: at most one line per job this often, unless the running node changes.
 PROGRESS_EVERY_S = 10.0
 # Give up after this long with no progress at all. Not a limit on the whole batch: a
@@ -101,8 +104,6 @@ FIRST_ENV, TOTAL_ENV = "COMFY_RENDER_FIRST", "COMFY_RENDER_TOTAL"
 # document for the whole batch, printed by the outer half at the end.
 RESULTS_ENV = "COMFY_RENDER_RESULTS"
 
-# Nothing interrupts or dequeues a job except a person: ComfyUI's own page, a
-# dashboard, `comfy jobs cancel`. The vhotseat guard fails a job with an error instead.
 CANCELLED_BY = "cancelled by the user (ComfyUI or another client)"
 
 
@@ -316,18 +317,34 @@ def _interrupted_at(status: dict) -> str | None:
     return None
 
 
-def _queued_ids() -> set[str] | None:
-    """Prompt ids ComfyUI still has running or pending, or None if it didn't answer."""
+def _queue_ids(timeout: float = 30) -> tuple[set[str], set[str]] | None:
+    """Running and pending IDs from the same queue snapshot."""
     try:
-        code, body = _request("GET", "/queue")
-    except (urllib.error.URLError, OSError):
+        code, body = _request("GET", "/queue", timeout=timeout)
+    except (OSError, ValueError):
         return None
     if code != 200 or not isinstance(body, dict):
         return None
-    return {
-        item[1] for key in ("queue_running", "queue_pending")
-        for item in body.get(key) or [] if isinstance(item, list) and len(item) > 1
-    }
+    def ids(key):
+        return {item[1] for item in body.get(key) or [] if isinstance(item, list) and len(item) > 1}
+
+    return ids("queue_running"), ids("queue_pending")
+
+
+def _cleanup_queue(owned: set[str]) -> None:
+    deadline = time.monotonic() + CLEANUP_GRACE_S
+    while (remaining := deadline - time.monotonic()) > 0:
+        queue = _queue_ids(remaining)
+        if queue is not None:
+            running, pending = queue
+            delete = owned & pending
+            if not delete and owned.isdisjoint(running):
+                return
+            if delete and (remaining := deadline - time.monotonic()) > 0:
+                with contextlib.suppress(OSError, ValueError):
+                    _request("POST", "/queue", {"delete": sorted(delete)}, timeout=remaining)
+        time.sleep(max(0, min(0.2, deadline - time.monotonic())))
+    print("comfy-render: cleanup grace expired while waiting for owned prompts", file=sys.stderr)
 
 
 # --- live progress -------------------------------------------------------------
@@ -495,25 +512,29 @@ def run(jobs: list[dict], timeout: float, verbose: bool, first: int = 1,
     if watcher.connect():
         watcher.start()
     results = []
-    for i, wf in enumerate(jobs, 1):
-        job = first + i - 1
-        try:
-            code, body = _request("POST", "/prompt", {"prompt": wf, "client_id": client_id})
-        except (urllib.error.URLError, OSError) as e:
-            raise UsageError(f"ComfyUI not reachable at {COMFY_URL}: {getattr(e, 'reason', e)}") from None
-        if code == 200 and isinstance(body, dict) and body.get("prompt_id"):
-            results.append({"job": job, "prompt_id": body["prompt_id"], "status": "queued"})
-            watcher.class_types[body["prompt_id"]] = {
-                nid: node.get("class_type", "") for nid, node in wf.items()
-            }
-        else:
-            results.append({"job": job, "status": "rejected", "errors": _validation_errors(body)})
-    queued = sum(r["status"] == "queued" for r in results)
-    print(f"queued {queued}/{total} job(s)", flush=True)
     try:
+        for i, wf in enumerate(jobs, 1):
+            _check_stop()
+            job = first + i - 1
+            try:
+                code, body = _request("POST", "/prompt", {"prompt": wf, "client_id": client_id})
+            except (urllib.error.URLError, OSError) as e:
+                raise UsageError(f"ComfyUI not reachable at {COMFY_URL}: {getattr(e, 'reason', e)}") from None
+            if code == 200 and isinstance(body, dict) and body.get("prompt_id"):
+                results.append({"job": job, "prompt_id": body["prompt_id"], "status": "queued"})
+                watcher.class_types[body["prompt_id"]] = {
+                    nid: node.get("class_type", "") for nid, node in wf.items()
+                }
+            else:
+                results.append({"job": job, "status": "rejected", "errors": _validation_errors(body)})
+        queued = sum(r["status"] == "queued" for r in results)
+        print(f"queued {queued}/{total} job(s)", flush=True)
         return _wait(results, queued, total, watcher, timeout, verbose)
     finally:
         watcher.close()
+        owned = {r["prompt_id"] for r in results if r["status"] in ("queued", "timeout")}
+        if owned:
+            _cleanup_queue(owned)
 
 
 def _outcome(entry: dict, status: dict, verbose: bool) -> dict:
@@ -542,15 +563,17 @@ def _wait(results, queued, total, watcher, timeout, verbose) -> tuple[list[dict]
         if time.monotonic() - max(last_progress, watcher.last_activity) > timeout:
             for r in pending.values():
                 r.update(status="timeout", errors=[
-                    f"no progress for {timeout:g}s; still queued or running in ComfyUI"])
+                    f"no progress for {timeout:g}s; unfinished at timeout"])
             return results, True
         # A job leaves the queue and enters /history in one step, so reading
         # /queue before /history means a job in neither was deleted while queued.
-        in_queue = _queued_ids()
+        queue = _queue_ids()
+        in_queue = None if queue is None else queue[0] | queue[1]
         if in_queue is not None and in_queue != last_queue:
             last_queue = in_queue
             last_progress = time.monotonic()
         for pid, r in list(pending.items()):
+            _check_stop()
             try:
                 _, hist = _request("GET", f"/history/{pid}")
             except (urllib.error.URLError, OSError):
@@ -682,7 +705,7 @@ def run_in_steps(args, jobs: list[dict]) -> int:
     """Inside a ticket, in steps of --yield-every: after every step but the last ask vhotseat
     whether this run has held the card too long, and on a yes leave the rest for the outer
     comfy-render (exit 5) instead of running on behind the next workload. A step that timed
-    out stops the stepping: ComfyUI still holds those jobs, and yielding would drop them.
+    out stops the batch before more jobs are submitted.
     """
     rest = Path(os.environ[REST_ENV])
     first = _env_int(FIRST_ENV, 1)
@@ -758,11 +781,40 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+# Defer signals until the current submission's prompt_id is recorded. Raising in the
+# handler could lose the acknowledgement or interrupt cleanup on a second signal.
+_stop_signal = 0
+
+
+def _check_stop() -> None:
+    if _stop_signal:
+        raise SystemExit(128 + _stop_signal)
+
+
+@contextlib.contextmanager
+def _render_signals():
+    global _stop_signal
+
+    def stop(signum, _frame):
+        global _stop_signal
+        _stop_signal = signum
+
+    with contextlib.ExitStack() as restore:
+        if threading.current_thread() is threading.main_thread():
+            for sig in (signal.SIGINT, signal.SIGTERM, *([signal.SIGBREAK] if os.name == "nt" else [])):
+                restore.callback(signal.signal, sig, signal.signal(sig, stop))
+        try:
+            yield
+            _check_stop()
+        finally:
+            _stop_signal = 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    # Never crash on printing a node's message: a Windows pipe is cp1252.
+    # Preserve paths and node messages even on a Windows pipe with a legacy code page.
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
-            stream.reconfigure(errors="replace")
+            stream.reconfigure(encoding="utf-8", errors="replace")
     p = _parser()
     args = p.parse_args(argv)
     if args.jobs is None:
@@ -785,6 +837,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.comfy_dir:
         COMFY_DIR = args.comfy_dir.expanduser()
 
+    with _render_signals():
+        return _render(args)
+
+
+def _render(args) -> int:
     try:
         stepping = bool(os.environ.get(TICKET_ENV) and os.environ.get(REST_ENV))
         jobs = load_jobs((stepping and os.environ.get(JOBS_ENV)) or args.jobs)

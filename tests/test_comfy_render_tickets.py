@@ -7,10 +7,10 @@ vhotseat's side is stubbed at the subprocess boundary."""
 import importlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import threading
+from pathlib import Path
 
 import pytest
 from fakes import FakeComfy
