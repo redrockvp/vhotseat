@@ -20,6 +20,7 @@ Code, Codex, pi and others.
 
 | Skill | For | What it does |
 | --- | --- | --- |
+| [vhotseat-gpu](skills/vhotseat-gpu/SKILL.md) | any agent using the GPU | Safely run GPU work, renders, holds, and bookings |
 | [comfyui-batching](skills/comfyui-batching/SKILL.md) | the agent running on the local LLM | Run ComfyUI work through `comfy-render`, in as few batches as possible |
 | [vhotseat-setup](skills/vhotseat-setup/SKILL.md) | your coding agent | Install vhotseat, find the GPU workloads, write the config, install the gates, check |
 | [vhotseat-add-workload](skills/vhotseat-add-workload/SKILL.md) | your coding agent | Add a server vhotseat doesn't know yet: driver, gate, admission, checks |

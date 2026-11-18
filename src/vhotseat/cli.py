@@ -54,9 +54,7 @@ def _autostart_name(value: str) -> str:
     return value
 
 
-def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dict | None = None) -> int:
-    util.LOG_PREFIX = "vhotseat"
-    util.safe_output()
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="vhotseat", description="Take turns on one GPU.",
                                 epilog=f"config: {cfgmod.default_path()} (or $VHOTSEAT_CONFIG)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -161,6 +159,13 @@ def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dic
     sp.add_argument("--ticket", type=int, metavar="ID",
                     help="the ticket to ask about (default: $VHOTSEAT_TICKET, set by `run`)")
     sp.add_argument("--json", action="store_true")
+    return p
+
+
+def main(argv: list[str] | None = None, arbiter: Arbiter | None = None, cfg: dict | None = None) -> int:
+    util.LOG_PREFIX = "vhotseat"
+    util.safe_output()
+    p = build_parser()
     argv = sys.argv[1:] if argv is None else list(argv)
     startup_command = []
     if len(argv) >= 2 and argv[0] == "autostart":
