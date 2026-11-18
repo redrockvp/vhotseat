@@ -5,7 +5,8 @@ one line per job: the files it produced, or ComfyUI's own error. It never
 crashes on a bad workflow; a job that fails is reported and the rest still run.
 
     comfy-render JOBS.json [--url URL] [--comfy-dir DIR] [--timeout SECONDS] [--json] [--verbose]
-                           [--hold [NAME]] [--hold-wait SECONDS]
+                           [--hold [NAME]] [--hold-wait SECONDS] [--class C] [--as REQUESTER]
+                           [--yield-every N]
 
 There is no limit on how long a batch may take: --timeout (default 1800) is how
 long it may go with no sign of progress (no job finishing, no node or sampler
@@ -21,10 +22,15 @@ JOBS.json is either
 Workflows are ComfyUI's API format (what "Export (API)" saves, and what
 POST /prompt takes). If the GPU is shared with an LLM through vhotseat, its
 guard node hands the GPU over before each job; nothing here needs to know.
-With --hold, the whole batch runs under `vhotseat hold NAME` (NAME defaults to
-comfy), so a request to the LLM between two jobs is refused instead of costing
-two handovers. That needs the `vhotseat` command (else $VHOTSEAT_BIN); without
---hold, comfy-render works with ComfyUI alone.
+With --hold, the whole batch runs under `vhotseat hold NAME --class C` (NAME defaults to
+comfy, C to batch): a ticket, so the queue's serving order decides when the batch gets the
+card, and --as records who is asking. Inside that ticket the batch runs in steps of --yield-every
+jobs (default 4) and asks `vhotseat should-yield` between them: once a run has held the card
+past its class's max hold, the rest of the batch is written back to the outer comfy-render, which
+queues a fresh ticket for it (behind whoever was waiting) and carries on. Exit code 5 is only
+that hand-back, lived between the two comfy-render processes; the caller never sees it. That
+needs the `vhotseat` command (else $VHOTSEAT_BIN); without --hold, comfy-render works with
+ComfyUI alone.
 
 ComfyUI is at --url, else $COMFY_URL, else http://127.0.0.1:8188. Saved files
 are printed as absolute paths under --comfy-dir (else $COMFY_DIR, else ComfyUI's
@@ -34,7 +40,9 @@ paths relative to ComfyUI's folder (output/...).
 Exit codes: 0 every job produced output · 1 at least one job was rejected or
 failed · 2 bad input file or ComfyUI unreachable · 3 timed out · 4 the user
 cancelled at least one job (it outranks 1 and 3: ask them why before re-running).
-On a timeout the unfinished jobs are left in ComfyUI.
+On a timeout the unfinished jobs are left in ComfyUI. 5 only comes from --hold, and only between
+its two comfy-render processes: the run inside handed the rest of the batch back, and the outer
+one re-queued it before answering.
 """
 
 import argparse
@@ -48,6 +56,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -71,6 +80,15 @@ EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_TIMEOUT, EXIT_CANCELLED = 0, 1, 2, 3, 4
 
 # Set by `vhotseat hold` in its command's environment.
 HOLD_ENV = "VHOTSEAT_HOLD"
+# Set by `vhotseat hold NAME --class C` (Arbiter.run) once its ticket has started: this run is
+# inside a ticket, so it may hand the rest of its batch back.
+TICKET_ENV = "VHOTSEAT_TICKET"
+# Set by comfy-render's outer half on the inner one: where to leave the jobs not done yet, and
+# how the part that ran went in the same path plus `.code`. The outer half re-queues that file.
+REST_ENV = "COMFY_RENDER_REST"
+# The inner half's code for "here is the rest, queue a ticket for it". Only comfy-render's outer
+# half reads it; it never reaches a caller.
+EXIT_YIELDED = 5
 
 # Nothing interrupts or dequeues a job except a person: ComfyUI's own page, a
 # dashboard, `comfy jobs cancel`. The vhotseat guard fails a job with an error instead.
@@ -452,30 +470,37 @@ class ProgressWatcher(threading.Thread):
 # --- run ----------------------------------------------------------------------
 
 
-def run(jobs: list[dict], timeout: float, verbose: bool) -> tuple[list[dict], bool]:
+def run(jobs: list[dict], timeout: float, verbose: bool, first: int = 1,
+        total: int | None = None) -> tuple[list[dict], bool]:
     """Submit every job, then wait until all of them finish or nothing has progressed
-    for `timeout` seconds. Returns (results, timed_out)."""
+    for `timeout` seconds. Returns (results, timed_out).
+
+    `first` and `total` number these jobs inside a bigger batch: a stepped batch still says
+    `job 3/7` for the seventh job of the whole batch, not for its third in this step.
+    """
+    total = len(jobs) if total is None else total
     client_id = f"comfy-render-{uuid.uuid4().hex[:8]}"
     watcher = ProgressWatcher(client_id, {})
     if watcher.connect():
         watcher.start()
     results = []
     for i, wf in enumerate(jobs, 1):
+        job = first + i - 1
         try:
             code, body = _request("POST", "/prompt", {"prompt": wf, "client_id": client_id})
         except (urllib.error.URLError, OSError) as e:
             raise UsageError(f"ComfyUI not reachable at {COMFY_URL}: {getattr(e, 'reason', e)}") from None
         if code == 200 and isinstance(body, dict) and body.get("prompt_id"):
-            results.append({"job": i, "prompt_id": body["prompt_id"], "status": "queued"})
+            results.append({"job": job, "prompt_id": body["prompt_id"], "status": "queued"})
             watcher.class_types[body["prompt_id"]] = {
                 nid: node.get("class_type", "") for nid, node in wf.items()
             }
         else:
-            results.append({"job": i, "status": "rejected", "errors": _validation_errors(body)})
+            results.append({"job": job, "status": "rejected", "errors": _validation_errors(body)})
     queued = sum(r["status"] == "queued" for r in results)
-    print(f"queued {queued}/{len(jobs)} job(s)", flush=True)
+    print(f"queued {queued}/{total} job(s)", flush=True)
     try:
-        return _wait(results, queued, len(jobs), watcher, timeout, verbose)
+        return _wait(results, queued, total, watcher, timeout, verbose)
     finally:
         watcher.close()
 
@@ -568,11 +593,14 @@ def _wait(results, queued, total, watcher, timeout, verbose) -> tuple[list[dict]
     return results, False
 
 
-def summarize(results: list[dict]) -> str:
+def summarize(results: list[dict], total: int | None = None) -> str:
+    """One line per job. `total` is the whole batch when these results are one step of it, so
+    a step's lines still say which job of the batch they are; the tally counts these jobs."""
     lines = []
     n = len(results)
+    tot = total if total is not None else n
     for r in results:
-        head = f"job {r['job']}/{n}"
+        head = f"job {r['job']}/{tot}"
         if r["status"] == "done":
             lines.append(f"{head} ok: " + ", ".join(r["files"]))
         else:
@@ -589,11 +617,84 @@ def summarize(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def main(argv: list[str] | None = None) -> int:
-    # Never crash on printing a node's message: a Windows pipe is cp1252.
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(errors="replace")
+def steps(jobs: list, n: int) -> list[list]:
+    """Consecutive groups of n. n <= 0 is one group: a batch that never yields inside itself."""
+    if not jobs:
+        return []
+    if n <= 0:
+        return [list(jobs)]
+    return [list(jobs[i:i + n]) for i in range(0, len(jobs), n)]
+
+
+def should_yield() -> bool:
+    """Ask vhotseat whether this run has held the card past its class's max hold. Only exit 0
+    means yes: no binary, an error, or any other code means carry on, never drop work."""
+    vhotseat = os.environ.get("VHOTSEAT_BIN") or shutil.which("vhotseat")
+    if not vhotseat:
+        return False
+    try:
+        return subprocess.call([vhotseat, "should-yield"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+    except Exception:  # noqa: BLE001 - can't ask: carry on
+        return False
+
+
+def _exit_code(results: list[dict], timed_out: bool = False) -> int:
+    """One code for a batch: a cancelled job outranks a timeout and a failure."""
+    if any(r["status"] == "cancelled" for r in results):
+        return EXIT_CANCELLED
+    if timed_out:
+        return EXIT_TIMEOUT
+    return EXIT_OK if all(r["status"] == "done" for r in results) else EXIT_FAILED
+
+
+def _report(as_json: bool, results: list[dict], total: int | None = None) -> None:
+    print(json.dumps(results, indent=1) if as_json else summarize(results, total))
+
+
+def _write_rest(rest: Path, left: list[dict], done: list[dict]) -> None:
+    """The jobs still to do, as plain workflows in order, plus how the part that ran went."""
+    rest.parent.mkdir(parents=True, exist_ok=True)
+    rest.write_text(json.dumps(left))
+    Path(f"{rest}.code").write_text(str(_exit_code(done)))
+
+
+def _rest_code(rest: Path) -> int:
+    """How a yielded round's finished part went; 0 when the file isn't there to say."""
+    try:
+        return int(Path(f"{rest}.code").read_text())
+    except (OSError, ValueError):
+        return EXIT_OK
+
+
+def run_in_steps(args, jobs: list[dict]) -> int:
+    """Inside a ticket, in steps of --yield-every: after every step but the last ask vhotseat
+    whether this run has held the card too long, and on a yes leave the rest for the outer
+    comfy-render (exit 5) instead of running on behind the next workload. A step that timed
+    out stops the stepping: ComfyUI still holds those jobs, and yielding would drop them.
+    """
+    rest = Path(os.environ[REST_ENV])
+    groups = steps(jobs, args.yield_every)
+    done: list[dict] = []
+    timed_out = False
+    for group in groups:
+        results, timed_out = run(group, args.timeout, args.verbose, first=len(done) + 1,
+                                 total=len(jobs))
+        done += results
+        left = jobs[len(done):]
+        if not timed_out and left and should_yield():
+            _write_rest(rest, left, done)
+            _report(args.json, results, len(jobs))
+            print(f"yielding the card: {len(left)} job(s) left")
+            return EXIT_YIELDED
+        _report(args.json, results, len(jobs))
+        if timed_out:
+            break
+    return _exit_code(done, timed_out)
+
+
+def _parser() -> argparse.ArgumentParser:
+    """The command line, built apart so `rerun_under_hold` can read --class and --as off argv."""
     p = argparse.ArgumentParser(prog="comfy-render", description=__doc__.split("\n\n")[0])
     p.add_argument("jobs", nargs="?", help="JSON file: a workflow, a list of them, or {base, jobs}")
     p.add_argument("--url", help="ComfyUI's address (default: $COMFY_URL, else http://127.0.0.1:8188)")
@@ -608,6 +709,21 @@ def main(argv: list[str] | None = None) -> int:
                    help="run the batch under `vhotseat hold NAME` (default comfy): keep the GPU until it's done")
     p.add_argument("--hold-wait", type=float, default=600, metavar="SECONDS",
                    help="with --hold: how long to wait for the GPU's current work to finish (default 600)")
+    p.add_argument("--class", dest="cls", default="batch",
+                   help="with --hold: the class of the ticket this batch takes (default batch)")
+    p.add_argument("--as", dest="requester",
+                   help="with --hold: who is asking, recorded on the ticket (default: vhotseat's)")
+    p.add_argument("--yield-every", type=int, default=4, metavar="N",
+                   help="inside a ticket: jobs per step before asking whether to yield the card (default 4)")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Never crash on printing a node's message: a Windows pipe is cp1252.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+    p = _parser()
     args = p.parse_args(argv)
     if args.jobs is None:
         # `--hold jobs/x.json` (as the skill writes it): --hold's optional NAME took the file.
@@ -632,32 +748,76 @@ def main(argv: list[str] | None = None) -> int:
     try:
         jobs = load_jobs(args.jobs)
         comfy_dir()
+        if os.environ.get(TICKET_ENV) and os.environ.get(REST_ENV):
+            # Inside a ticket that can hand the rest of the batch back: steps, and ask between
+            # them. No ticket, or no place to leave the rest: the batch runs as one, as today.
+            return run_in_steps(args, jobs)
         results, timed_out = run(jobs, args.timeout, args.verbose)
     except UsageError as e:
         print(f"comfy-render: {e}", file=sys.stderr)
         return EXIT_USAGE
 
-    print(json.dumps(results, indent=1) if args.json else summarize(results))
-    if any(r["status"] == "cancelled" for r in results):
-        return EXIT_CANCELLED
-    if timed_out:
-        return EXIT_TIMEOUT
-    return EXIT_OK if all(r["status"] == "done" for r in results) else EXIT_FAILED
+    _report(args.json, results)
+    return _exit_code(results, timed_out)
+
+
+def _clean_rest(tmp: Path, used: list[Path]) -> None:
+    """Every round's rest file goes except the one the LAST round ran from: that is the batch the
+    caller ended with, and it may still want to see it. The folder goes when nothing is left."""
+    keep = used[-2] if len(used) > 1 else None
+    for old in used:
+        if old == keep:
+            continue
+        for gone in (old, Path(f"{old}.code")):
+            try:
+                gone.unlink()
+            except OSError:
+                pass  # never written, or already gone
+    try:
+        tmp.rmdir()
+    except OSError:
+        pass  # not empty: a file the caller may want is in it
 
 
 def rerun_under_hold(name: str, wait: float, argv: list[str]) -> int:
-    """Run this same command again as `vhotseat hold NAME -- comfy-render ARGV`. The
-    copy inside sees VHOTSEAT_HOLD=NAME and just runs the batch; the hold keeps
-    every other workload's gate refusing until it exits, and passes signals on."""
+    """Run this same command as `vhotseat hold NAME --class C -- comfy-render ARGV`: a ticket,
+    so the queue's serving order decides when the batch gets the card. The copy inside sees
+    VHOTSEAT_HOLD=NAME and runs the batch in steps; when it has held the card past its class's
+    max hold it leaves the rest in $COMFY_RENDER_REST and exits 5, and this queues a fresh ticket
+    for that file - behind whoever was waiting - and carries on until a round ends by itself.
+    The worst round's code decides. The hold keeps every other workload's gate refusing until
+    the round exits, and passes signals on."""
     vhotseat = os.environ.get("VHOTSEAT_BIN") or shutil.which("vhotseat")
     if not vhotseat:
         print("comfy-render: --hold needs the vhotseat command (not on PATH; or set $VHOTSEAT_BIN)",
               file=sys.stderr)
         return EXIT_USAGE
+    args = _parser().parse_args(argv)
     me = [sys.executable, "-m", "vhotseat.kit.comfy_render"]
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(
         filter(None, [str(Path(__file__).resolve().parents[2]), os.environ.get("PYTHONPATH")]))}
-    return subprocess.call([vhotseat, "hold", name, "--wait", str(wait), "--", *me, *argv], env=env)
+    # A fresh rest file for every round, in one folder this cleans up when it ends.
+    tmp = Path(tempfile.mkdtemp(prefix="comfy-render-rest-"))
+    used: list[Path] = []
+    try:
+        round_argv, worst, rnd = list(argv), EXIT_OK, 0
+        while True:
+            rnd += 1
+            rest = tmp / f"rest-{rnd}.json"
+            used.append(rest)
+            code = subprocess.call([vhotseat, "hold", name, "--class", args.cls,
+                                    *(["--as", args.requester] if args.requester else []),
+                                    "--wait", str(wait), "--", *me, *round_argv],
+                                   env={**env, REST_ENV: str(rest)})
+            if code == EXIT_YIELDED and rest.is_file():
+                # The run inside held the card too long and left the rest here: queue a new
+                # ticket for that file, and remember how the part that ran went.
+                worst = max(worst, _rest_code(rest))
+                round_argv = [str(rest) if a == args.jobs else a for a in round_argv]
+                continue
+            return max(worst, code)
+    finally:
+        _clean_rest(tmp, used)
 
 
 if __name__ == "__main__":
