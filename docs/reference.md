@@ -722,7 +722,7 @@ a handover's way: a write waits at most 2 s, and any error is ignored.
 
 ## Scheduling
 
-Add a `schedule:` block to enable bookings; without one the existing gate and switch rules are unchanged. An untagged ComfyUI job (the web page; a ComfyUI-driver workload) is class `peter` unless `default_class` says otherwise: an agent's batch takes a ticket instead. `classes` lists priorities highest first, defaulting to `peter`, `booked`, `agent` (900 seconds max hold), `batch` (1200), and `background` (600). `default_class` maps workload names to classes; any other untagged load is `agent`. `affinity_s` defaults to 600 seconds. These hold limits and affinity are stored for later queue scheduling.
+Add a `schedule:` block to enable bookings; without one the existing gate and switch rules are unchanged. An untagged ComfyUI job (the web page; a ComfyUI-driver workload) is class `peter` unless `default_class` says otherwise: an agent's batch takes a ticket instead. `classes` lists priorities highest first, defaulting to `peter`, `booked`, `agent` (900 seconds max hold), `batch` (1200), and `background` (600). `default_class` maps workload names to classes; any other untagged load is `agent`. `affinity_s` defaults to 600 seconds. The max holds and affinity drive the ticket queue below.
 
 A `peter` booking reserves the card for the owner; a `booked` window allows its named workloads, and `peter` requests always pass. Bookings only stop new loads: running work keeps what it has. `mode: hard` is stored but does not interrupt work. A typed `switch` or `hold` is an order and overrides a booking, with a `schedule-override` event. `switch none` always frees the card.
 
@@ -730,5 +730,16 @@ A `peter` booking reserves the card for the owner; a `booked` window allows its 
 - `vhotseat unbook ID`, `pause ID [--until TIME]`, and `resume ID` remove, pause, and resume bookings. A pause runs to the end of the current or next window unless `--until` says otherwise; an `--until` already past is refused.
 - `vhotseat bookings [--json]` shows active and upcoming windows over seven days; `queue [--json]` shows live waiting and running tickets.
 - `vhotseat when NAME [--class C] [--for DURATION] [--as REQUESTER] [--json]` finds the next suitable start. Duration accepts seconds or units such as `90m`. It exits 0 when it can start now, 1 when later, and 2 for bad input.
+
+### Tickets: requests that wait their turn
+
+A **ticket** is one request for the card that waits in a visible queue instead of racing for the lock. `vhotseat run` and `hold --class` take one; a plain `hold` (no `--class`) is still an order and takes none.
+
+- `vhotseat run NAME [--class C] [--for DURATION] [--as REQUESTER] [--wait S] [--queue-timeout S] -- CMD...` takes a ticket (class `batch` by default; `--for` is its estimate, `--as` who is asking), waits until the queue serves it, then holds NAME for CMD exactly as `hold` does and closes the ticket. It exits with CMD's code; 1 if `--queue-timeout` passed first (default: no limit); 2 for an unknown class. CMD gets `VHOTSEAT_TICKET` (its ticket) beside `VHOTSEAT_HOLD`.
+- `vhotseat hold NAME --class C [--for D] [--as R] [--queue-timeout S] -- CMD...` is the same as `run`.
+- **The serving order:** the highest class first; within a class, round-robin per requester (one agent's ten tickets don't keep another's one waiting) and then the oldest; tickets for the workload already on the card go first, unless another kind has waited longer than `affinity_s`. A ticket whose estimate (or, with none, its class's max hold) would run into a booking that excludes it waits until after that booking.
+- **Only one ticket runs at a time**, and a ticket is alive only while its process is: a crashed runner never blocks the queue.
+- **`vhotseat should-yield [--ticket ID] [--json]`** (the ticket from `$VHOTSEAT_TICKET` by default) exits 0 when the run has held the card past its class's `max_hold_s` and a ticket of the same or a higher class is waiting, and prints why; 1 to carry on (also when there is no schedule); 2 with no ticket. Nothing is ever cut off: yielding is the run's own choice at a step boundary. `comfy-render --hold` does it between steps of `--yield-every` jobs (default 4) and re-queues the rest of its batch behind the waiter.
+- Without a schedule, `run` and `hold --class` are a plain `hold`, and if the schedule can't be read they fall back to one too.
 
 Schedule commands exit 2 for usage errors or missing configuration; a booking conflict or unknown booking ID exits 1. Without a schedule, `when`, `bookings` and `queue` report nothing is booked (with `--json`: `[]`, or `when`'s usual object with `now: true`) and exit 0. A job run inside a typed `hold NAME`, or behind a typed `switch NAME`, gets past its guard whatever is booked.
