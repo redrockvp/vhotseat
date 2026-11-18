@@ -2324,7 +2324,6 @@ class Arbiter:
             self.events.record("hold-end", mode=name, exit=code)
             return code
 
-
     def run(self, name: str, command: list[str], wait: float, *, cls: str = "batch",
             est_s: float | None = None, requester: str | None = None,
             queue_timeout: float = 0.0, poll_s: float = 1.0) -> int:
@@ -2366,7 +2365,17 @@ class Arbiter:
             said = False
             while True:
                 on_card = self.probe()["mode"]
-                if self.schedule.claim(t["id"], on_card):
+                try:
+                    claimed = self.schedule.claim(t["id"], on_card)
+                except Exception as e:
+                    # The schedule broke while this ticket waited (a file that stopped reading, a
+                    # writer that won't let go): it fails safe the same way it does at the start.
+                    util.log(f"schedule unreadable: {e}; running as a plain hold")
+                    with contextlib.suppress(Exception):
+                        self.schedule.finish(t["id"], "expired")
+                    finished = True
+                    return self.hold(name, command, wait)
+                if claimed:
                     break
                 if not said:
                     said = True
@@ -2386,9 +2395,13 @@ class Arbiter:
                 util.sleep(poll_s)
             self.events.record("ticket-start", ticket=t["id"], workload=name)
             code = self.hold(name, command, wait, env={TICKET_ENV: str(t["id"])})
-            self.schedule.finish(t["id"], "done")
-            finished = True
-            self.events.record("ticket-end", ticket=t["id"], state="done", exit=code)
+            # The command has run: its exit code is the answer, whatever the bookkeeping does next.
+            try:
+                self.schedule.finish(t["id"], "done")
+                finished = True
+                self.events.record("ticket-end", ticket=t["id"], state="done", exit=code)
+            except Exception as e:
+                util.log(f"ticket {t['id']} ran, but closing it failed: {e}")
             return code
         finally:
             if not finished:

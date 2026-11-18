@@ -187,3 +187,28 @@ def test_should_yield_without_a_ticket_or_schedule(rig, q, monkeypatch):
     assert q.cli("should-yield") == 2                                   # no ticket named
     q.arb.schedule = None
     assert q.cli("should-yield", "--ticket", "1") == 1                  # no schedule: never yield
+
+
+def test_a_schedule_that_breaks_while_waiting_falls_back_to_a_hold(q, capsys, monkeypatch):
+    s = q.arb.schedule
+
+    def broken(*_a, **_k):
+        raise schedule.sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(s, "claim", broken)
+    assert q.cli("run", "comfy", "--", *py("raise SystemExit(6)")) == 6
+    assert "schedule unreadable" in capsys.readouterr().err
+    assert s.tickets(include_done=True)[-1]["state"] == "expired"
+
+
+def test_the_commands_exit_code_survives_a_failed_close(q, capsys, monkeypatch):
+    s = q.arb.schedule
+    real = s.finish
+
+    def finish(tid, state="done"):
+        if state == "done":
+            raise schedule.sqlite3.OperationalError("disk I/O error")
+        return real(tid, state)
+    monkeypatch.setattr(s, "finish", finish)
+    assert q.cli("run", "comfy", "--", *py("raise SystemExit(9)")) == 9
+    assert "closing it failed" in capsys.readouterr().err
+    assert s.tickets(include_done=True)[-1]["state"] == "expired"     # never left running
