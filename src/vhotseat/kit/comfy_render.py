@@ -12,6 +12,11 @@ There is no limit on how long a batch may take: --timeout (default 1800) is how
 long it may go with no sign of progress (no job finishing, no node or sampler
 step starting, no change in ComfyUI's queue) before it gives up.
 
+With --json, stdout contains one array in job order and progress goes to stderr.
+Each object has a one-based job number and a status string (queued, done, failed,
+rejected, timeout, cancelled, or not submitted). Accepted jobs have a prompt_id.
+Optional files and errors fields are arrays of path strings and messages, respectively.
+
 JOBS.json is either
   - one workflow:      {"1": {"class_type": ..., "inputs": {...}}, ...}
   - a list of them:    [ {workflow}, {workflow}, ... ]
@@ -501,7 +506,7 @@ class ProgressWatcher(threading.Thread):
 
 
 def run(jobs: list[dict], timeout: float, verbose: bool, first: int = 1,
-        total: int | None = None) -> tuple[list[dict], bool]:
+        total: int | None = None, *, progress=None) -> tuple[list[dict], bool]:
     """Submit every job, then wait until all of them finish or nothing has progressed
     for `timeout` seconds. Returns (results, timed_out).
 
@@ -530,8 +535,8 @@ def run(jobs: list[dict], timeout: float, verbose: bool, first: int = 1,
             else:
                 results.append({"job": job, "status": "rejected", "errors": _validation_errors(body)})
         queued = sum(r["status"] == "queued" for r in results)
-        print(f"queued {queued}/{total} job(s)", flush=True)
-        return _wait(results, queued, total, watcher, timeout, verbose)
+        print(f"queued {queued}/{total} job(s)", file=progress, flush=True)
+        return _wait(results, queued, total, watcher, timeout, verbose, progress)
     finally:
         watcher.close()
         owned = {r["prompt_id"] for r in results if r["status"] in ("queued", "timeout")}
@@ -553,7 +558,7 @@ def _outcome(entry: dict, status: dict, verbose: bool) -> dict:
     return {"status": "done", "files": files}
 
 
-def _wait(results, queued, total, watcher, timeout, verbose) -> tuple[list[dict], bool]:
+def _wait(results, queued, total, watcher, timeout, verbose, progress) -> tuple[list[dict], bool]:
     pending = {r["prompt_id"]: r for r in results if r["status"] == "queued"}
     # Progress is a job finishing, a websocket event for one of ours, or ComfyUI's queue
     # changing (our jobs may be waiting behind someone else's, which send us no events).
@@ -600,7 +605,7 @@ def _wait(results, queued, total, watcher, timeout, verbose) -> tuple[list[dict]
             line = f"job {r['job']}/{total} {r['status']}"
             if r["status"] == "cancelled":
                 line += f": {r['errors'][0]}"
-            print(f"{line} ({finished} of {queued} queued finished)", flush=True)
+            print(f"{line} ({finished} of {queued} queued finished)", file=progress, flush=True)
 
         now = time.monotonic()
         for pid, r in pending.items():
@@ -611,18 +616,18 @@ def _wait(results, queued, total, watcher, timeout, verbose) -> tuple[list[dict]
                 # workload (~1 s) and the model is loading (tens of seconds): say so once.
                 if watcher.connected.is_set() and pid not in shown:
                     print(f"job {r['job']}/{total} waiting to start (earlier jobs, or the GPU "
-                          "handover and model load)", flush=True)
+                          "handover and model load)", file=progress, flush=True)
                     shown[pid] = (None, None, now)
                     last_note = now
                 continue
             last_node, last_text, when = shown.get(pid, (None, None, 0.0))
             if text != last_text and (node != last_node or now - when >= PROGRESS_EVERY_S):
-                print(f"job {r['job']}/{total} running: {text}", flush=True)
+                print(f"job {r['job']}/{total} running: {text}", file=progress, flush=True)
                 shown[pid] = (node, text, now)
                 last_note = now
         if pending and now - last_note > 60:
             # Keep the caller's idle watchdog fed during long renders.
-            print(f"waiting on {len(pending)} job(s)…", flush=True)
+            print(f"waiting on {len(pending)} job(s)…", file=progress, flush=True)
             last_note = now
         if pending:
             time.sleep(POLL_S)
@@ -684,10 +689,6 @@ def _exit_code(results: list[dict], timed_out: bool = False) -> int:
     return EXIT_OK if all(r["status"] == "done" for r in results) else EXIT_FAILED
 
 
-def _report(as_json: bool, results: list[dict], total: int | None = None) -> None:
-    print(json.dumps(results, indent=1) if as_json else summarize(results, total))
-
-
 def _write_rest(rest: Path, left: list[dict], done: list[dict]) -> None:
     """The jobs still to do, as plain workflows in order, plus how the part that ran went."""
     rest.parent.mkdir(parents=True, exist_ok=True)
@@ -713,10 +714,12 @@ def run_in_steps(args, jobs: list[dict]) -> int:
     first = _env_int(FIRST_ENV, 1)
     total = _env_int(TOTAL_ENV, first - 1 + len(jobs))
     groups = steps(jobs, args.yield_every)
+    progress = sys.stderr if args.json else sys.stdout
     done: list[dict] = []
     timed_out = False
     for group in groups:
-        results, timed_out = run(group, args.timeout, args.verbose, first=first + len(done), total=total)
+        results, timed_out = run(group, args.timeout, args.verbose, first=first + len(done),
+                                 total=total, progress=progress)
         done += results
         left = jobs[len(done):]
         yielding = not timed_out and left and should_yield()
@@ -725,7 +728,7 @@ def run_in_steps(args, jobs: list[dict]) -> int:
         if yielding:
             _write_rest(rest, left, done)
             _json_out(args, done)
-            print(f"yielding the card: {len(left)} job(s) left")
+            print(f"yielding the card: {len(left)} job(s) left", file=progress)
             return EXIT_YIELDED
         if timed_out:
             # The steps after this one never reached ComfyUI: say so, job by job.
@@ -755,7 +758,7 @@ def _json_out(args, results: list[dict]) -> None:
     if os.environ.get(RESULTS_ENV):
         Path(os.environ[RESULTS_ENV]).write_text(json.dumps(results))
     else:
-        _report(True, results)
+        print(json.dumps(results, indent=1))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -768,7 +771,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=STALL_TIMEOUT_S, metavar="SECONDS",
                    help=f"give up after this long with no progress (default {STALL_TIMEOUT_S}); "
                         "a batch that keeps progressing may take any time")
-    p.add_argument("--json", action="store_true", help="print the results as JSON")
+    p.add_argument("--json", action="store_true",
+                   help="write one array to stdout and progress to stderr. Each result has job (1-based) "
+                        "and status (queued, done, failed, rejected, timeout, cancelled, or not submitted), "
+                        "with optional prompt_id, files (paths), and errors (messages)")
     p.add_argument("--verbose", action="store_true", help="include traceback tails for runtime errors")
     p.add_argument("--hold", nargs="?", const="comfy", metavar="NAME",
                    help="run the batch under `vhotseat hold NAME` (default comfy): keep the GPU until it's done")
@@ -825,7 +831,7 @@ def main(argv: list[str] | None = None) -> int:
             args.jobs, args.hold = args.hold, "comfy"
         else:
             p.error("the following arguments are required: jobs")
-    reader = stdout_reader()
+    reader = stdout_reader() if not args.json else None
     if reader in BUFFERING_READERS:
         print(f"comfy-render: don't pipe its output (to {reader}): its progress lines are how the "
               "user follows a long render live. Run it as `comfy-render JOBS.json`, with no pipe.",
@@ -852,12 +858,15 @@ def _render(args) -> int:
             # Inside a ticket that can hand the rest of the batch back: steps, and ask between
             # them. No ticket, or no place to leave the rest: the batch runs as one, as today.
             return run_in_steps(args, jobs)
-        results, timed_out = run(jobs, args.timeout, args.verbose)
+        results, timed_out = run(jobs, args.timeout, args.verbose, progress=sys.stderr if args.json else sys.stdout)
     except UsageError as e:
         print(f"comfy-render: {e}", file=sys.stderr)
         return EXIT_USAGE
 
-    _report(args.json, results)
+    if args.json:
+        _json_out(args, results)
+    else:
+        print(summarize(results))
     return _exit_code(results, timed_out)
 
 

@@ -333,6 +333,14 @@ three shapes:
 
 A UI-format export (`nodes` / `links`) is refused with a hint.
 
+With `--json`, stdout contains one array in job order, including when `--hold`
+runs the batch across several tickets. Progress goes to stderr. Each result
+has a one-based integer `job` and a string `status`. An accepted job starts as
+`queued` and ends as `done`, `failed`, `timeout`, or `cancelled`. A submission
+ComfyUI refuses is `rejected`. Jobs in later steps skipped after a timeout
+are `not submitted`. Accepted jobs include their ComfyUI `prompt_id`.
+`files` and `errors`, when present, are arrays of saved paths and diagnostic messages.
+
 | Outcome | Example line |
 | --- | --- |
 | saved files | `job 2/4 ok: /…/output/a.png` |
