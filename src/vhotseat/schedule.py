@@ -47,6 +47,7 @@ BOOKING_CLASSES = ("peter", "booked")
 EVERY = ("daily", "weekdays")
 MODES = ("drain", "hard")
 DAY = 86400.0
+STALE_S = 120.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS booking (
@@ -373,6 +374,55 @@ class Schedule:
                 "reason": "in the way: " + "; ".join(dict.fromkeys(why))}
 
     # --- tickets ----------------------------------------------------------------------------
+    def take(self, requester: str, cls: str, workload: str, *, est_s: float | None = None,
+             pid: int | None = None, model: str | None = None, note: str = "") -> dict:
+        """Queue one request as a ticket: waiting, stamped with the clock."""
+        if cls not in self.classes:
+            raise ScheduleError(f"a ticket's class is one of {', '.join(self.classes)}, not {cls!r}")
+        if not workload:
+            raise ScheduleError("a ticket has to name the workload it runs on")
+        now = self.now()
+        with self._db() as con:
+            cur = con.execute("INSERT INTO ticket (requester, class, workload, model, est_s, pid, "
+                              "state, created, heartbeat, note) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                              (requester, cls, workload, model, est_s, pid, "waiting", now, now, note))
+            tid = cur.lastrowid
+        return self.ticket(tid)
+
+    def ticket(self, tid: int) -> dict | None:
+        """One ticket as a dict, in whatever state it is; None when there is no such id."""
+        with self._db() as con:
+            r = con.execute("SELECT * FROM ticket WHERE id = ?", (tid,)).fetchone()
+        return dict(r) if r else None
+
+    def beat(self, tid: int) -> dict:
+        """Say a ticket without a pid is still there (its caller lives elsewhere): heartbeat = now."""
+        with self._db() as con:
+            con.execute("UPDATE ticket SET heartbeat = ? WHERE id = ?", (self.now(), tid))
+        return self.ticket(tid)
+
+    def start(self, tid: int) -> dict:
+        """A waiting ticket goes running now."""
+        with self._db() as con:
+            r = con.execute("SELECT * FROM ticket WHERE id = ?", (tid,)).fetchone()
+            if not r:
+                raise ScheduleError(f"no ticket {tid}")
+            if r["state"] != "waiting":
+                raise ScheduleError(f"ticket {tid} is {r['state']}, not waiting: only a waiting ticket starts")
+            con.execute("UPDATE ticket SET state = 'running', started = ? WHERE id = ?", (self.now(), tid))
+        return self.ticket(tid)
+
+    def finish(self, tid: int, state: str = "done") -> dict:
+        """Close a ticket: done, yielded (it gave the card up), or expired."""
+        if state not in ("done", "yielded", "expired"):
+            raise ScheduleError(f"a ticket finishes as done, yielded, or expired, not {state!r}")
+        with self._db() as con:
+            r = con.execute("SELECT * FROM ticket WHERE id = ?", (tid,)).fetchone()
+            if not r:
+                raise ScheduleError(f"no ticket {tid}")
+            con.execute("UPDATE ticket SET state = ?, ended = ? WHERE id = ?", (state, self.now(), tid))
+        return self.ticket(tid)
+
     def tickets(self, include_done: bool = False) -> list[dict]:
         """Waiting and running tickets, oldest first; a ticket whose process has gone is expired
         on the way (and not returned)."""
@@ -383,17 +433,90 @@ class Schedule:
             return [dict(r) for r in con.execute(q)]
 
     def expire_dead(self) -> int:
+        """Expire tickets that stopped living: a pid that has gone, or a heartbeat past `STALE_S`."""
         now = self.now()
         with self._db() as con:
-            rows = list(con.execute("SELECT id, pid FROM ticket WHERE state IN ('waiting','running')"))
-            dead = [r["id"] for r in rows if not self.alive(r["pid"])]
+            rows = list(con.execute("SELECT id, pid, heartbeat FROM ticket WHERE state IN ('waiting','running')"))
+            dead = [r["id"] for r in rows if not self._living(r, now)]
             for tid in dead:
                 con.execute("UPDATE ticket SET state = 'expired', ended = ? WHERE id = ?", (now, tid))
         return len(dead)
 
-    def queue_view(self) -> list[dict]:
-        """The waiting tickets in the order they'd be served (class, then age), and the running ones."""
+    def _living(self, r, now: float) -> bool:
+        """A ticket with a pid lives while its process does; one without lives on its heartbeat."""
+        if r["pid"] is not None:
+            return bool(self.alive(r["pid"]))
+        return now - r["heartbeat"] < STALE_S
+
+    def order(self, on_card: str | None = None, now: float | None = None) -> list[dict]:
+        """The waiting tickets in the order they would be served.
+
+        Class first, then affinity (a ticket for the workload already on the card goes first, and one
+        that has waited past `affinity_s` stops paying for a handover), then round-robin: the ticket's
+        place among its own requester's waiting tickets of that class, so one busy caller cannot keep
+        another waiting behind all of its tickets. Age breaks the rest.
+        """
+        now = self.now() if now is None else now
+        waiting = [t for t in self.tickets() if t["state"] == "waiting"]
+        seen: dict[tuple[str, str], int] = {}
+        k = {}
+        for t in sorted(waiting, key=lambda t: (t["created"], t["id"])):
+            g = (t["requester"], t["class"])
+            k[t["id"]] = seen.get(g, 0)
+            seen[g] = k[t["id"]] + 1
+        affinity = self.conf["affinity_s"]
+        return sorted(waiting, key=lambda t: (
+            self.rank(t["class"]),
+            0 if on_card is None or t["workload"] == on_card or now - t["created"] >= affinity else 1,
+            k[t["id"]], t["created"], t["id"]))
+
+    def head(self, on_card: str | None = None) -> dict | None:
+        """The next ticket that can actually start now, or None when none of them can.
+
+        A ticket without an estimate is judged on its class's `max_hold_s`, so a run nobody sized
+        waits for a booking the way its class would be cut off anyway.
+        """
+        for t in self.order(on_card):
+            est = t["est_s"]
+            if est is None:
+                est = self.max_hold_s(t["class"])
+                if est is None:
+                    est = 0
+            if (self.admit(t["workload"], t["class"], t["requester"])["ok"]
+                    and self.when(t["workload"], t["class"], est, t["requester"])["now"]):
+                return t
+        return None
+
+    def my_turn(self, tid: int, on_card: str | None = None) -> bool:
+        """Is this ticket the one that takes the card now? Nobody else may be running."""
+        h = self.head(on_card)
+        if h is None or h["id"] != tid:
+            return False
+        return not any(t["state"] == "running" and t["id"] != tid for t in self.tickets())
+
+    def overdue(self, tid: int) -> dict | None:
+        """A running ticket held past its class's max hold, with a class at its own rank or higher
+        waiting: {held_s, limit_s, waiting}. None when it is not overdue.
+        """
+        t = self.ticket(tid)
+        if t is None or t["state"] != "running":
+            return None
+        limit = self.max_hold_s(t["class"])
+        if limit is None:
+            return None
+        held = self.now() - t["started"]
+        if held <= limit:
+            return None
+        waiting = sum(1 for w in self.tickets()
+                      if w["state"] == "waiting" and self.rank(w["class"]) <= self.rank(t["class"]))
+        return {"held_s": held, "limit_s": limit, "waiting": waiting} if waiting else None
+
+    def should_yield(self, tid: int) -> bool:
+        """Has this running ticket held the card long enough that a waiting peer wants it back?"""
+        return self.overdue(tid) is not None
+
+    def queue_view(self, on_card: str | None = None) -> list[dict]:
+        """The running tickets, then the waiting ones in the order they'd be served."""
         ts = self.tickets()
         running = [t for t in ts if t["state"] == "running"]
-        waiting = sorted((t for t in ts if t["state"] == "waiting"), key=lambda t: (self.rank(t["class"]), t["created"]))
-        return running + waiting
+        return running + self.order(on_card)
