@@ -4,7 +4,7 @@ ComfyUI and the other workloads vhotseat manages (a local LLM, say) can't hold
 VRAM at the same time. Each of them asks vhotseat before it loads; this is the
 ComfyUI side. Before each job runs, it calls
 
-    vhotseat switch comfy --wait VHOTSEAT_GUARD_WAIT_S
+    vhotseat switch VHOTSEAT_GUARD_WORKLOAD --wait VHOTSEAT_GUARD_WAIT_S
 
 which lets the other workloads finish what they're running (an answer the LLM
 is writing), then releases them. If that fails, the job fails visibly: an
@@ -20,6 +20,9 @@ breaking ComfyUI.
 
 Env:
   VHOTSEAT_BIN            default: vhotseat on PATH, else ~/.local/bin/vhotseat (.exe on Windows)
+  VHOTSEAT_GUARD_WORKLOAD the workload this ComfyUI is in vhotseat's config (default comfy). Set it
+                          when one box runs a second ComfyUI as a workload of its own, e.g.
+                          `set VHOTSEAT_GUARD_WORKLOAD=farcast` in that install's launcher
   VHOTSEAT_GUARD_WAIT_S   how long to wait for running work elsewhere to finish (default 300)
   VHOTSEAT_GUARD          set to 0 to disable
 """
@@ -36,6 +39,7 @@ NODE_CLASS_MAPPINGS: dict = {}  # no nodes; ComfyUI requires the attribute to lo
 NODE_DISPLAY_NAME_MAPPINGS: dict = {}
 
 WAIT_S = int(os.environ.get("VHOTSEAT_GUARD_WAIT_S", "300"))
+WORKLOAD = os.environ.get("VHOTSEAT_GUARD_WORKLOAD") or "comfy"
 BIN = os.environ.get("VHOTSEAT_BIN") or shutil.which("vhotseat") or os.path.expanduser(
     "~/.local/bin/vhotseat.exe" if os.name == "nt" else "~/.local/bin/vhotseat"
 )
@@ -52,7 +56,7 @@ class GpuBusy(RuntimeError):
 
 
 def take_gpu() -> None:
-    """Switch the GPU to ComfyUI, or raise GpuBusy with vhotseat's reason."""
+    """Switch the GPU to this ComfyUI's workload, or raise GpuBusy with vhotseat's reason."""
     global REQUEST_OK
     for attempt in (1, 2):
         # --request: the queue is asking on somebody's behalf, not a person typing
@@ -60,13 +64,13 @@ def take_gpu() -> None:
         # job never loads a model on top of the card someone is playing on; it doesn't
         # refuse the typed command, and it doesn't refuse a job at all once ComfyUI
         # already holds the card, so a batch in flight carries on.
-        cmd = [BIN, "switch", "comfy", "--request", "--wait", str(WAIT_S)] if REQUEST_OK \
-            else [BIN, "switch", "comfy", "--wait", str(WAIT_S)]
+        cmd = [BIN, "switch", WORKLOAD, "--request", "--wait", str(WAIT_S)] if REQUEST_OK \
+            else [BIN, "switch", WORKLOAD, "--wait", str(WAIT_S)]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
                                timeout=WAIT_S + 120, **NO_WINDOW)
         except (OSError, subprocess.TimeoutExpired) as e:
-            raise GpuBusy(f"vhotseat switch comfy could not run: {e}") from e
+            raise GpuBusy(f"vhotseat switch {WORKLOAD} could not run: {e}") from e
         if r.returncode == 0:
             return
         if REQUEST_OK and attempt == 1 and "--request" in r.stderr and "unrecognized" in r.stderr:
@@ -78,7 +82,7 @@ def take_gpu() -> None:
                         "so a running game won't refuse the load. Update vhotseat.", BIN)
             continue
         lines = [ln.removeprefix("vhotseat: ") for ln in r.stderr.splitlines() if ln.strip()]
-        raise GpuBusy(lines[-1] if lines else f"vhotseat switch comfy exited {r.returncode}")
+        raise GpuBusy(lines[-1] if lines else f"vhotseat switch {WORKLOAD} exited {r.returncode}")
 
 
 def _fail_job(executor, prompt_id: str, prompt: dict, reason: str) -> None:
@@ -132,7 +136,7 @@ def install() -> bool:
 
     setattr(guarded, MARKER, True)
     execution.PromptExecutor.execute_async = guarded
-    log.info("vhotseat_guard: on (%s, wait %ss)", BIN, WAIT_S)
+    log.info("vhotseat_guard: on (%s switch %s, wait %ss)", BIN, WORKLOAD, WAIT_S)
     return True
 
 
