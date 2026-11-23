@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 from fakes import COMFY_CONTEXT_VRAM, COMFY_MODEL_VRAM, FakeComfy, FakeGpu, FakeHost, FakeStrata
 
-from vhotseat import claims, doctor, gpu, host, schedule, setup, web
+from vhotseat import claims, doctor, gpu, host, setup, web
 from vhotseat import config as cfgmod
 
 ROOT = Path(__file__).resolve().parents[1]
