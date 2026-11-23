@@ -165,11 +165,17 @@ def read_proc(pid: int) -> tuple[str, str]:
     return cgroup, cmd
 
 
+def needles(process) -> tuple[str, ...]:
+    """A `vram: {process:}` selector's substrings: one, or several where any of them matches."""
+    return (process,) if isinstance(process, str) else tuple(process)
+
+
 def classify(total: int, free: int, procs: list[tuple[int, int | None, str]],
              selectors: dict[str, tuple[str, str] | None], procinfo=read_proc) -> tuple[dict, list]:
     """(the attribution summary, and one row per process holding memory).
 
-    selectors: workload -> ("unit", "comfyui.service") or ("process", "ComfyUI/main.py").
+    selectors: workload -> ("unit", "comfyui.service") or ("process", "ComfyUI/main.py"), or
+    ("process", [several substrings]) where any of them matches. The first workload that matches wins.
     procs: (pid, MiB or None if the driver can't say, name the GPU reader reports)."""
     out = {"total_mib": total, "free_mib": free, **{f"{n}_mib": 0 for n in selectors}, "other_mib": 0}
     rows = []
@@ -180,7 +186,8 @@ def classify(total: int, free: int, procs: list[tuple[int, int | None, str]],
         units = cgroup.split("/")
         key, owner = "other_mib", None
         for n, sel in selectors.items():
-            if sel and ((sel[0] == "unit" and sel[1] in units) or (sel[0] == "process" and sel[1] in (cmd or name))):
+            if sel and ((sel[0] == "unit" and sel[1] in units)
+                        or (sel[0] == "process" and any(s in (cmd or name) for s in needles(sel[1])))):
                 key, owner = f"{n}_mib", n
                 break
         out[key] += mib
