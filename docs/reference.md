@@ -298,7 +298,15 @@ both unpack to a `vhotseat_guard/` folder. From a checkout, symlink
   After every update, follow [comfyui-updates.md](comfyui-updates.md).
 - **Env:** `VHOTSEAT_GUARD=0` disables it; `VHOTSEAT_GUARD_WAIT_S` sets how
   long a job waits for the LLM to finish an answer (default 300);
-  `VHOTSEAT_BIN` points it at the CLI.
+  `VHOTSEAT_BIN` points it at the CLI; `VHOTSEAT_GUARD_WORKLOAD` (default
+  `comfy`) is the workload it switches.
+- **A second ComfyUI** (another port, conda env and `custom_nodes`) is a
+  `driver: comfyui` workload of its own, with its own `url`, a `vram: {process:}`
+  that only its python matches, and `gate.custom_nodes` pointing at its install.
+  Link the guard into that install too and start it with
+  `VHOTSEAT_GUARD_WORKLOAD=<its name>`. Under a `schedule:` block its untagged jobs
+  are class `peter` like any ComfyUI's; if an agent drives it, say so with
+  `default_class: {<its name>: agent}`.
 
 A custom node that doesn't release its VRAM on `/free` makes every handover
 fail. [examples/vram-leak-tts-audio-suite.md](examples/vram-leak-tts-audio-suite.md)

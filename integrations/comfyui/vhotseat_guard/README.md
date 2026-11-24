@@ -19,7 +19,11 @@ or symlink this folder into `ComfyUI/custom_nodes/`. Restart ComfyUI after
 installing or updating it.
 
 Env: `VHOTSEAT_GUARD=0` disables it; `VHOTSEAT_GUARD_WAIT_S` (default 300) is
-how long to wait for the LLM; `VHOTSEAT_BIN` points at the CLI.
+how long to wait for the LLM; `VHOTSEAT_BIN` points at the CLI;
+`VHOTSEAT_GUARD_WORKLOAD` (default `comfy`) is the workload it switches. Set
+that one when a box runs a second ComfyUI as a workload of its own (another
+port, another `custom_nodes`): each install links the same guard, and its
+launcher says which workload it is, e.g. `set VHOTSEAT_GUARD_WORKLOAD=farcast`.
 
 It wraps a private ComfyUI method (`PromptExecutor.execute_async`), so a
 ComfyUI update can break it. The guard then switches itself off with an error
