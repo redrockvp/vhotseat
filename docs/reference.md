@@ -75,6 +75,12 @@ it closes.
 | `proxy` | a server reached only over HTTP, with no hook (Ollama, llama-server) | a small proxy in front of it asks before forwarding; [build one with the guide](guides/proxy-gate.md) |
 | `hold` | a program that isn't a server (a training run, a script) | always run it as `vhotseat hold NAME -- CMD` |
 
+For a `hook` gate, `gate.config` names the server's config so `doctor` can check the hook is
+there, strict, and fits `gate.timeout`. It can be one path, a glob, or a list of either. A
+server that starts from one config per model (Strata) should list them all, or use a glob such as
+`C:\Projects\Strata\terminal\strata-*.json`. A config added later without the hook then fails
+`doctor` instead of loading unguarded. A glob that matches nothing fails too: the configs moved.
+
 A gate runs **inside** its workload's own load, so it never waits on the lock:
 a `switch` holding it may be waiting on this very load. It allows a load that a
 `switch` or `hold` for this workload asked for; refuses while any other one is
