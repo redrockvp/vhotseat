@@ -323,6 +323,84 @@ def test_doctor_checks_gates(vh, tmp_path):
     assert any(s == "fail" and "guard node not installed" in d for s, c, d in found)
 
 
+def _hooked(path, exe, name="strata", strict=True):
+    path.write_text(json.dumps({"before_load": [exe, "gate", name], "before_load_strict": strict,
+                                "before_load_timeout_s": 90}))
+    return path
+
+
+def _strata_gate_lines(vh):
+    return [(s, d) for s, c, d in doctor.checks(vh.arb, vh.cfg) if c == "strata: gate"]
+
+
+@pytest.fixture
+def gate_exe(tmp_path):
+    """A vhotseat executable that exists, for configs whose hook should pass."""
+    exe = tmp_path / "bin" / ("vhotseat.exe" if os.name == "nt" else "vhotseat")
+    exe.parent.mkdir()
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    return str(exe)
+
+
+def test_doctor_checks_every_config_in_a_gate_config_list(vh, tmp_path, gate_exe):
+    """A server can start from several configs (Strata has one per model, 2026-11-24: two new ones
+    had no hook while doctor checked a third). With a list, each one is checked and a bad one is
+    named."""
+    good = _hooked(tmp_path / "strata-a.json", gate_exe)
+    bad = tmp_path / "strata-b.json"
+    bad.write_text(json.dumps({"model_name": "b"}))
+    vh.arb.workloads["strata"].gate["config"] = [str(good), str(bad)]
+    lines = _strata_gate_lines(vh)
+    assert ("ok", f"strata-a.json runs `{gate_exe} gate strata` before loading") in lines
+    fails = [d for s, d in lines if s == "fail"]
+    assert any("strata-b.json" in d and "loads aren't guarded" in d for d in fails)
+    assert any("strata-b.json" in d and "before_load_strict isn't true" in d for d in fails)
+    assert not any("strata-a.json" in d for d in fails)
+
+
+def test_doctor_expands_a_gate_config_glob(vh, tmp_path, gate_exe):
+    for n in ("coder", "inkling", "swift"):
+        _hooked(tmp_path / f"strata-{n}.json", gate_exe)
+    (tmp_path / "other.json").write_text("{}")             # not matched by the pattern
+    vh.arb.workloads["strata"].gate["config"] = str(tmp_path / "strata-*.json")
+    lines = _strata_gate_lines(vh)
+    assert [s for s, d in lines] == ["ok", "ok", "ok"]
+    assert [d.split(" ")[0] for s, d in lines] == ["strata-coder.json", "strata-inkling.json", "strata-swift.json"]
+
+    (tmp_path / "strata-new.json").write_text(json.dumps({"model_name": "new"}))   # a new model, no hook
+    fails = [d for s, d in _strata_gate_lines(vh) if s == "fail"]
+    assert fails and all("strata-new.json" in d for d in fails)
+
+
+def test_doctor_fails_a_gate_config_glob_that_matches_nothing(vh, tmp_path):
+    pattern = str(tmp_path / "moved" / "strata-*.json")
+    vh.arb.workloads["strata"].gate["config"] = pattern
+    assert _strata_gate_lines(vh) == [("fail", f"gate.config {pattern} matches no file, so the hook can't be checked")]
+
+
+def test_doctor_gate_config_list_mixes_paths_and_globs(vh, tmp_path, gate_exe):
+    (tmp_path / "terminal").mkdir()
+    _hooked(tmp_path / "terminal" / "strata-x.json", gate_exe)
+    one = _hooked(tmp_path / "strata-old.json", gate_exe, strict=False)
+    vh.arb.workloads["strata"].gate["config"] = [str(tmp_path / "terminal" / "*.json"), str(one)]
+    lines = _strata_gate_lines(vh)
+    assert ("ok", f"strata-x.json runs `{gate_exe} gate strata` before loading") in lines
+    assert ("fail", "strata-old.json: before_load_strict isn't true: a refused load would load anyway") in lines
+
+
+def test_gate_config_must_be_a_path_or_a_list_of_paths():
+    raw = config.parse((ROOT / "config.example.yaml").read_text())
+    raw["workloads"]["strata"]["gate"]["config"] = ["a.json", 3]
+    with pytest.raises(config.ConfigError, match=r"gate\.config: expected a path, a glob or a list of them"):
+        config.validate(raw)
+    raw["workloads"]["strata"]["gate"]["config"] = []
+    with pytest.raises(config.ConfigError, match=r"gate\.config: expected a path, a glob or a list of them"):
+        config.validate(raw)
+    raw["workloads"]["strata"]["gate"]["config"] = ["a.json", "terminal/strata-*.json"]
+    config.validate(raw)
+
+
 # --- admission per model -------------------------------------------------------------
 
 
