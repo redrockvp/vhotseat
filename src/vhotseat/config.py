@@ -317,6 +317,11 @@ def validate(raw) -> dict:
         if "status" in gate:
             _check(isinstance(gate["status"], str) and gate["status"].startswith(("http://", "https://")),
                    f"{where}.gate.status", "expected the proxy's http://…/_vhotseat/status URL")
+        if "config" in gate:
+            # A hook server's config file(s), checked by doctor: one per model is common (Strata).
+            c = gate["config"]
+            _check((isinstance(c, str) and c) or (isinstance(c, list) and c and all(isinstance(x, str) and x for x in c)),
+                   f"{where}.gate.config", "expected a path, a glob or a list of them (the server configs doctor checks)")
         if driver == "http":
             hdr = w.get("headers") or {}
             _check(isinstance(hdr, dict) and all(isinstance(k, str) and isinstance(v, str) and k and v

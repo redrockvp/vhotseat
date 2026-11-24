@@ -51,7 +51,9 @@ workloads:
     #                                       # the number is what makes it an informed one.
     gate:
       kind: hook       # Strata runs `vhotseat gate strata` before every load
-      config: ~/Strata/strata.json   # its config file, checked by doctor
+      config: ~/Strata/strata.json   # its config file, checked by doctor: a path, a glob
+                                     # (~/Strata/strata-*.json, one per model) or a list of them;
+                                     # every match must run the hook
       timeout: 90      # Strata's before_load_timeout_s: the hook must fit in it
     admission:
       # RAM the machine must be able to give Strata before it may load: its

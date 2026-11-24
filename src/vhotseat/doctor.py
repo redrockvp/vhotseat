@@ -7,6 +7,7 @@ as the config, the GPU backend and each workload. Read-only: it never
 switches, loads or unloads anything.
 """
 
+import glob
 import json
 import re
 import shutil
@@ -19,14 +20,37 @@ OK, WARN, FAIL = "ok", "warn", "fail"
 OTHER_WARN_MIB = 1024
 
 
+GLOB_CHARS = re.compile(r"[*?\[]")
+
+
 def _gate_hook(w, gate: dict) -> list:
     """A hook gate: the server's config runs `vhotseat gate NAME` before it loads,
-    strictly, with a limit that fits our release time."""
-    out = []
-    path = gate.get("config")
-    if not path:
+    strictly, with a limit that fits our release time. `gate.config` is that config: a
+    path, a glob, or a list of them, for a server that can start from several (Strata
+    has one per model). Every config it names is checked, so a new one without the hook
+    shows up here instead of loading unguarded."""
+    spec = gate.get("config")
+    if not spec:
         return [(WARN, f"{w.name}: gate", "no gate.config set, so the hook can't be checked")]
-    p = Path(path).expanduser()
+    specs = [spec] if isinstance(spec, str) else list(spec)
+    several = len(specs) > 1 or any(GLOB_CHARS.search(s) for s in specs)
+    out, paths = [], []
+    for s in specs:
+        if GLOB_CHARS.search(s):
+            found = sorted(Path(p) for p in glob.glob(str(Path(s).expanduser())))
+            if not found:
+                out.append((FAIL, f"{w.name}: gate", f"gate.config {s} matches no file, so the hook can't be checked"))
+            paths += found
+        else:
+            paths.append(Path(s).expanduser())
+    for p in dict.fromkeys(paths):        # once each, in order
+        out += _gate_hook_file(w, gate, p, f"{p.name}: " if several else "")
+    return out
+
+
+def _gate_hook_file(w, gate: dict, p: Path, which: str) -> list:
+    """The hook checks on one server config; `which` names it when there are several."""
+    out = []
     try:
         cfg = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
@@ -39,14 +63,14 @@ def _gate_hook(w, gate: dict) -> list:
         out.append((FAIL, f"{w.name}: gate", f"{p} before_load is {cmd or 'unset'}: "
                     f"loads aren't guarded; set it to [\"vhotseat\", \"gate\", \"{w.name}\"]"))
     elif not shutil.which(cmd[0]):
-        out.append((FAIL, f"{w.name}: gate", f"before_load runs {cmd[0]}, which isn't there"))
+        out.append((FAIL, f"{w.name}: gate", f"{which}before_load runs {cmd[0]}, which isn't there"))
     else:
         out.append((OK, f"{w.name}: gate", f"{p.name} runs `{' '.join(cmd)}` before loading"))
     if not cfg.get("before_load_strict"):
-        out.append((FAIL, f"{w.name}: gate", "before_load_strict isn't true: a refused load would load anyway"))
+        out.append((FAIL, f"{w.name}: gate", f"{which}before_load_strict isn't true: a refused load would load anyway"))
     limit, need = cfg.get("before_load_timeout_s", 120), gate.get("timeout")
     if need and limit < need:
-        out.append((WARN, f"{w.name}: gate", f"before_load_timeout_s is {limit}, gate.timeout is {need}: "
+        out.append((WARN, f"{w.name}: gate", f"{which}before_load_timeout_s is {limit}, gate.timeout is {need}: "
                     "the server may kill the hook while it's still making room"))
     return out
 
