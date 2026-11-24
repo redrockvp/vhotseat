@@ -31,6 +31,7 @@ from .config_edit import version_of
 from .drivers.base import Workload
 from .errors import Busy, PolicyRefused, ReleaseFailed, ScheduleRefused, SwitchError
 from .events import EventLog, row_time
+from .gpu import needles
 from .lock import GpuLock, Held, Locked, write_turn
 from .telemetry import READ_ERRORS
 
@@ -1317,9 +1318,10 @@ class Arbiter:
             sel = w.vram_selector
             if not sel or sel[0] != "process":
                 continue
-            needle = sel[1].lower()
+            found = [s.lower() for s in needles(sel[1])]
             for pid, p in procs.items():
-                if needle in f"{p.get('exe') or ''} {p.get('name') or ''}".lower():
+                text = f"{p.get('exe') or ''} {p.get('name') or ''}".lower()
+                if any(s in text for s in found):
                     owned.add(pid)
         return claims.matching(self.claim_rules, procs, owned, self.claim_ignore)
 

@@ -248,6 +248,10 @@ def validate(raw) -> dict:
         if vram is not None:
             _check(isinstance(vram, dict) and len(vram) == 1 and next(iter(vram)) in ("unit", "process"),
                    f"{where}.vram", "expected {unit: NAME.service} or {process: SUBSTRING}")
+            proc = vram.get("process")
+            if isinstance(proc, list):
+                _check(proc and all(isinstance(s, str) and s for s in proc), f"{where}.vram.process",
+                       "expected a substring, or a list of substrings (any of them matches)")
         _check(vram is not None or svc is not None, f"{where}.vram",
                "needed when there's no service: how to find its processes on the GPU")
         _int(w, "idle_vram_mib", where)
